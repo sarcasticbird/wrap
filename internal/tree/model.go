@@ -37,6 +37,7 @@ type Backend interface {
 type Options struct {
 	WS, Root, RootName, Cmd, Note string
 	Repos                         []gitx.Discovered
+	Keys                          config.Keys
 	Status                        func(string) (*gitx.Snapshot, error)
 	Take                          func(string) (*gitx.Snapshot, error)
 	Worktrees                     func(string) ([]gitx.Worktree, error)
@@ -117,6 +118,8 @@ type Model struct {
 	gitPolling           bool
 	sessionsTimerPending bool
 	gitTimerPending      bool
+	keys                 config.Keys
+	helpOpen             bool
 }
 
 var (
@@ -146,6 +149,7 @@ func NewModel(b Backend, o Options) Model {
 		statusFn:      o.Status,
 		takeFn:        o.Take,
 		gitMetadataFn: gitMetadataFn,
+		keys:          o.Keys.WithDefaults(),
 	}
 	m.repos, m.rootKids, m.ErrText = entryTopology(o.Root, o.RootName, o.Repos, o.Worktrees)
 	return m
@@ -482,7 +486,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Cursor = m.clampCursor()
 		return m.scheduleGitTick()
 	case tea.MouseMsg:
-		if m.ConfirmKill || m.ConfirmShutdown {
+		if m.helpOpen || m.ConfirmKill || m.ConfirmShutdown {
 			return m, nil
 		}
 		return m.handleMouse(msg)
@@ -537,6 +541,7 @@ func nextGitTick() tea.Cmd {
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
 	start, end := m.viewport(rows)
+	msg.Y-- // the heading occupies physical pane row 0
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft &&
 		(msg.Y < 0 || msg.Y >= end-start) {
 		return m, nil
@@ -548,11 +553,26 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
+	if m.ConfirmKill || m.ConfirmShutdown {
+		m.HandleKey(msg, m.backend, len(rows))
+		return m, nil
+	}
+	if m.helpOpen {
+		switch msg.String() {
+		case "h", "esc", "q":
+			m.helpOpen = false
+		}
+		return m, nil
+	}
+	if msg.String() == "h" {
+		m.helpOpen = true
+		return m, nil
+	}
 	if m.HandleKey(msg, m.backend, len(rows)) {
 		return m, nil
 	}
 	switch msg.String() {
-	case "h", "left":
+	case "left":
 		if m.Cursor < len(rows) {
 			r := rows[m.Cursor]
 			switch r.kind {
@@ -570,7 +590,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.Cursor = m.clampCursor()
 		}
-	case "l", "right":
+	case "right":
 		if m.Cursor < len(rows) {
 			r := rows[m.Cursor]
 			switch r.kind {
@@ -819,9 +839,12 @@ func (m Model) totalDirty() int {
 func (m Model) viewport(rows []row) (int, int) {
 	capacity := len(rows)
 	if m.Height > 0 {
-		capacity = m.Height - 2 // rows, then the blank/footer area
-		if capacity < 1 {
-			capacity = 1
+		capacity = m.Height - 2 // heading and compact action footer
+		if m.footer() != "" {
+			capacity--
+		}
+		if capacity <= 0 {
+			return 0, 0
 		}
 	}
 	anchor := m.Cursor
@@ -837,9 +860,14 @@ func (m Model) viewport(rows []row) (int, int) {
 }
 
 func (m Model) View() string {
-	var b strings.Builder
+	heading := pane.Heading("Git", m.keys.FocusTree, m.Width)
+	if m.helpOpen {
+		return m.helpView(heading)
+	}
+
 	rows := m.rows()
 	start, end := m.viewport(rows)
+	lines := []string{heading}
 	for i := start; i < end; i++ {
 		r := rows[i]
 		line := m.renderRow(r)
@@ -851,10 +879,44 @@ func (m Model) View() string {
 		case i == m.Cursor:
 			line = pane.CursorStyle.Render(line)
 		}
-		b.WriteString(line + "\n")
+		lines = append(lines, line)
 	}
-	b.WriteString("\n" + m.footer())
-	return b.String()
+	footer := m.footer()
+	reserved := len(lines) + 1 // compact action footer
+	if footer != "" {
+		reserved++
+	}
+	if m.Height > 0 {
+		for pad := m.Height - reserved; pad > 0; pad-- {
+			lines = append(lines, "")
+		}
+	}
+	if footer != "" {
+		lines = append(lines, footer)
+	}
+	lines = append(lines, pane.ActionFooter(m.Width))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) helpView(heading string) string {
+	bodyHeight := -1 // unknown pane height: render the complete Help body
+	if m.Height > 0 {
+		if m.Height == 1 {
+			return heading
+		}
+		bodyHeight = m.Height - 2 // heading and close footer
+	}
+	lines := []string{heading}
+	if body := pane.HelpBody(m.keys, m.Width, bodyHeight); body != "" {
+		lines = append(lines, strings.Split(body, "\n")...)
+	}
+	if m.Height > 0 {
+		for pad := m.Height - len(lines) - 1; pad > 0; pad-- {
+			lines = append(lines, "")
+		}
+	}
+	lines = append(lines, pane.HelpFooter(m.Width))
+	return strings.Join(lines, "\n")
 }
 
 // rootBell surfaces a workspace-wide 🔔 on the root row when any session

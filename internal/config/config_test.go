@@ -128,13 +128,38 @@ func TestWalkDepthInsideDefaults(t *testing.T) {
 }
 
 func TestKeysWithDefaults(t *testing.T) {
-	k := Keys{}.WithDefaults()
-	if k.FocusTree != "M-1" || k.FocusTerminal != "M-2" || k.FocusTerms != "M-3" {
-		t.Errorf("defaults = %+v", k)
+	want := Keys{FocusTree: "M-2", FocusTerminal: "M-1", FocusTerms: "M-3"}
+	if got := (Keys{}).WithDefaults(); got != want {
+		t.Fatalf("WithDefaults() = %+v, want %+v", got, want)
 	}
-	k = Keys{FocusTree: "M-a"}.WithDefaults()
-	if k.FocusTree != "M-a" || k.FocusTerminal != "M-2" {
-		t.Errorf("partial override = %+v", k)
+	got := (Keys{FocusTree: "M-a"}).WithDefaults()
+	if got.FocusTree != "M-a" || got.FocusTerminal != "M-1" || got.FocusTerms != "M-3" {
+		t.Fatalf("partial defaults = %+v", got)
+	}
+
+	tests := map[string]struct {
+		keys Keys
+		want Keys
+	}{
+		"legacy tree binding": {
+			keys: Keys{FocusTree: "M-1"},
+			want: Keys{FocusTree: "M-1", FocusTerminal: "M-2", FocusTerms: "M-3"},
+		},
+		"legacy terminal binding": {
+			keys: Keys{FocusTerminal: "M-2"},
+			want: Keys{FocusTree: "M-1", FocusTerminal: "M-2", FocusTerms: "M-3"},
+		},
+		"default key claimed by terms": {
+			keys: Keys{FocusTerms: "M-1"},
+			want: Keys{FocusTree: "M-2", FocusTerminal: "M-3", FocusTerms: "M-1"},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := tt.keys.WithDefaults(); got != tt.want {
+				t.Fatalf("WithDefaults() = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 

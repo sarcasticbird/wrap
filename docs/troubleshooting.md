@@ -14,8 +14,8 @@ Install or upgrade tmux, then launch the workspace again.
 
 ## Option/Alt focus keys do not arrive
 
-The default focus bindings are `M-1`, `M-2`, and `M-3`. Your terminal must send
-Option/Alt as Meta.
+The default focus bindings are `M-1` for the active terminal, `M-2` for Git,
+and `M-3` for Terminals. Your terminal must send Option/Alt as Meta.
 
 For Ghostty on macOS:
 

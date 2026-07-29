@@ -121,7 +121,8 @@ func VisibleRange(rowCount, capacity, anchor int) (int, int) {
 func (n *Nav) HandleMouse(msg tea.MouseMsg, rowCount int) {
 	switch {
 	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
-		idx := msg.Y // no heading row — row 0 is the first row
+		// Pane models translate physical chrome rows before calling this helper.
+		idx := msg.Y
 		if idx >= 0 && idx < rowCount {
 			n.Cursor = idx
 		}

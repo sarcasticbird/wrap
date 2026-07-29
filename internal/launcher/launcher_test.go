@@ -1399,8 +1399,8 @@ func TestLaunchUIBuildsChrome(t *testing.T) {
 		"-f /dev/null -L wrap-ui set-option -g mouse on",
 		"-f /dev/null -L wrap-ui set-option -g set-clipboard on",
 		"-f /dev/null -L wrap-ui set-option -t wrap-vb @wrap_tree_side left",
-		"-f /dev/null -L wrap-ui bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
-		"-f /dev/null -L wrap-ui bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
+		"-f /dev/null -L wrap-ui bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
+		"-f /dev/null -L wrap-ui bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
 		"-f /dev/null -L wrap-ui bind-key -n M-3 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .2 select-pane -t .1",
 	} {
 		if !strings.Contains(all, want) {
@@ -1508,7 +1508,7 @@ func TestLaunchUIExplicitDefaultKeysDoNotForceRebuild(t *testing.T) {
 	// ...then relaunched with those same bindings written out longhand.
 	f.calls = nil
 	explicit := state.ChromeParams{TreeSide: "left", TreeWidth: 25,
-		Keys: config.Keys{FocusTree: "M-1", FocusTerminal: "M-2", FocusTerms: "M-3"}}
+		Keys: config.Keys{FocusTree: "M-2", FocusTerminal: "M-1", FocusTerms: "M-3"}}
 	if err := m.LaunchUI(explicit); err != nil {
 		t.Fatal(err)
 	}
@@ -1718,7 +1718,7 @@ func TestLaunchUICustomKeys(t *testing.T) {
 	if !strings.Contains(all, "bind-key -n M-a if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0") {
 		t.Errorf("custom key not bound:\n%s", all)
 	}
-	if !strings.Contains(all, "bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2") {
+	if !strings.Contains(all, "bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2") {
 		t.Errorf("unset keys should default:\n%s", all)
 	}
 }
@@ -1744,7 +1744,7 @@ func TestLaunchUIUnbindsSupersededGlobalFocusKeys(t *testing.T) {
 		}
 	}
 	for option, want := range map[string]string{
-		focusTreeOption: "M-1", focusTerminalOption: "M-2", focusTermsOption: "M-3",
+		focusTreeOption: "M-2", focusTerminalOption: "M-1", focusTermsOption: "M-3",
 	} {
 		if got := f.globalOptions[option]; got != want {
 			t.Errorf("%s = %q, want %q", option, got, want)
@@ -1786,7 +1786,7 @@ func TestLaunchUIReconcilesGlobalFocusKeysForHealthyChrome(t *testing.T) {
 		}
 	}
 	for option, want := range map[string]string{
-		focusTreeOption: "M-1", focusTerminalOption: "M-2", focusTermsOption: "M-3",
+		focusTreeOption: "M-2", focusTerminalOption: "M-1", focusTermsOption: "M-3",
 	} {
 		if got := f.globalOptions[option]; got != want {
 			t.Errorf("%s = %q, want %q", option, got, want)
@@ -1965,8 +1965,8 @@ func TestLaunchUIRightSideCommands(t *testing.T) {
 		"-f /dev/null -L wrap-ui split-window -h -b -t =wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'",
 		"-f /dev/null -L wrap-ui split-window -v -t =wrap-vb:0.1 -l 30% '/bin/wrap' watch 'vb'",
 		"-f /dev/null -L wrap-ui set-option -t wrap-vb @wrap_tree_side right",
-		"-f /dev/null -L wrap-ui bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
-		"-f /dev/null -L wrap-ui bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
+		"-f /dev/null -L wrap-ui bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
+		"-f /dev/null -L wrap-ui bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
 		"-f /dev/null -L wrap-ui bind-key -n M-3 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .2 select-pane -t .1",
 	} {
 		if !strings.Contains(all, want) {
@@ -2046,8 +2046,8 @@ func TestLaunchUIRightSideCustomWidth(t *testing.T) {
 	}
 	// Check binds match right-side table: .1 for sidebar, .0 for terminal, .2 for watcher
 	for _, want := range []string{
-		"bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
-		"bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
+		"bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
+		"bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
 		"bind-key -n M-3 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .2 select-pane -t .1",
 	} {
 		if !strings.Contains(all, want) {

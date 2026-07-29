@@ -374,7 +374,7 @@ func ReadMeta(ws string) (Meta, bool, error) {
 //
 // Old chrome.json files have no "build" key and decode to 0, so any
 // workspace built before this existed rebuilds on the next launch.
-const ChromeBuild = 12
+const ChromeBuild = 13
 
 // ChromeParams records what the live chrome was BUILT with: the launch
 // params LaunchUI used for its splits/keys, the entry topology fingerprint,

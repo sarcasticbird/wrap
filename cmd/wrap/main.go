@@ -282,6 +282,7 @@ func runSidebar(ws string) error {
 		Root:     w.Root,
 		RootName: filepath.Base(w.Root),
 		Cmd:      w.Cmd,
+		Keys:     w.Keys.WithDefaults(),
 		Note:     strings.Join(warns, "; "),
 		Repos:    w.Repos,
 	})
@@ -296,7 +297,10 @@ func runWatch(ws string) error {
 	if err != nil {
 		return err
 	}
-	return terms.Run(m, terms.Options{WS: ws, Root: w.Root, Cmd: w.Cmd})
+	return terms.Run(m, terms.Options{
+		WS: ws, Root: w.Root, Cmd: w.Cmd,
+		Keys: w.Keys.WithDefaults(),
+	})
 }
 
 func runAttach(ws string) error {

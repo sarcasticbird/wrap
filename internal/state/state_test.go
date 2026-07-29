@@ -283,6 +283,12 @@ func TestChromeBuildIncludesCompactTermsRendering(t *testing.T) {
 	}
 }
 
+func TestChromeBuildIncludesPaneHeadingsAndHelp(t *testing.T) {
+	if ChromeBuild < 13 {
+		t.Fatalf("ChromeBuild = %d, want at least 13 so existing panes restart with headings, compact help, and the new focus order", ChromeBuild)
+	}
+}
+
 func TestChromeParamsRoundTrip(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	p := ChromeParams{

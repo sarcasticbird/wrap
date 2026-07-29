@@ -50,6 +50,7 @@ func (b scratchPaneBackend) KillEntrySession(name, targetID, targetGeneration, s
 // Options carries the wiring NewModel needs beyond the backend.
 type Options struct {
 	WS, Root, Cmd string
+	Keys          config.Keys
 }
 
 // row is a single ws-owned session line.
@@ -128,6 +129,8 @@ type Model struct {
 	displayStale    string // why the displayed-session read failed; last display remains
 	polling         bool
 	timerPending    bool
+	keys            config.Keys
+	helpOpen        bool
 }
 
 // NewModel builds an empty terms Model; the first tick populates rows.
@@ -141,6 +144,7 @@ func NewModel(b Backend, o Options) Model {
 		lastSeen: map[string]int64{},
 		expanded: map[sessionKey]bool{},
 		paths:    map[sessionKey]pathState{},
+		keys:     o.Keys.WithDefaults(),
 	}
 }
 
@@ -308,7 +312,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.scheduleTick()
 	case tea.MouseMsg:
-		if m.ConfirmKill || m.ConfirmShutdown || m.renaming {
+		if m.helpOpen || m.ConfirmKill || m.ConfirmShutdown || m.renaming {
 			return m, nil
 		}
 		return m.handleMouse(msg)
@@ -342,6 +346,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 		lines := m.visibleLines(rows)
+		msg.Y-- // the heading occupies physical pane row 0
 		if msg.Y < 0 || msg.Y >= len(lines) {
 			return m, nil
 		}
@@ -356,6 +361,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
 	if m.renaming {
 		return m.handleRenameKey(msg)
+	}
+	if m.ConfirmKill || m.ConfirmShutdown {
+		m.HandleKey(msg, scratchPaneBackend{m.backend}, len(rows))
+		return m, nil
+	}
+	if m.helpOpen {
+		switch msg.String() {
+		case "h", "esc", "q":
+			m.helpOpen = false
+		}
+		return m, nil
+	}
+	if msg.String() == "h" {
+		m.helpOpen = true
+		return m, nil
 	}
 	if m.HandleKey(msg, scratchPaneBackend{m.backend}, len(rows)) {
 		return m, nil
@@ -627,10 +647,12 @@ func (m Model) visibleLines(rows []row) []physicalLine {
 
 	capacity := len(rows) * 2
 	if m.Height > 0 {
-		helpLines := strings.Count(helpBlock(m.Width), "\n") + 1
-		capacity = m.Height - helpLines - 1
-		if capacity < 1 {
-			capacity = 1
+		capacity = m.Height - 2 // heading and compact action footer
+		if m.footer() != "" {
+			capacity--
+		}
+		if capacity <= 0 {
+			return nil
 		}
 	}
 	rowHeight := func(index int) int {
@@ -671,24 +693,22 @@ func (m Model) visibleLines(rows []row) []physicalLine {
 	return lines
 }
 
-// View renders the rows, an optional footer, and the help block. When
-// m.Height is known (a WindowSizeMsg has arrived) and everything fits, the
-// help block is pinned so its LAST line lands on the pane's last line:
-// blank padding lines soak up the gap between the rows and the
-// footer+help group, which stays glued together at the bottom (the footer
-// sits directly above help, with no separating blank — unlike the
-// fallback flow below, which always has one). When height is 0/unknown,
-// or rows+footer+help wouldn't fit in it (padding would go negative), it
-// falls back to the original top-down flow: rows, footer, one blank line,
-// help.
+// View renders a pane heading, rows, an optional status line, and the compact
+// workspace-action footer. Help replaces the ordinary content without
+// stopping background polling.
 func (m Model) View() string {
+	heading := pane.Heading("Terminals", m.keys.FocusTerms, m.Width)
+	if m.helpOpen {
+		return m.helpView(heading)
+	}
+
 	rows := m.rows()
 	visible := m.visibleLines(rows)
-	rowLines := make([]string, 0, len(visible))
+	lines := []string{heading}
 	for _, visibleLine := range visible {
 		r := rows[visibleLine.row]
 		if visibleLine.detail {
-			rowLines = append(rowLines, m.renderPath(r.path))
+			lines = append(lines, m.renderPath(r.path))
 			continue
 		}
 		line := renderRow(r, m.Width)
@@ -700,38 +720,44 @@ func (m Model) View() string {
 		case visibleLine.row == m.Cursor:
 			line = pane.CursorStyle.Render(line)
 		}
-		rowLines = append(rowLines, line)
+		lines = append(lines, line)
 	}
 	footer := m.footer()
-	help := helpBlock(m.Width)
-	helpLines := strings.Count(help, "\n") + 1
-
-	var b strings.Builder
-	for _, l := range rowLines {
-		b.WriteString(l + "\n")
-	}
-
-	contentLines := len(rowLines)
+	reserved := len(lines) + 1 // compact action footer
 	if footer != "" {
-		contentLines++
+		reserved++
 	}
-	pad := m.Height - contentLines - helpLines
-	if m.Height > 0 && pad >= 0 {
-		for i := 0; i < pad; i++ {
-			b.WriteString("\n")
+	if m.Height > 0 {
+		for pad := m.Height - reserved; pad > 0; pad-- {
+			lines = append(lines, "")
 		}
-		if footer != "" {
-			b.WriteString(footer + "\n")
-		}
-		b.WriteString(help)
-		return b.String()
 	}
-
 	if footer != "" {
-		b.WriteString(footer + "\n")
+		lines = append(lines, footer)
 	}
-	b.WriteString("\n" + help)
-	return b.String()
+	lines = append(lines, pane.ActionFooter(m.Width))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) helpView(heading string) string {
+	bodyHeight := -1 // unknown pane height: render the complete Help body
+	if m.Height > 0 {
+		if m.Height == 1 {
+			return heading
+		}
+		bodyHeight = m.Height - 2 // heading and close footer
+	}
+	lines := []string{heading}
+	if body := pane.HelpBody(m.keys, m.Width, bodyHeight); body != "" {
+		lines = append(lines, strings.Split(body, "\n")...)
+	}
+	if m.Height > 0 {
+		for pad := m.Height - len(lines) - 1; pad > 0; pad-- {
+			lines = append(lines, "")
+		}
+	}
+	lines = append(lines, pane.HelpFooter(m.Width))
+	return strings.Join(lines, "\n")
 }
 
 func renderRow(r row, width int) string {
@@ -839,19 +865,4 @@ func (m Model) footer() string {
 		return pane.AlertStyle.Render(" alert failed: " + m.ringErr + " ")
 	}
 	return ""
-}
-
-func helpBlock(width int) string {
-	lines := []string{
-		" terms: ↵ open · ←/→ details · n new · r rename · x kill",
-		" tree:  ↵ open · l files · h close · x kill",
-		" focus: ⌥1 tree · ⌥2 terminal · ⌥3 terms",
-		" q detach · Q shutdown",
-	}
-	if width > 0 {
-		for i, line := range lines {
-			lines[i] = runewidth.Truncate(line, width, "")
-		}
-	}
-	return pane.DimStyle.Render(strings.Join(lines, "\n"))
 }

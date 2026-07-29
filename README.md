@@ -79,26 +79,31 @@ sessions continue running. Launch the same folder again to reattach.
 
 ## Layout and keys
 
-The tree and terminal monitor share one column. The active terminal occupies
-the full-height column beside them. Set `tree_side = "right"` to mirror the
-layout.
+The `Git (⌥2)` and `Terminals (⌥3)` panes share one column. The active
+terminal (`⌥1`) occupies the full-height column beside them. Set
+`tree_side = "right"` to mirror the layout. Custom focus bindings replace the
+key labels shown in the headings.
 
 | Key | Action |
 | --- | --- |
 | `j` / `k`, Up / Down | Move the cursor |
-| Left / Right | Collapse / expand the selected terminal's PWD details |
+| Left / Right | Collapse / expand changed files or terminal PWD details |
 | `Enter` | Select/open the current row or show the current session |
-| `l` / `h` | Expand/collapse changed files in the tree |
+| `h` | Open Help in the focused list pane |
 | `n` | Bind the selected tree row or create a scratch terminal |
 | `r` | Rename a scratch terminal |
 | `x` | Tree: kill the selected live entry; terminals: kill only a scratch terminal |
 | `q` | Detach without stopping sessions |
 | `Q` | Destroy only the current workspace's sessions after confirmation |
-| `Option-1/2/3` | Focus tree / terminal / terminals |
+| `Option-1/2/3` | Focus active terminal / Git / Terminals |
 
 Clicking moves the cursor; it does not activate a row. The tree never creates
 a terminal. It records the selected folder, and `n` in the terminals pane
 creates or binds the corresponding session.
+
+Each list pane keeps the compact footer `h help · q detach · Q shutdown`.
+While Help is open, press `h`, `Esc`, or `q` to close it; `q` does not detach
+from Help.
 
 The terminal monitor stays in creation order as names, bell state, and activity
 indicators change. Repository, worktree, root, and diff rows are protected
