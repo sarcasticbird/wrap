@@ -1,0 +1,64 @@
+name: ci
+
+# wrap drives real tmux, so CI runs the matrix with tmux installed: the
+# integration tests skip themselves when it is absent, and skipped tests
+# prove nothing about pane geometry. Both platforms are covered because
+# wrap targets both and tmux behavior differs between builds.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: install tmux (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: install tmux (macos)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: tmux version
+        run: tmux -V
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }
+      - name: documentation links
+        run: ./scripts/check-doc-links.sh && ./scripts/test-doc-links.sh
+      - name: build
+        run: go build ./...
+      - name: release archive reproducibility
+        run: ./scripts/test-package-release.sh
+      - name: release publication state machine
+        run: ./scripts/test-publish-release.sh
+      - name: test
+        run: go test -race ./...
+      - name: vet
+        run: go vet ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Keep the lint version explicit; Dependabot updates the action wrapper.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2

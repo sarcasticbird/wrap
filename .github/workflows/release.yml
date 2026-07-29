@@ -1,0 +1,59 @@
+name: release
+
+# Publishes a GitHub Release with binaries for macOS and Linux when a
+# version tag is pushed. The complete reusable CI workflow runs first: a tag
+# that fails either platform, lint, docs, or reproducibility checks cannot
+# become a release. The public repository also protects v* tags from updates
+# and deletion; publish-release.sh performs a defensive post-publish recheck.
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel after a run may have published but before its defensive
+  # post-publish tag check and rollback.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # actions/checkout resolves the pushed tag to a lightweight ref;
+      # re-fetch it so --notes-from-tag sees the annotation.
+      - name: fetch tag annotation
+        run: |
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          tag_object=$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")
+          tag_commit=$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")
+          head_commit=$(git rev-parse HEAD)
+          if [ "$(git cat-file -t "$tag_object")" != tag ]; then
+            echo "Release tags must be annotated" >&2
+            exit 1
+          fi
+          if [ "$tag_commit" != "$head_commit" ]; then
+            echo "Tag moved while this workflow was running; refusing a stale release" >&2
+            exit 1
+          fi
+          echo "WRAP_EXPECTED_TAG_OBJECT=$tag_object" >>"$GITHUB_ENV"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Release retries must use the same compiler patch: selecting the
+          # moving 1.26 line can change binaries and checksums for one tag.
+          go-version: 1.26.5
+      - name: build release archives
+        run: ./scripts/package-release.sh "$GITHUB_REF_NAME" dist
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WRAP_EXPECTED_SHA: ${{ github.sha }}
+        run: ./scripts/publish-release.sh "$GITHUB_REF_NAME" dist
