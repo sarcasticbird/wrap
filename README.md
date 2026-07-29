@@ -10,6 +10,8 @@ you three panes: a repository tree, a persistent terminal, and a monitor of
 every terminal in the workspace. When a program rings the terminal bell, its
 session is marked with a 🔔 without moving the list.
 
+<img width="1638" height="1002" alt="Screenshot 2026-07-29 at 8 47 47 AM" src="https://github.com/user-attachments/assets/00f561a5-f4f8-4d4a-b1b8-6ed8c2fa7789" />
+
 ## Why wrap
 
 - See which agent needs attention without cycling through terminal tabs.
