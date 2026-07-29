@@ -888,8 +888,8 @@ func (m Model) renderRow(r row) string {
 					arrow = "▸ "
 				}
 			}
-			label := arrow + rootStyle.Render(r.name) + m.rootBell()
-			label += pane.DimStyle.Render(" ⎇" + g.branch)
+			label := arrow + rootStyle.Render(pane.SafeLabel(r.name)) + m.rootBell()
+			label += pane.DimStyle.Render(" ⎇" + pane.SafeLabel(g.branch))
 			if g.dirty > 0 {
 				label += pane.DimStyle.Render(fmt.Sprintf(" [%d]", g.dirty))
 			}
@@ -898,7 +898,7 @@ func (m Model) renderRow(r row) string {
 			}
 			return label
 		}
-		label := rootStyle.Render(r.name) + m.rootBell()
+		label := rootStyle.Render(pane.SafeLabel(r.name)) + m.rootBell()
 		if n := m.totalDirty(); n > 0 {
 			label += pane.DimStyle.Render(fmt.Sprintf(" [%d]", n))
 		}
@@ -926,9 +926,9 @@ func (m Model) renderRow(r row) string {
 				arrow = "▸ "
 			}
 		}
-		label := arrow + marker + " " + r.name
+		label := arrow + marker + " " + pane.SafeLabel(r.name)
 		if g.branch != "" {
-			label += pane.DimStyle.Render(" ⎇" + g.branch)
+			label += pane.DimStyle.Render(" ⎇" + pane.SafeLabel(g.branch))
 		}
 		if g.dirty > 0 {
 			label += pane.DimStyle.Render(fmt.Sprintf(" [%d]", g.dirty))
@@ -946,7 +946,7 @@ func (m Model) renderRow(r row) string {
 		if r.untracked {
 			status = '?'
 		}
-		line := fmt.Sprintf("   %c %s", status, truncate(r.name, width-12))
+		line := fmt.Sprintf("   %c %s", status, truncate(pane.SafeLabel(r.name), width-12))
 		if !r.untracked && (r.added > 0 || r.deleted > 0) {
 			line += " " + addStyle.Render(fmt.Sprintf("+%d", r.added)) + " " + delStyle.Render(fmt.Sprintf("-%d", r.deleted))
 		}
@@ -959,16 +959,16 @@ func (m Model) footer() string {
 		return s
 	}
 	if m.stale != "" {
-		return pane.AlertStyle.Render(" rows stale: " + m.stale + " ")
+		return pane.AlertStyle.Render(" rows stale: " + pane.SafeLabel(m.stale) + " ")
 	}
 	if m.selectionStale != "" {
-		return pane.AlertStyle.Render(" selection stale: " + m.selectionStale + " ")
+		return pane.AlertStyle.Render(" selection stale: " + pane.SafeLabel(m.selectionStale) + " ")
 	}
 	if m.info != "" {
 		return pane.DimStyle.Render(" " + m.info + " ")
 	}
 	if m.note != "" {
-		return pane.DimStyle.Render(" " + m.note + " ")
+		return pane.DimStyle.Render(" " + pane.SafeLabel(m.note) + " ")
 	}
 	return ""
 }

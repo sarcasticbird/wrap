@@ -796,8 +796,7 @@ func formatPWD(root, path string) string {
 			display = "." + string(filepath.Separator) + rel
 		}
 	}
-	quoted := strconv.QuoteToGraphic(display)
-	return quoted[1 : len(quoted)-1]
+	return pane.SafeLabel(display)
 }
 
 func truncateLeft(value string, width int) string {
