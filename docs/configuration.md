@@ -27,8 +27,8 @@ tree_width = 25
 cmd = ""
 
 [keys]
-focus_tree = "M-1"
-focus_terminal = "M-2"
+focus_tree = "M-2"
+focus_terminal = "M-1"
 focus_terms = "M-3"
 ```
 
@@ -104,14 +104,15 @@ wrap does not inspect process environments or infer tool-specific state.
 
 ```toml
 [keys]
-focus_tree = "M-1"
-focus_terminal = "M-2"
+focus_tree = "M-2"
+focus_terminal = "M-1"
 focus_terms = "M-3"
 ```
 
-Values use tmux key syntax. The defaults are `M-1`, `M-2`, and `M-3`.
-On macOS, `M-1` is usually Option-1 when the terminal is configured to send
-Option as Alt/Meta.
+Values use tmux key syntax. By default, `M-1` focuses the active terminal,
+`M-2` focuses Git, and `M-3` focuses Terminals. On macOS, `M-1` is usually
+Option-1 when the terminal is configured to send Option as Alt/Meta. The Git
+and Terminals headings show the effective configured bindings.
 
 ## Applying changes
 

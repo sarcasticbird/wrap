@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/gitx"
 	"github.com/sarcasticbird/wrap/internal/state"
@@ -83,6 +84,113 @@ func oneRepoOpts(b Backend) Options {
 	return Options{
 		WS: "ws", Root: "/root", RootName: "root",
 		Repos: []gitx.Discovered{{Name: "repo1", Path: "/r1", Kind: gitx.DiscoveredRepo}},
+	}
+}
+
+func TestViewHasGitHeadingAndCompactFooter(t *testing.T) {
+	m := NewModel(&fakeBackend{}, Options{
+		WS: "ws", Root: "/root", RootName: "root",
+		Keys: config.Keys{FocusTree: "M-2"},
+	})
+	view := ansi.Strip(m.View())
+	for _, want := range []string{"Git (⌥2)", "h help · q detach · Q shutdown"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestLeftRightAreOnlyGitExpansionKeys(t *testing.T) {
+	m := NewModel(&fakeBackend{}, oneRepoOpts(&fakeBackend{}))
+	m.git["/r1"] = repoGit{branch: "main", dirty: 1}
+	m.Cursor = 1
+
+	mod, _ := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	if !mod.(Model).expanded["/r1"] {
+		t.Fatal("Right did not expand repo")
+	}
+	mod, _ = mod.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if mod.(Model).expanded["/r1"] {
+		t.Fatal("Left did not collapse repo")
+	}
+	mod, _ = mod.Update(key("l"))
+	if mod.(Model).expanded["/r1"] {
+		t.Fatal("l remains an expansion alias")
+	}
+}
+
+func TestGitHelpCloseKeysDoNotDetach(t *testing.T) {
+	for _, closeKey := range []tea.KeyMsg{
+		key("h"),
+		{Type: tea.KeyEsc},
+		key("q"),
+	} {
+		t.Run(closeKey.String(), func(t *testing.T) {
+			b := &fakeBackend{}
+			m := NewModel(b, Options{WS: "ws", Root: "/root", RootName: "root"})
+			mod, _ := m.Update(key("h"))
+			if !mod.(Model).helpOpen {
+				t.Fatal("h did not open Help")
+			}
+			mod, _ = mod.Update(closeKey)
+			if mod.(Model).helpOpen {
+				t.Fatalf("%q did not close Help", closeKey.String())
+			}
+			if b.detached {
+				t.Fatalf("%q detached while closing Help", closeKey.String())
+			}
+		})
+	}
+}
+
+func TestGitHelpKeepsActionsInertAndPollingLive(t *testing.T) {
+	b := &fakeBackend{}
+	m := NewModel(b, oneRepoOpts(b))
+	m.Cursor = 1
+	m.expanded["/r1"] = true
+	mod, _ := m.Update(key("h"))
+
+	mod, _ = mod.Update(key("j"))
+	mod, _ = mod.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 0})
+	mod, _ = mod.Update(key("Q"))
+	got := mod.(Model)
+	if got.Cursor != 1 || !got.expanded["/r1"] || got.ConfirmShutdown {
+		t.Fatalf("Help mutated actions: cursor=%d expanded=%v shutdown=%v", got.Cursor, got.expanded["/r1"], got.ConfirmShutdown)
+	}
+
+	mod, _ = mod.Update(sessionsMsg{sessions: []tmux.SessionInfo{{Name: "ws/repo1"}}})
+	got = mod.(Model)
+	if _, ok := got.sessions["ws/repo1"]; !ok {
+		t.Fatal("session poll was ignored while Help was open")
+	}
+}
+
+func TestGitHelpFitsSmallPaneHeights(t *testing.T) {
+	for _, height := range []int{1, 2} {
+		t.Run(fmt.Sprintf("height_%d", height), func(t *testing.T) {
+			m := NewModel(&fakeBackend{}, Options{WS: "ws", Root: "/root", RootName: "root"})
+			m.Width = 80
+			m.Height = height
+			m.helpOpen = true
+
+			lines := strings.Split(ansi.Strip(m.View()), "\n")
+			if len(lines) > height {
+				t.Fatalf("Help rendered %d lines into height %d:\n%s", len(lines), height, m.View())
+			}
+			if height == 2 && !strings.Contains(lines[1], "close") {
+				t.Fatalf("two-line Help should retain close hint:\n%s", m.View())
+			}
+		})
+	}
+}
+
+func TestGitConfirmationKeepsPriorityOverHelp(t *testing.T) {
+	m := NewModel(&fakeBackend{}, Options{WS: "ws", Root: "/root", RootName: "root"})
+	mod, _ := m.Update(key("Q"))
+	mod, _ = mod.Update(key("h"))
+	got := mod.(Model)
+	if got.ConfirmShutdown || got.helpOpen {
+		t.Fatalf("h should cancel confirmation without opening Help: %+v", got.Nav)
 	}
 }
 
@@ -300,7 +408,7 @@ func TestExpandShowsFiles(t *testing.T) {
 	mod, _ = mod.Update(key("j")) // cursor: root -> repo1
 
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	if cmd == nil {
 		t.Fatal("expanding should return an immediate git refresh cmd")
 	}
@@ -315,7 +423,7 @@ func TestExpandShowsFiles(t *testing.T) {
 		t.Errorf("missing staged counts in view:\n%s", v)
 	}
 
-	mod, _ = mod.Update(key("h")) // collapse
+	mod, _ = mod.Update(tea.KeyMsg{Type: tea.KeyLeft}) // collapse
 	sm = mod.(Model)
 	if got := len(sm.rows()); got != 2 {
 		t.Errorf("collapsed rows = %d, want 2: %+v", got, sm.rows())
@@ -396,19 +504,18 @@ func TestRootRowSelectable(t *testing.T) {
 		t.Fatalf("state = %+v ok=%v err=%v", sel, ok, err)
 	}
 
-	// Root row is at line 0 (no heading row), so a mouse click at Y=0
-	// must hit it directly -- Y, not Y-1. A click only moves the cursor
-	// (no activation); Enter is what reaches the backend.
+	// The heading occupies line 0, so the root row begins at line 1.
+	// A click only moves the cursor; Enter is what reaches the backend.
 	b2 := &fakeBackend{}
 	m2 := NewModel(b2, Options{WS: "ws2", Root: "/root2", RootName: "root2"})
 	var mod2 tea.Model = m2
 	mod2, _ = mod2.Update(sessionsMsg{sessions: []tmux.SessionInfo{{Name: "ws2"}}})
-	mod2, _ = mod2.Update(tea.MouseMsg{Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	mod2, _ = mod2.Update(tea.MouseMsg{Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if len(b2.switched) != 0 {
 		t.Fatalf("click alone should not activate: switched=%v", b2.switched)
 	}
 	if sm2 := mod2.(Model); sm2.Cursor != 0 {
-		t.Fatalf("click at Y=0 should set cursor to 0, got %d", sm2.Cursor)
+		t.Fatalf("click at Y=1 should set cursor to 0, got %d", sm2.Cursor)
 	}
 	mod2.Update(key("enter"))
 	if len(b2.switched) != 1 || b2.switched[0] != "ws2" {
@@ -426,8 +533,8 @@ func TestMouseClickMovesCursorNoBackendCalls(t *testing.T) {
 	m := NewModel(b, oneRepoOpts(b))
 	var mod tea.Model = m
 	mod, _ = mod.Update(sessionsMsg{sessions: b.sessions})
-	// repo1 is row index 1 (root=0, repo1=1).
-	mod, _ = mod.Update(tea.MouseMsg{Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	// repo1 is model row 1 and physical line 2 after the heading.
+	mod, _ = mod.Update(tea.MouseMsg{Y: 2, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	sm := mod.(Model)
 	if sm.Cursor != 1 {
 		t.Fatalf("cursor = %d, want 1", sm.Cursor)
@@ -516,7 +623,7 @@ func TestViewportTranslatesMouseRows(t *testing.T) {
 	m := NewModel(&fakeBackend{}, Options{WS: "ws", Root: "/root", RootName: "root", Repos: repos})
 	m.Height = 5
 	m.Cursor = len(m.rows()) - 1
-	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 0})
+	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 1})
 	if got := mod.(Model).Cursor; got != len(m.rows())-3 {
 		t.Fatalf("cursor = %d, want first visible row %d", got, len(m.rows())-3)
 	}
@@ -531,7 +638,7 @@ func TestViewportIgnoresClicksBelowVisibleRows(t *testing.T) {
 	m.Height = 5
 	m.Cursor = len(m.rows()) - 1
 	before := m.Cursor
-	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 3})
+	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 4})
 	if got := mod.(Model).Cursor; got != before {
 		t.Fatalf("footer click moved cursor from %d to hidden row %d", before, got)
 	}
@@ -589,7 +696,7 @@ func TestExpandAffordance(t *testing.T) {
 
 	mod, _ = mod.Update(key("j")) // cursor -> repo1
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 
 	sm := mod.(Model)
@@ -604,7 +711,7 @@ func TestExpandAffordance(t *testing.T) {
 		t.Errorf("expanded repo should show its file rows, view:\n%s", v)
 	}
 
-	mod, _ = mod.Update(key("h")) // collapse
+	mod, _ = mod.Update(tea.KeyMsg{Type: tea.KeyLeft}) // collapse
 	sm = mod.(Model)
 	v = sm.View()
 	if !strings.Contains(v, "▸ ") {
@@ -680,7 +787,7 @@ func TestKillConfirmSurvivesRowChurn(t *testing.T) {
 	// Expand repo0 with one file so rows = [root, repo0, file, repo1].
 	mod, _ = mod.Update(key("j")) // cursor -> repo0
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l"))
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight})
 	mod, _ = mod.Update(cmd())
 	mod, _ = mod.Update(gitMsg{"/r0": {snap: &gitx.Snapshot{Untracked: []string{"f1.txt"}}}})
 
@@ -839,7 +946,7 @@ func TestRootRepoExpandsFiles(t *testing.T) {
 	mod, _ = mod.Update(gitMsg{"/root": {branch: "main", dirty: 1}})
 
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // cursor is already on root (index 0); expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // cursor is already on root (index 0); expand
 	if cmd == nil {
 		t.Fatal("expanding a root repo should return an immediate git refresh cmd")
 	}
@@ -860,7 +967,7 @@ func TestRootRepoExpandsFiles(t *testing.T) {
 		t.Errorf("missing root staged counts in view:\n%s", v)
 	}
 
-	mod, _ = mod.Update(key("h")) // collapse root
+	mod, _ = mod.Update(tea.KeyMsg{Type: tea.KeyLeft}) // collapse root
 	sm = mod.(Model)
 	if got := len(sm.rows()); got != 2 { // root, repo1
 		t.Errorf("collapsed rows = %d, want 2: %+v", got, sm.rows())
@@ -889,7 +996,7 @@ func TestUmbrellaRootUnchanged(t *testing.T) {
 	})
 
 	sm := mod.(Model)
-	rootLine := strings.Split(sm.View(), "\n")[0]
+	rootLine := strings.Split(sm.View(), "\n")[1]
 	if !strings.Contains(rootLine, "[5]") {
 		t.Errorf("umbrella root row should show sum of child dirty, got %q", rootLine)
 	}
@@ -899,7 +1006,7 @@ func TestUmbrellaRootUnchanged(t *testing.T) {
 
 	before := len(sm.rows())
 	var cmd tea.Cmd
-	mod, cmd = sm.Update(key("l")) // cursor is on root; umbrella root is a no-op
+	mod, cmd = sm.Update(tea.KeyMsg{Type: tea.KeyRight}) // cursor is on root; umbrella root is a no-op
 	if cmd != nil {
 		t.Errorf("l on an umbrella root should not return a refresh cmd")
 	}
@@ -923,7 +1030,7 @@ func TestRootFileRowParentWalk(t *testing.T) {
 	mod, _ = mod.Update(gitMsg{"/root": {branch: "main", dirty: 1}})
 
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand root
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand root
 	mod, _ = mod.Update(cmd())
 	mod, _ = mod.Update(key("j")) // cursor -> root's file row
 
@@ -933,7 +1040,7 @@ func TestRootFileRowParentWalk(t *testing.T) {
 		t.Fatalf("setup: expected cursor on root's file row, rows=%+v cursor=%d", rows, sm.Cursor)
 	}
 
-	mod, _ = mod.Update(key("h"))
+	mod, _ = mod.Update(tea.KeyMsg{Type: tea.KeyLeft})
 	sm = mod.(Model)
 	if sm.expanded["/root"] {
 		t.Errorf("h on the root's own file row should collapse the root")
@@ -1023,7 +1130,7 @@ func TestRootWorktreeKidExpansionShowsFiles(t *testing.T) {
 
 	// Expand the kid
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l"))
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight})
 	if cmd == nil {
 		t.Fatal("expanding should return an immediate git refresh cmd")
 	}
@@ -1062,7 +1169,7 @@ func TestRootWorktreeKidExpansionShowsFiles(t *testing.T) {
 	// Collapse the kid
 	sm.Cursor = 1
 	mod = sm
-	mod, _ = mod.Update(key("h"))
+	mod, _ = mod.Update(tea.KeyMsg{Type: tea.KeyLeft})
 	sm = mod.(Model)
 	rows = sm.rows()
 	if len(rows) != 2 {
@@ -1192,7 +1299,7 @@ func TestFileRowsNeverSwitchMiddle(t *testing.T) {
 	mod, _ = mod.Update(key("j")) // cursor -> repo1
 
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 	mod, _ = mod.Update(key("j")) // cursor -> file row
 
@@ -1221,7 +1328,7 @@ func TestFileRowEnterOpensDiffUntracked(t *testing.T) {
 	var mod tea.Model = m
 	mod, _ = mod.Update(key("j")) // -> repo1
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 	mod, _ = mod.Update(key("j")) // -> c.txt
 	mod, _ = mod.Update(key("enter"))
@@ -1254,7 +1361,7 @@ func TestFileRowEnterOpensDiffStaged(t *testing.T) {
 	var mod tea.Model = m
 	mod, _ = mod.Update(key("j")) // -> repo1
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 	mod, _ = mod.Update(key("j")) // -> a.go (staged)
 	mod.Update(key("enter"))
@@ -1283,7 +1390,7 @@ func TestFileRowEnterOpensDiffUnstaged(t *testing.T) {
 	var mod tea.Model = m
 	mod, _ = mod.Update(key("j")) // -> repo1
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 	mod, _ = mod.Update(key("j")) // -> b.go (unstaged)
 	mod.Update(key("enter"))
@@ -1309,10 +1416,10 @@ func TestMouseClickThenEnterOpensDiff(t *testing.T) {
 	var mod tea.Model = m
 	mod, _ = mod.Update(key("j")) // -> repo1
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 	// rows: root(0), repo1(1), c.txt(2)
-	mod, _ = mod.Update(tea.MouseMsg{Y: 2, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	mod, _ = mod.Update(tea.MouseMsg{Y: 3, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 
 	sm := mod.(Model)
 	if sm.Cursor != 2 {
@@ -1389,7 +1496,7 @@ func TestDualGroupSameFile(t *testing.T) {
 	mod, _ = mod.Update(key("j")) // -> repo1
 
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 
 	sm := mod.(Model)
@@ -1463,7 +1570,7 @@ func TestLongPathPassthrough(t *testing.T) {
 	mod, _ = mod.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
 
 	var cmd tea.Cmd
-	mod, cmd = mod.Update(key("l")) // expand
+	mod, cmd = mod.Update(tea.KeyMsg{Type: tea.KeyRight}) // expand
 	mod, _ = mod.Update(cmd())
 
 	sm := mod.(Model)

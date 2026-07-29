@@ -46,14 +46,39 @@ type Keys struct {
 }
 
 func (k Keys) WithDefaults() Keys {
-	if k.FocusTree == "" {
-		k.FocusTree = "M-1"
+	defaults := []struct {
+		value     *string
+		preferred string
+	}{
+		{&k.FocusTerminal, "M-1"},
+		{&k.FocusTree, "M-2"},
+		{&k.FocusTerms, "M-3"},
 	}
-	if k.FocusTerminal == "" {
-		k.FocusTerminal = "M-2"
+	used := make(map[string]bool, len(defaults))
+	for _, binding := range defaults {
+		if *binding.value != "" {
+			used[*binding.value] = true
+		}
 	}
-	if k.FocusTerms == "" {
-		k.FocusTerms = "M-3"
+	// Preserve every preferred default that an explicit binding has not
+	// claimed before relocating the collided defaults to the remaining keys.
+	for _, binding := range defaults {
+		if *binding.value == "" && !used[binding.preferred] {
+			*binding.value = binding.preferred
+			used[binding.preferred] = true
+		}
+	}
+	for _, binding := range defaults {
+		if *binding.value != "" {
+			continue
+		}
+		for _, candidate := range []string{"M-1", "M-2", "M-3"} {
+			if !used[candidate] {
+				*binding.value = candidate
+				used[candidate] = true
+				break
+			}
+		}
 	}
 	return k
 }

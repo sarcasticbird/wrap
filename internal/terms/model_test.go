@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
+	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/state"
 	"github.com/sarcasticbird/wrap/internal/tmux"
 )
@@ -425,7 +426,7 @@ func TestRenderPathNeverExceedsPaneWidth(t *testing.T) {
 
 func TestViewportCountsExpandedDetailLines(t *testing.T) {
 	m := NewModel(&fakeBackend{}, Options{WS: "vb", Root: "/workspace"})
-	m.Height = 8 // four help lines + three content lines + one reserved line
+	m.Height = 8 // heading + up to six content lines + compact footer
 	identity := sessionKey{generation: "generation-a", id: "$7"}
 	m.expanded[identity] = true
 	m.paths[identity] = pathState{value: "/workspace/api", valid: true}
@@ -443,7 +444,7 @@ func TestViewportCountsExpandedDetailLines(t *testing.T) {
 
 func TestViewportKeepsExpandedParentAndDetailTogether(t *testing.T) {
 	m := NewModel(&fakeBackend{}, Options{WS: "vb", Root: "/workspace"})
-	m.Height = 7 // exactly two physical content lines
+	m.Height = 4 // heading + exactly two physical content lines + footer
 	key := sessionKey{generation: "generation-a", id: "$8"}
 	m.expanded[key] = true
 	m.paths[key] = pathState{value: "/workspace/web", valid: true}
@@ -472,7 +473,7 @@ func TestClickingDetailSelectsParentSession(t *testing.T) {
 	m.Cursor = 1
 
 	mod, _ := m.Update(tea.MouseMsg{
-		Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		Y: 2, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
 	})
 	if got := mod.(Model).Cursor; got != 0 {
 		t.Fatalf("detail click selected row %d, want parent row 0", got)
@@ -971,19 +972,115 @@ func TestKillConfirmSurvivesRowChurn(t *testing.T) {
 	}
 }
 
-func TestHelpBlockRendered(t *testing.T) {
-	m := NewModel(&fakeBackend{}, Options{WS: "vb"})
-	v := m.View()
-	helpLines := []string{
-		" terms: ↵ open · ←/→ details · n new · r rename · x kill",
-		" tree:  ↵ open · l files · h close · x kill",
-		" focus: ⌥1 tree · ⌥2 terminal · ⌥3 terms",
-		" q detach · Q shutdown",
-	}
-	for _, line := range helpLines {
-		if !strings.Contains(v, line) {
-			t.Errorf("missing help text %q in view:\n%s", line, v)
+func TestViewHasTerminalsHeadingAndCompactFooter(t *testing.T) {
+	m := NewModel(&fakeBackend{}, Options{
+		WS:   "vb",
+		Keys: config.Keys{FocusTerms: "M-3"},
+	})
+	view := ansi.Strip(m.View())
+	for _, want := range []string{"Terminals (⌥3)", "h help · q detach · Q shutdown"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Contains(view, "terms: ↵ open") {
+		t.Fatalf("old permanent help remains:\n%s", view)
+	}
+}
+
+func TestTermsHelpCloseKeysDoNotDetach(t *testing.T) {
+	for _, closeKey := range []tea.KeyMsg{
+		key("h"),
+		{Type: tea.KeyEsc},
+		key("q"),
+	} {
+		t.Run(closeKey.String(), func(t *testing.T) {
+			b := &fakeBackend{}
+			m := NewModel(b, Options{WS: "vb"})
+			mod, _ := m.Update(key("h"))
+			if !mod.(Model).helpOpen {
+				t.Fatal("h did not open Help")
+			}
+			mod, _ = mod.Update(closeKey)
+			if mod.(Model).helpOpen {
+				t.Fatalf("%q did not close Help", closeKey.String())
+			}
+			if b.detached {
+				t.Fatalf("%q detached while closing Help", closeKey.String())
+			}
+		})
+	}
+}
+
+func TestTermsHelpKeepsActionsInertAndPollingLive(t *testing.T) {
+	b := &fakeBackend{}
+	m := NewModel(b, Options{WS: "vb"})
+	mod, _ := m.Update(rowsMsg{sessions: []tmux.SessionInfo{
+		{ID: "$7", Generation: "generation", Name: "vb/a"},
+		{ID: "$8", Generation: "generation", Name: "vb/b"},
+	}})
+	got := mod.(Model)
+	got.Cursor = 1
+	keyA := sessionKey{generation: "generation", id: "$7"}
+	got.expanded[keyA] = true
+	got.paths[keyA] = pathState{value: "/workspace/a", valid: true}
+	mod, _ = got.Update(key("h"))
+
+	mod, _ = mod.Update(key("k"))
+	mod, _ = mod.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 1})
+	mod, _ = mod.Update(key("Q"))
+	got = mod.(Model)
+	if got.Cursor != 1 || !got.expanded[keyA] || got.ConfirmShutdown {
+		t.Fatalf("Help mutated actions: cursor=%d expanded=%v shutdown=%v", got.Cursor, got.expanded[keyA], got.ConfirmShutdown)
+	}
+
+	mod, _ = mod.Update(rowsMsg{sessions: []tmux.SessionInfo{{
+		ID: "$9", Generation: "generation", Name: "vb/c",
+	}}})
+	if _, ok := mod.(Model).sessions["vb/c"]; !ok {
+		t.Fatal("session poll was ignored while Help was open")
+	}
+}
+
+func TestTermsHelpFitsSmallPaneHeights(t *testing.T) {
+	for _, height := range []int{1, 2} {
+		t.Run(fmt.Sprintf("height_%d", height), func(t *testing.T) {
+			m := NewModel(&fakeBackend{}, Options{WS: "vb"})
+			m.Width = 80
+			m.Height = height
+			m.helpOpen = true
+
+			lines := strings.Split(ansi.Strip(m.View()), "\n")
+			if len(lines) > height {
+				t.Fatalf("Help rendered %d lines into height %d:\n%s", len(lines), height, m.View())
+			}
+			if height == 2 && !strings.Contains(lines[1], "close") {
+				t.Fatalf("two-line Help should retain close hint:\n%s", m.View())
+			}
+		})
+	}
+}
+
+func TestTermsRenameAndConfirmationKeepPriorityOverHelp(t *testing.T) {
+	b := &fakeBackend{}
+	m := NewModel(b, Options{WS: "vb"})
+	mod, _ := m.Update(rowsMsg{sessions: []tmux.SessionInfo{{
+		ID: "$7", Generation: "generation", Name: "vb·term·1",
+		Kind: tmux.SessionKindScratch,
+	}}})
+	mod, _ = mod.Update(key("r"))
+	mod, _ = mod.Update(key("h"))
+	got := mod.(Model)
+	if got.helpOpen || string(got.renameBuf) != "h" {
+		t.Fatalf("rename should consume h: help=%v buffer=%q", got.helpOpen, got.renameBuf)
+	}
+
+	m = NewModel(b, Options{WS: "vb"})
+	mod, _ = m.Update(key("Q"))
+	mod, _ = mod.Update(key("h"))
+	got = mod.(Model)
+	if got.ConfirmShutdown || got.helpOpen {
+		t.Fatalf("h should cancel confirmation without opening Help: %+v", got.Nav)
 	}
 }
 
@@ -1006,11 +1103,7 @@ func TestViewNeverEmitsLineWiderThanPane(t *testing.T) {
 	}
 }
 
-// TestViewPinsHelpToBottom pins the new bottom-anchored layout: once a
-// WindowSizeMsg has reported the pane's height, the help block's last line
-// must land on the pane's last line, with blank padding soaking up the gap
-// between the rows and the footer+help group.
-func TestViewPinsHelpToBottom(t *testing.T) {
+func TestViewPinsCompactFooterToBottom(t *testing.T) {
 	b := &fakeBackend{}
 	m := NewModel(b, Options{WS: "vb"})
 	var mod tea.Model = m
@@ -1024,17 +1117,14 @@ func TestViewPinsHelpToBottom(t *testing.T) {
 	if len(lines) != 20 {
 		t.Fatalf("line count = %d, want 20 (pinned to pane height):\n%s", len(lines), v)
 	}
-	if !strings.Contains(lines[19], "q detach") {
-		t.Errorf("last line = %q, want the help block's final line", lines[19])
+	if !strings.Contains(lines[19], "h help") {
+		t.Errorf("last line = %q, want the compact action footer", lines[19])
 	}
-	if !strings.Contains(lines[16], "terms:") {
-		t.Errorf("line 16 = %q, want the help block's first line", lines[16])
+	if !strings.Contains(lines[0], "Terminals") {
+		t.Errorf("line 0 = %q, want pane heading", lines[0])
 	}
 }
 
-// TestViewNoHeightFallsBackToFlow pins the fallback: without a
-// WindowSizeMsg (height unknown), View keeps the original top-down flow —
-// rows, then a single blank line, then help (no pinning attempted).
 func TestViewNoHeightFallsBackToFlow(t *testing.T) {
 	b := &fakeBackend{}
 	m := NewModel(b, Options{WS: "vb"})
@@ -1044,15 +1134,15 @@ func TestViewNoHeightFallsBackToFlow(t *testing.T) {
 	}})
 	v := mod.View()
 	lines := strings.Split(v, "\n")
-	if lines[1] != "" {
-		t.Errorf("line 1 = %q, want a blank separator (old flow: rows, blank, help)", lines[1])
+	if !strings.Contains(lines[0], "Terminals") {
+		t.Errorf("line 0 = %q, want pane heading", lines[0])
 	}
-	if !strings.Contains(lines[2], "terms:") {
-		t.Errorf("line 2 = %q, want the help block's first line right after the blank", lines[2])
+	if !strings.Contains(lines[1], "vb/a") {
+		t.Errorf("line 1 = %q, want first row after heading", lines[1])
 	}
 	last := lines[len(lines)-1]
-	if !strings.Contains(last, "q detach") {
-		t.Errorf("last line = %q, want the help block's final line", last)
+	if !strings.Contains(last, "h help") {
+		t.Errorf("last line = %q, want compact action footer", last)
 	}
 }
 
@@ -1268,8 +1358,9 @@ func TestMouseClickMovesCursorNoBackendCalls(t *testing.T) {
 		{Name: "vb/a", Activity: 100},
 		{Name: "vb/b", Activity: 100},
 	}})
-	// rows sort alphabetically here (no bell/activity signal): vb/a(0), vb/b(1).
-	mod, _ = mod.Update(tea.MouseMsg{Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	// Rows sort by creation fallback here: vb/a(0), vb/b(1). The heading
+	// occupies physical line 0, so vb/b is physical line 2.
+	mod, _ = mod.Update(tea.MouseMsg{Y: 2, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	sm := mod.(Model)
 	if sm.Cursor != 1 {
 		t.Fatalf("cursor = %d, want 1", sm.Cursor)
@@ -1353,9 +1444,9 @@ func TestViewportTranslatesMouseRows(t *testing.T) {
 	}
 	m.Height = 8
 	m.Cursor = len(m.rows()) - 1
-	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 0})
-	if got := mod.(Model).Cursor; got != len(m.rows())-3 {
-		t.Fatalf("cursor = %d, want first visible row %d", got, len(m.rows())-3)
+	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 1})
+	if got := mod.(Model).Cursor; got != len(m.rows())-6 {
+		t.Fatalf("cursor = %d, want first visible row %d", got, len(m.rows())-6)
 	}
 }
 
@@ -1368,7 +1459,7 @@ func TestViewportIgnoresClicksBelowVisibleRows(t *testing.T) {
 	m.Height = 8
 	m.Cursor = len(m.rows()) - 1
 	before := m.Cursor
-	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 3})
+	mod, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: 7})
 	if got := mod.(Model).Cursor; got != before {
 		t.Fatalf("help click moved cursor from %d to hidden row %d", before, got)
 	}

@@ -25,7 +25,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	if cfg.Defaults.Cmd != "" {
 		t.Fatalf("defaults.cmd = %q, want empty login shell", cfg.Defaults.Cmd)
 	}
-	want := Keys{FocusTree: "M-1", FocusTerminal: "M-2", FocusTerms: "M-3"}
+	want := Keys{FocusTree: "M-2", FocusTerminal: "M-1", FocusTerms: "M-3"}
 	if cfg.Keys != want {
 		t.Fatalf("keys = %+v, want %+v", cfg.Keys, want)
 	}
