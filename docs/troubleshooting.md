@@ -26,6 +26,15 @@ macos-option-as-alt = true
 Or replace the bindings with tmux key syntax in
 [configuration](configuration.md#focus-keys).
 
+## tmux keys do nothing, or I cannot resize or scroll
+
+wrap remaps the tmux prefix to `C-q` and hides the status bar, so the default
+`C-b` does nothing and there is no on-screen reminder. Reach tmux with `C-q`:
+a bare arrow key switches panes, `C-q` then `Ctrl`+arrow (or `Alt`+arrow for a
+larger step) resizes a pane, and `C-q` then `[` (or the mouse wheel) enters
+copy mode for scrollback. See
+[Layout and keys](../README.md#tmux-prefix-and-pane-control) for the full list.
+
 ## Copy mode does not update the clipboard
 
 wrap enables tmux clipboard forwarding, but the terminal can still reject OSC
