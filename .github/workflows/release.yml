@@ -26,32 +26,45 @@ jobs:
   release:
     needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Sign build provenance for the release archives via Sigstore/OIDC
+      # and record the attestation on the repository.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # actions/checkout resolves the pushed tag to a lightweight ref;
-      # re-fetch it so --notes-from-tag sees the annotation.
-      - name: fetch tag annotation
+        with:
+          # Full history so the tag-on-main ancestry check below has the
+          # graph connecting the tag commit to main's tip; a shallow clone
+          # cannot resolve merge-base.
+          fetch-depth: 0
+      # actions/checkout resolves the pushed tag to a lightweight ref, so
+      # re-fetch the annotated object (and main) here. The graph validation —
+      # annotated, points at HEAD, and on main so unreviewed history cannot
+      # ship — lives in scripts/check-release-tag.sh, covered by
+      # scripts/test-check-release-tag.sh.
+      - name: validate release tag
         run: |
           git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
-          tag_object=$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")
-          tag_commit=$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")
-          head_commit=$(git rev-parse HEAD)
-          if [ "$(git cat-file -t "$tag_object")" != tag ]; then
-            echo "Release tags must be annotated" >&2
-            exit 1
-          fi
-          if [ "$tag_commit" != "$head_commit" ]; then
-            echo "Tag moved while this workflow was running; refusing a stale release" >&2
-            exit 1
-          fi
+          git fetch --force origin main
+          tag_object=$(./scripts/check-release-tag.sh "refs/tags/${GITHUB_REF_NAME}" origin/main)
           echo "WRAP_EXPECTED_TAG_OBJECT=$tag_object" >>"$GITHUB_ENV"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # Release retries must use the same compiler patch: selecting the
-          # moving 1.26 line can change binaries and checksums for one tag.
-          go-version: 1.26.5
+          # Single source of truth: the tag's go.mod pins the exact toolchain
+          # (toolchain go1.26.x), so release retries and the CI gate that
+          # precedes them build with the same compiler patch.
+          go-version-file: go.mod
       - name: build release archives
         run: ./scripts/package-release.sh "$GITHUB_REF_NAME" dist
+      # Attest provenance for the exact archives before they are published,
+      # so consumers can verify with `gh attestation verify` that these
+      # binaries were built by this workflow from this commit.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/wrap_*.tar.gz
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}

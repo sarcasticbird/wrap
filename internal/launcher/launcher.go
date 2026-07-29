@@ -146,7 +146,11 @@ func (m *Manager) beginWorkspaceMutation() (func() error, error) {
 	return release, nil
 }
 
-func (m *Manager) uiWindow() string        { return m.UISession() + ":0" }
+// uiWindow anchors the session name with "=" so tmux matches this
+// workspace's chrome exactly. Without it, an unanchored target falls back
+// to prefix/fnmatch and can resolve to another workspace (wrap-vb vs
+// wrap-vb2) whenever this one is transiently absent during teardown.
+func (m *Manager) uiWindow() string        { return "=" + m.UISession() + ":0" }
 func (m *Manager) paneTarget(i int) string { return m.uiWindow() + "." + strconv.Itoa(i) }
 
 // EnsureSessionServer guarantees the home session exists and that killing
@@ -181,7 +185,22 @@ func (m *Manager) ensureHomeSession(homeDir string) (bool, error) {
 			}
 		}
 		if err := m.Sess.NewSession(HomeSession, homeDir, ""); err != nil {
-			return false, fmt.Errorf("create home session: %w", err)
+			// Check-then-act race: another pane on the session server can
+			// create the home session between our HasSession probe and this
+			// new-session, which tmux then rejects as a duplicate. Re-check
+			// before surfacing the error — if the session now exists, the
+			// race resolved in our favor and this is not a failure.
+			hasHome, recheckErr := m.Sess.HasSession(HomeSession)
+			if recheckErr != nil {
+				return false, errors.Join(
+					fmt.Errorf("create home session: %w", err),
+					fmt.Errorf("recheck fallback session %s: %w", HomeSession, recheckErr),
+				)
+			}
+			if !hasHome {
+				return false, fmt.Errorf("create home session: %w", err)
+			}
+			return false, nil
 		}
 		return true, nil
 	}
@@ -1070,14 +1089,17 @@ func (m *Manager) landingAfterKill(killed, successor string) (string, error) {
 		return "", errors.Join(append(checkErrs, fmt.Errorf("check fallback session %s: %w", HomeSession, err))...)
 	}
 	if !hasHome {
-		created, err := m.ensureHomeSession("")
-		if err != nil {
+		if _, err := m.ensureHomeSession(""); err != nil {
 			return "", errors.Join(append(checkErrs, fmt.Errorf("prepare fallback session %s: %w", HomeSession, err))...)
 		}
-		if created {
-			if _, err := m.configureSessionServer(); err != nil {
-				return HomeSession, errors.Join(append(checkErrs, fmt.Errorf("configure fallback session %s: %w", HomeSession, err))...)
-			}
+		// Configure whenever the home session was absent, not only when this
+		// pane created it. On a concurrent create ensureHomeSession reports
+		// created=false, but the racing winner may not have finished
+		// configuring a freshly restarted server — redirecting a client to an
+		// unconfigured generation would fail validation. configureSessionServer
+		// is idempotent, so a redundant configure by the losing pane is safe.
+		if _, err := m.configureSessionServer(); err != nil {
+			return HomeSession, errors.Join(append(checkErrs, fmt.Errorf("configure fallback session %s: %w", HomeSession, err))...)
 		}
 	}
 	return HomeSession, errors.Join(checkErrs...)
@@ -1270,7 +1292,12 @@ func (m *Manager) ShutdownWorkspace() error {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
-		return errors.Join(errors.Join(errs...), release())
+		// Partial failure: the chrome stays alive so the user sees what
+		// broke. Clear the barrier too — the workspace is NOT going away,
+		// and leaving it set would refuse every later mutation (and every
+		// retry) until a full relaunch. A clean sweep below deliberately
+		// leaves the barrier set: that workspace really is gone.
+		return errors.Join(errors.Join(errs...), state.ClearShutdown(m.WS), release())
 	}
 	return errors.Join(m.UI.KillSession(m.UISession()), release())
 }

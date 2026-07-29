@@ -98,6 +98,39 @@ func TestLockUIServerSerializesAcrossWorkspaces(t *testing.T) {
 	}
 }
 
+// TestLockWorkspaceReturnsBusyWhenHeldTooLong guards the UI against an
+// indefinite freeze. Workspace mutations (new terminal, kill, shutdown) run
+// synchronously on the Bubble Tea Update goroutine, so a blocking flock would
+// hang the whole TUI for as long as a sibling process holds the lock. The
+// lock must instead give up after a bounded wait and return an error the pane
+// can surface, rather than block forever.
+func TestLockWorkspaceReturnsBusyWhenHeldTooLong(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	releaseFirst, err := LockWorkspace("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = releaseFirst() })
+
+	done := make(chan error, 1)
+	go func() {
+		release, err := LockWorkspace("api")
+		if err == nil {
+			_ = release() // unexpected; clean up so we don't leak the lock
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("second LockWorkspace acquired a lock still held; expected a busy error")
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("LockWorkspace blocked indefinitely on a held lock instead of returning a bounded busy error")
+	}
+}
+
 func TestWriteRead(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	if _, ok, err := Read("wrap"); err != nil || ok {

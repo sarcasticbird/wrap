@@ -206,7 +206,7 @@ func (n Nav) ConfirmFooter(showing string) string {
 		return AlertStyle.Render(" shutdown workspace? y/n ")
 	}
 	if n.ErrText != "" {
-		return AlertStyle.Render(" " + n.ErrText + " ")
+		return AlertStyle.Render(" " + SafeLabel(n.ErrText) + " ")
 	}
 	return ""
 }

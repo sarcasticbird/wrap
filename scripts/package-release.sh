@@ -23,8 +23,23 @@ case "$version" in
     ;;
 esac
 
+# shellcheck disable=SC1007 # CDPATH= is a deliberate empty env assignment for cd
 repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+
+# Pin the compiler to the exact toolchain go.mod names, not merely a newer
+# local Go. The `toolchain` directive is only a floor for go commands, so a
+# newer installed toolchain would silently build the release and break the
+# reproducibility the pin promises. GOTOOLCHAIN makes it exact; derive it from
+# the single canonical source so CI, local builds, and every retry agree.
+GOTOOLCHAIN=$(awk '$1 == "toolchain" { print $2; exit }' "$repo/go.mod")
+if [ -z "$GOTOOLCHAIN" ]; then
+  echo "go.mod has no toolchain directive; cannot pin the release compiler" >&2
+  exit 1
+fi
+export GOTOOLCHAIN
+
 mkdir -p "$output"
+# shellcheck disable=SC1007 # CDPATH= is a deliberate empty env assignment for cd
 output=$(CDPATH= cd -- "$output" && pwd)
 stage_root=$(mktemp -d "$output/.stage.XXXXXX")
 trap 'rm -rf -- "$stage_root"' 0 1 2 15

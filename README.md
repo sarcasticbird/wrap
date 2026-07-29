@@ -113,6 +113,25 @@ absolute.
     ./current/path
 ```
 
+### tmux prefix and pane control
+
+wrap runs its chrome on its own tmux server with the prefix remapped to
+`C-q` (not tmux's default `C-b`), the status bar hidden, and mouse and
+system-clipboard integration on. The keys in the table above are wrap's own;
+everything tmux still provides is reached through the `C-q` prefix. Because the
+status bar is hidden, there is no on-screen reminder of the prefix.
+
+| Task | How |
+| --- | --- |
+| Move between panes | `C-q` then an arrow key |
+| Resize a pane | Drag the pane border with the mouse, or `C-q` then `Ctrl`+arrow (one cell) or `Alt`+arrow (a larger step) |
+| Scroll back / copy mode | Scroll the mouse wheel, or press `C-q` then `[`; leave with `q` or Escape |
+| Copy a selection | Select with the mouse — the text is sent to your system clipboard. From the keyboard, copy mode follows your tmux copy table (emacs by default: `Ctrl-Space` starts the selection, `Alt-w` copies) |
+| Any other tmux command | `C-q` then the usual tmux key |
+
+`q` and `Q` in the table are handled by wrap's panes, not tmux, so they never
+need the prefix.
+
 ## Configuration
 
 Configuration is optional. Copy [the tested example](examples/wrap.toml) to

@@ -44,6 +44,8 @@ jobs:
         run: ./scripts/test-package-release.sh
       - name: release publication state machine
         run: ./scripts/test-publish-release.sh
+      - name: release tag ancestry gate
+        run: ./scripts/test-check-release-tag.sh
       - name: test
         run: go test -race ./...
       - name: vet

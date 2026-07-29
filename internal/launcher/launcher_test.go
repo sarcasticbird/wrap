@@ -1392,8 +1392,8 @@ func TestLaunchUIBuildsChrome(t *testing.T) {
 	all := f.all()
 	for _, want := range []string{
 		"-f /dev/null -L wrap-ui new-session -d -s wrap-vb -x 220 -y 60 '/bin/wrap' sidebar 'vb'",
-		"-f /dev/null -L wrap-ui split-window -h -t wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'",
-		"-f /dev/null -L wrap-ui split-window -v -t wrap-vb:0.0 -l 30% '/bin/wrap' watch 'vb'",
+		"-f /dev/null -L wrap-ui split-window -h -t =wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'",
+		"-f /dev/null -L wrap-ui split-window -v -t =wrap-vb:0.0 -l 30% '/bin/wrap' watch 'vb'",
 		"-f /dev/null -L wrap-ui set-option -g status off",
 		"-f /dev/null -L wrap-ui set-option -g prefix C-q",
 		"-f /dev/null -L wrap-ui set-option -g mouse on",
@@ -1962,8 +1962,8 @@ func TestLaunchUIRightSideCommands(t *testing.T) {
 	all := f.all()
 	for _, want := range []string{
 		"-f /dev/null -L wrap-ui new-session -d -s wrap-vb -x 220 -y 60 '/bin/wrap' sidebar 'vb'",
-		"-f /dev/null -L wrap-ui split-window -h -b -t wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'",
-		"-f /dev/null -L wrap-ui split-window -v -t wrap-vb:0.1 -l 30% '/bin/wrap' watch 'vb'",
+		"-f /dev/null -L wrap-ui split-window -h -b -t =wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'",
+		"-f /dev/null -L wrap-ui split-window -v -t =wrap-vb:0.1 -l 30% '/bin/wrap' watch 'vb'",
 		"-f /dev/null -L wrap-ui set-option -t wrap-vb @wrap_tree_side right",
 		"-f /dev/null -L wrap-ui bind-key -n M-1 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .1 select-pane -t .0",
 		"-f /dev/null -L wrap-ui bind-key -n M-2 if-shell -F #{==:#{@wrap_tree_side},right} select-pane -t .0 select-pane -t .2",
@@ -2006,7 +2006,7 @@ func TestLaunchUIEmptyTreeSideDefaultsLeft(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := f.all()
-	if !strings.Contains(all, "split-window -h -t wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'") {
+	if !strings.Contains(all, "split-window -h -t =wrap-vb:0.0 -l 75% '/bin/wrap' attach 'vb'") {
 		t.Errorf("empty tree_side should default to the left layout:\n%s", all)
 	}
 	if strings.Contains(all, "-b") {
@@ -2024,7 +2024,7 @@ func TestLaunchUICustomTreeWidth(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := f.all()
-	if !strings.Contains(all, "split-window -h -t wrap-vb:0.0 -l 60% '/bin/wrap' attach 'vb'") {
+	if !strings.Contains(all, "split-window -h -t =wrap-vb:0.0 -l 60% '/bin/wrap' attach 'vb'") {
 		t.Errorf("treeWidth 40 should give a 60%% terminal split:\n%s", all)
 	}
 }
@@ -2041,7 +2041,7 @@ func TestLaunchUIRightSideCustomWidth(t *testing.T) {
 	if !strings.Contains(all, "-l 60%") {
 		t.Errorf("treeWidth 40 should give a 60%% terminal split:\n%s", all)
 	}
-	if !strings.Contains(all, "split-window -h -b -t wrap-vb:0.0 -l 60%") {
+	if !strings.Contains(all, "split-window -h -b -t =wrap-vb:0.0 -l 60%") {
 		t.Errorf("right layout should have -b flag for split:\n%s", all)
 	}
 	// Check binds match right-side table: .1 for sidebar, .0 for terminal, .2 for watcher
