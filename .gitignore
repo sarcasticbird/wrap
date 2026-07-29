@@ -1,0 +1,15 @@
+# Build artifacts
+/wrap
+/dist/
+*.test
+coverage.out
+
+# Agent and task tooling. These are listed here rather than left to a
+# personal global excludes file so the repo is self-sufficient: a
+# contributor running the same tools should not see their scratch state
+# as untracked noise, or accidentally commit it.
+.agents/
+.claude/
+.superpowers/
+.kata.toml
+.kata.local.toml
