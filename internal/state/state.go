@@ -11,9 +11,41 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sarcasticbird/wrap/internal/config"
 )
+
+// lockWait bounds how long a lock acquisition polls a contended flock before
+// giving up. Workspace mutations run on the Bubble Tea Update goroutine, so a
+// blocking acquire freezes the whole TUI; a bounded, non-blocking wait caps
+// that freeze and converts a stuck holder into a recoverable "busy" error
+// instead of an indefinite hang. Normal contention (one tmux round-trip)
+// clears in well under this window.
+const (
+	lockWait = 2 * time.Second
+	lockPoll = 25 * time.Millisecond
+)
+
+// acquireFlock takes an exclusive flock on fd, polling without blocking so the
+// caller never hangs the UI. It returns an error if the lock stays held for
+// longer than lockWait.
+func acquireFlock(fd int) error {
+	deadline := time.Now().Add(lockWait)
+	for {
+		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if err != syscall.EWOULDBLOCK {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("busy: still held after %s", lockWait)
+		}
+		time.Sleep(lockPoll)
+	}
+}
 
 // Selection is the workspace's current pick: which tree row is active and
 // which tmux session backs it. Written by the tree pane, read by the terms
@@ -84,7 +116,7 @@ func lockFile(path, subject string) (func() error, error) {
 	if err != nil {
 		return nil, fmt.Errorf("state: open %s lock %s: %w", subject, path, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := acquireFlock(int(f.Fd())); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("state: lock %s: %w", subject, err),
 			f.Close(),
