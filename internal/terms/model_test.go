@@ -268,6 +268,7 @@ func TestMirrorOperationMessagesIgnoreStaleCompletionsAndSnapshots(t *testing.T)
 func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
 	const pairingURL = "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 	m := Model{
+		mirrorOpen:       true,
 		mirrorTargetName: "vb/api",
 		mirrorSnapshot: mirrorapi.Snapshot{
 			State:      mirrorapi.StateReady,
@@ -289,6 +290,47 @@ func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
 	}
 	if strings.Contains(view, "QR-LINE") {
 		t.Fatalf("narrow mirror overlay rendered a partial QR:\n%s", view)
+	}
+}
+
+func TestMirrorOverlayScrollsThroughCompletePairingURL(t *testing.T) {
+	const pairingURL = "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	m := Model{
+		mirrorOpen:       true,
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: pairingURL,
+			Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+		},
+	}
+	m.Width = 12
+	m.Height = 4
+	urlLines := mirrorWrapLine(pairingURL, m.Width)
+	if m.mirrorMaxScroll() == 0 {
+		t.Fatal("short overlay did not expose a scroll range")
+	}
+	for _, want := range urlLines {
+		found := false
+		for offset := 0; offset <= m.mirrorMaxScroll(); offset++ {
+			m.mirrorScroll = offset
+			if strings.Contains(ansi.Strip(m.mirrorView("Terminals")), want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("wrapped credential chunk %q is unreachable", want)
+		}
+	}
+	m.mirrorScroll = 0
+	mod, _ := m.Update(key("down"))
+	if mod.(Model).mirrorScroll != 1 {
+		t.Fatal("down did not scroll the mirror overlay")
+	}
+	mod, _ = mod.Update(key("up"))
+	if mod.(Model).mirrorScroll != 0 {
+		t.Fatal("up did not scroll the mirror overlay")
 	}
 }
 

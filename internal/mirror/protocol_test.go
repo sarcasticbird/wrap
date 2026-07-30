@@ -64,6 +64,17 @@ func TestProtocolValidatesDirectionIdentityAndDimensions(t *testing.T) {
 	}
 }
 
+func TestServerCloseAcknowledgementMustBeEmpty(t *testing.T) {
+	for _, payload := range []any{nil, []byte{}} {
+		if err := ValidateServerFrame(TagClose, payload); err != nil {
+			t.Fatalf("empty close acknowledgement %T rejected: %v", payload, err)
+		}
+	}
+	if err := ValidateServerFrame(TagClose, []byte("unexpected")); err == nil {
+		t.Fatal("non-empty close acknowledgement accepted")
+	}
+}
+
 func TestChunkOutputKeepsCiphertextWithinWireLimit(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), MaxWireMessage*2)
 	chunks := ChunkOutput(data)

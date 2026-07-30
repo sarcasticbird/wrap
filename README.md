@@ -167,6 +167,7 @@ HTTP request, WebSocket header, query, or cookie.
 
 Inside the overlay:
 
+- Up / Down or `j` / `k` scroll pairing details in a short pane.
 - `x` revokes the selected terminal; revoking the last one stops the server
   and tunnel.
 - `R` creates a new pairing credential and disconnects existing browsers.

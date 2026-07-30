@@ -200,6 +200,13 @@ func (c *Client) SendOutput(ctx context.Context, output []byte) error {
 	return nil
 }
 
+func (c *Client) sendCloseAcknowledgement(ctx context.Context) error {
+	if err := ValidateServerFrame(TagClose, nil); err != nil {
+		return err
+	}
+	return c.send(ctx, TagClose, nil)
+}
+
 func (c *Client) send(ctx context.Context, tag byte, payload []byte) error {
 	select {
 	case <-ctx.Done():
@@ -332,7 +339,7 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 			return err
 		}
 		c.viewerOpen.Store(false)
-		return c.send(ctx, TagClose, nil)
+		return c.sendCloseAcknowledgement(ctx)
 	case TagInput:
 		if !c.viewerOpen.Load() {
 			return errors.New("no terminal is open")

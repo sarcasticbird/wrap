@@ -167,6 +167,7 @@ type Model struct {
 	mirrorCancel      context.CancelFunc
 	mirrorStarting    bool
 	mirrorOperationID uint64
+	mirrorScroll      int
 	mirrorReconciling bool
 	mirrorSyncErr     string
 }
@@ -374,6 +375,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.event.Snapshot != nil {
+			if msg.event.Snapshot.PairingURL != m.mirrorSnapshot.PairingURL {
+				m.mirrorScroll = 0
+			}
 			m.mirrorSnapshot = *msg.event.Snapshot
 		}
 		if msg.event.Viewed != nil {
@@ -532,6 +536,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.ErrText = ""
 		m.mirrorOpen = true
+		m.mirrorScroll = 0
 		m.mirrorTarget = mirrorapi.Identity{ID: target.id, Generation: target.generation}
 		m.mirrorTargetName = target.name
 		if target.mirrored {
@@ -665,6 +670,10 @@ func (m Model) startMirror(target row) (tea.Model, tea.Cmd) {
 
 func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
+	case "up", "k":
+		m.mirrorScroll = max(0, m.mirrorScroll-1)
+	case "down", "j":
+		m.mirrorScroll = min(m.mirrorMaxScroll(), m.mirrorScroll+1)
 	case "esc":
 		m.clearMirrorCancel()
 		m.mirrorStarting = false
@@ -1118,11 +1127,44 @@ func (m Model) footer() string {
 }
 
 func (m Model) mirrorView(heading string) string {
+	content := m.mirrorContentLines()
+	scroll := min(max(0, m.mirrorScroll), m.mirrorMaxScroll())
 	lines := []string{heading}
-	maxBody := 0
 	if m.Height > 0 {
-		maxBody = max(1, m.Height-1)
+		bodyHeight := max(0, m.Height-2)
+		end := min(len(content), scroll+bodyHeight)
+		lines = append(lines, content[scroll:end]...)
+	} else {
+		lines = append(lines, content...)
 	}
+	footer := "esc close"
+	if m.mirrorSnapshot.State == mirrorapi.StateReady {
+		footer = "x revoke · R rotate · esc close"
+	} else if !m.mirrorStarting {
+		footer = "m retry · esc close"
+	}
+	if m.mirrorMaxScroll() > 0 {
+		footer = "↑/↓ scroll · " + footer
+	}
+	for i := range lines {
+		if m.Width > 0 {
+			lines[i] = runewidth.Truncate(lines[i], m.Width, "")
+		}
+	}
+	if m.Height > 0 {
+		for len(lines) < m.Height-1 {
+			lines = append(lines, "")
+		}
+	}
+	if m.Width > 0 {
+		footer = runewidth.Truncate(footer, m.Width, "")
+	}
+	lines = append(lines, pane.DimStyle.Render(footer))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) mirrorContentLines() []string {
+	var lines []string
 	switch {
 	case m.mirrorStarting || m.mirrorSnapshot.State == mirrorapi.StateStarting:
 		lines = append(lines, "", "Starting encrypted mirror…", "", m.mirrorTargetName)
@@ -1147,9 +1189,7 @@ func (m Model) mirrorView(heading string) string {
 					}
 				}
 			}
-			qrFitsHeight := maxBody == 0 ||
-				mirrorRenderedRows(lines, m.Width)+1+len(qrLines) <= maxBody
-			if qrFitsWidth && qrFitsHeight {
+			if qrFitsWidth {
 				lines = append(lines, "")
 				lines = append(lines, qrLines...)
 			}
@@ -1161,33 +1201,14 @@ func (m Model) mirrorView(heading string) string {
 			"Check cloudflared is installed and retry.",
 		)
 	}
-	footer := "esc close"
-	if m.mirrorSnapshot.State == mirrorapi.StateReady {
-		footer = "x revoke · R rotate · esc close"
-	} else if !m.mirrorStarting {
-		footer = "m retry · esc close"
+	return lines
+}
+
+func (m Model) mirrorMaxScroll() int {
+	if m.Height <= 0 {
+		return 0
 	}
-	if maxBody == 0 {
-		maxBody = len(lines)
-	}
-	if len(lines) > maxBody {
-		lines = lines[:maxBody]
-	}
-	for i := range lines {
-		if m.Width > 0 {
-			lines[i] = runewidth.Truncate(lines[i], m.Width, "")
-		}
-	}
-	if m.Height > 0 {
-		for len(lines) < m.Height-1 {
-			lines = append(lines, "")
-		}
-	}
-	if m.Width > 0 {
-		footer = runewidth.Truncate(footer, m.Width, "")
-	}
-	lines = append(lines, pane.DimStyle.Render(footer))
-	return strings.Join(lines, "\n")
+	return max(0, len(m.mirrorContentLines())-max(0, m.Height-2))
 }
 
 func mirrorWrapLine(line string, width int) []string {
@@ -1211,16 +1232,4 @@ func mirrorWrapLine(line string, width int) []string {
 		lines = append(lines, string(chunk))
 	}
 	return lines
-}
-
-func mirrorRenderedRows(lines []string, width int) int {
-	if width <= 0 {
-		return len(lines)
-	}
-	rows := 0
-	for _, line := range lines {
-		lineRows := (runewidth.StringWidth(line) + width - 1) / width
-		rows += max(1, lineRows)
-	}
-	return rows
 }

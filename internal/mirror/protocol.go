@@ -165,6 +165,16 @@ func ValidateClientFrame(tag byte, value any) error {
 
 func ValidateServerFrame(tag byte, value any) error {
 	switch tag {
+	case TagClose:
+		switch payload := value.(type) {
+		case nil:
+		case []byte:
+			if len(payload) != 0 {
+				return errors.New("close acknowledgement payload must be empty")
+			}
+		default:
+			return errors.New("invalid close acknowledgement payload")
+		}
 	case TagMirrorList, TagStatus:
 		list, ok := value.(SessionList)
 		if !ok {
