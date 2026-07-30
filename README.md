@@ -2,7 +2,7 @@
 
 Supervise persistent coding-agent terminals from one tmux workspace.
 
-> **Status:** `v0.1.0-beta.1` is a pre-1.0 release. CLI and configuration
+> **Status:** `v0.1.0-beta.3` is a pre-1.0 release. CLI and configuration
 > behavior may change before 1.0.
 
 wrap opens a folder, discovers its Git repositories and worktrees, and gives
@@ -40,7 +40,7 @@ Go is needed only when installing from source.
 Install this beta with Go:
 
 ```sh
-go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.1
+go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.3
 wrap version
 ```
 
@@ -48,7 +48,7 @@ wrap version
 your `PATH`.
 
 Prebuilt archives for macOS and Linux are attached to the
-[`v0.1.0-beta.1` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.1).
+[`v0.1.0-beta.3` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.3).
 Each archive contains `wrap`, `LICENSE`, and `README.md`; verify it against
 `checksums.txt` before installing.
 
