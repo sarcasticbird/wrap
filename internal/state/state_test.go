@@ -330,6 +330,66 @@ func TestMetaRoundTrip(t *testing.T) {
 	}
 }
 
+func TestListMetaReturnsSortedValidAndInvalidRecords(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	for name, root := range map[string]string{
+		"alpha": "/work/alpha",
+		"zeta":  "/work/zeta",
+	} {
+		if err := WriteMeta(name, Meta{Kind: "folder", Root: root}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := filepath.Join(stateHome, "wrap")
+	if err := os.MkdirAll(filepath.Join(root, "absent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "broken"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "broken", "workspace.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ui-server.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ListMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNames := []string{"absent", "alpha", "broken", "zeta"}
+	if len(got) != len(wantNames) {
+		t.Fatalf("records = %+v, want names %v", got, wantNames)
+	}
+	for i, wantName := range wantNames {
+		if got[i].Name != wantName {
+			t.Errorf("record %d name = %q, want %q", i, got[i].Name, wantName)
+		}
+	}
+	if got[0].Err == nil || got[2].Err == nil {
+		t.Fatalf("invalid metadata errors = absent:%v broken:%v", got[0].Err, got[2].Err)
+	}
+	if got[1].Err != nil || got[1].Meta != (Meta{Kind: "folder", Root: "/work/alpha"}) {
+		t.Errorf("alpha record = %+v", got[1])
+	}
+	if got[3].Err != nil || got[3].Meta != (Meta{Kind: "folder", Root: "/work/zeta"}) {
+		t.Errorf("zeta record = %+v", got[3])
+	}
+}
+
+func TestListMetaMissingRootIsEmpty(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	got, err := ListMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("records = %+v, want empty", got)
+	}
+}
+
 // Concurrent writers must never publish a spliced document. A shared
 // fixed temp path let two writes interleave into one file before either
 // rename, so the winner could publish a mixture of both.

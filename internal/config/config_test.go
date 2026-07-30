@@ -93,6 +93,32 @@ func TestSessionOwnedBy(t *testing.T) {
 	}
 }
 
+func TestSessionWorkspace(t *testing.T) {
+	tests := []struct {
+		name      string
+		session   string
+		want      string
+		wantValid bool
+	}{
+		{name: "root", session: "vb", want: "vb", wantValid: true},
+		{name: "entry", session: "vb/api", want: "vb", wantValid: true},
+		{name: "scratch", session: "vb·term·1", want: "vb", wantValid: true},
+		{name: "renamed scratch", session: "vb·term·logs", want: "vb", wantValid: true},
+		{name: "diff", session: "vb·diff", want: "vb", wantValid: true},
+		{name: "home", session: HomeSession},
+		{name: "invalid owner", session: "bad\nname"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := SessionWorkspace(tt.session)
+			if got != tt.want || ok != tt.wantValid {
+				t.Fatalf("SessionWorkspace(%q) = %q, %v; want %q, %v",
+					tt.session, got, ok, tt.want, tt.wantValid)
+			}
+		})
+	}
+}
+
 func TestWalkDepth(t *testing.T) {
 	c, _, err := Load(writeConfig(t, "walk_depth = 3\n"))
 	if err != nil {

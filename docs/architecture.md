@@ -161,6 +161,26 @@ selection remains highlighted. The monitor asks tmux which session the nested
 client actually displays; persisted tree selection is not treated as display
 ground truth.
 
+`wrap tui` is another local polling client, not a daemon or registry. It
+enumerates workspace metadata, then reconciles those names and canonical roots
+with live `wrap-<workspace>` sessions on `wrap-ui` and exact owned sessions on
+`wrap`. Metadata with neither kind of live session is omitted. Chrome reports
+whether a client is attached; owned work sessions without chrome produce a
+recoverable row. Selecting any row delegates to the normal folder launch path,
+so live chrome is reused and missing chrome is rebuilt only after the usual
+configuration, discovery, ownership, topology, and migration checks.
+The selector carries both the persisted workspace name and canonical root
+through its child launch. That child takes the workspace lock, rechecks the
+exact metadata and live tmux ownership, and refuses to create anything if the
+row disappeared or changed after it was displayed.
+
+The selector polls every two seconds and preserves both its last successful
+rows and selected workspace identity across refreshes. A transient source
+failure marks those rows stale instead of replacing them with an empty list.
+Stale or non-visible rows cannot be selected.
+Malformed or missing metadata for a live workspace is surfaced as a warning
+and never becomes a selectable recovery target.
+
 The monitor keeps sessions in tmux creation order; rename, bell, activity,
 selection, and active-pane changes do not reorder rows. Tmux's
 `session_created` timestamp provides the primary key and the numeric stable

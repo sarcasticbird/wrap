@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -18,6 +20,8 @@ import (
 	"github.com/sarcasticbird/wrap/internal/tmux"
 	"github.com/sarcasticbird/wrap/internal/tree"
 	"github.com/sarcasticbird/wrap/internal/workspace"
+	"github.com/sarcasticbird/wrap/internal/workspaces"
+	"github.com/sarcasticbird/wrap/internal/workspacesui"
 )
 
 // version is stamped by the release build via
@@ -68,29 +72,61 @@ func dispatchPane(args []string, fn func(string) error) error {
 	return fn(ws)
 }
 
+func dispatchTUIAttach(args []string, fn func(string, string) error) error {
+	if len(args) != 3 || args[1] == "" || args[2] == "" {
+		return errors.New("internal command — run wrap tui")
+	}
+	return fn(args[1], args[2])
+}
+
 func main() {
-	args := os.Args[1:]
+	err := runArgs(os.Args[1:], commandFuncs{
+		sidebar:   runSidebar,
+		watch:     runWatch,
+		attach:    runAttach,
+		tui:       runTUI,
+		tuiAttach: runTUIAttach,
+		launch:    runLaunch,
+		version:   func() { fmt.Println("wrap", version) },
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "wrap:", err)
+		os.Exit(1)
+	}
+}
+
+type commandFuncs struct {
+	sidebar   func(string) error
+	watch     func(string) error
+	attach    func(string) error
+	tui       func() error
+	tuiAttach func(string, string) error
+	launch    func(string) error
+	version   func()
+}
+
+func runArgs(args []string, funcs commandFuncs) error {
 	cmd := ""
 	if len(args) > 0 {
 		cmd = args[0]
 	}
-	var err error
 	switch cmd {
 	case "sidebar":
-		err = dispatchPane(args, runSidebar)
+		return dispatchPane(args, funcs.sidebar)
 	case "watch":
-		err = dispatchPane(args, runWatch)
+		return dispatchPane(args, funcs.watch)
 	case "attach":
-		err = dispatchPane(args, runAttach)
+		return dispatchPane(args, funcs.attach)
+	case "tui":
+		return funcs.tui()
+	case "tui-attach":
+		return dispatchTUIAttach(args, funcs.tuiAttach)
 	case "version":
-		fmt.Println("wrap", version)
+		funcs.version()
+		return nil
 	default:
 		// "" or a directory: launch that workspace.
-		err = runLaunch(cmd)
-	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "wrap:", err)
-		os.Exit(1)
+		return funcs.launch(cmd)
 	}
 }
 
@@ -104,7 +140,9 @@ func discoverFn(cfg *config.Config) func(string) ([]gitx.Discovered, []string, e
 	}
 }
 
-func runLaunch(target string) (retErr error) {
+type workspaceGuard func(*launcher.Manager, state.Meta) (func() error, error)
+
+func runLaunch(target string) error {
 	if err := tmux.CheckVersion(tmux.NewServer(tmux.SocketUI).R); err != nil {
 		return err
 	}
@@ -120,6 +158,15 @@ func runLaunch(target string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	return runResolvedWorkspace(ws, cwd, cfgWarns, discoveryWarns,
+		func(m *launcher.Manager, meta state.Meta) (func() error, error) {
+			return m.GuardWorkspaceMeta(meta)
+		})
+}
+
+func runResolvedWorkspace(ws *workspace.Workspace, cwd string, cfgWarns, discoveryWarns []string,
+	guard workspaceGuard,
+) (retErr error) {
 	entryNames, entryPaths, entryWarn := tree.EntryNamesAndPaths(ws.Root, ws.Name, ws.Repos)
 	topologyComplete, topologyDetail := migrationTopology(discoveryWarns, entryWarn)
 	warns := append([]string{}, cfgWarns...)
@@ -134,7 +181,7 @@ func runLaunch(target string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	releaseOwnership, err := m.GuardWorkspaceMeta(ws.Meta())
+	releaseOwnership, err := guard(m, ws.Meta())
 	if err != nil {
 		return err
 	}
@@ -309,6 +356,123 @@ func runAttach(ws string) error {
 		return err
 	}
 	return m.RunMiddleAttach()
+}
+
+type selectorFunc func(initialNote string) (workspaces.Workspace, bool, error)
+
+func runTUILoop(selectWorkspace selectorFunc,
+	launch func(workspaces.Workspace) (string, error),
+) error {
+	initialNote := ""
+	for {
+		selected, ok, err := selectWorkspace(initialNote)
+		if err != nil {
+			return fmt.Errorf("run workspace selector: %w", err)
+		}
+		if !ok {
+			return nil
+		}
+		note, err := launch(selected)
+		if err != nil {
+			initialNote = err.Error()
+			continue
+		}
+		initialNote = note
+	}
+}
+
+func runTUI() error {
+	source := workspaces.NewRuntimeSource()
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate wrap binary for workspace selector: %w", err)
+	}
+	return runTUILoop(func(initialNote string) (workspaces.Workspace, bool, error) {
+		return workspacesui.Run(workspacesui.Options{
+			Discover: func() (workspaces.Snapshot, error) {
+				return workspaces.Discover(source)
+			},
+			InitialNote: initialNote,
+		})
+	}, func(selected workspaces.Workspace) (string, error) {
+		return runSelectedWrapChild(executable, selected)
+	})
+}
+
+func runTUIAttach(name, root string) error {
+	if err := tmux.CheckVersion(tmux.NewServer(tmux.SocketUI).R); err != nil {
+		return err
+	}
+	cfg, cfgWarns, err := loadConfigOptional()
+	if err != nil {
+		return err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getwd: %w", err)
+	}
+	ws, discoveryWarns, err := resolveSelectedWorkspace(
+		workspaces.Workspace{Name: name, Root: root},
+		cfg,
+		discoverFn(cfg),
+	)
+	if err != nil {
+		return err
+	}
+	return runResolvedWorkspace(ws, cwd, cfgWarns, discoveryWarns,
+		func(m *launcher.Manager, meta state.Meta) (func() error, error) {
+			return m.GuardActiveWorkspaceMeta(meta)
+		})
+}
+
+func resolveSelectedWorkspace(selected workspaces.Workspace, cfg *config.Config,
+	discover func(string) ([]gitx.Discovered, []string, error),
+) (*workspace.Workspace, []string, error) {
+	if !filepath.IsAbs(selected.Root) {
+		return nil, nil, fmt.Errorf("selected workspace %q root %q is not absolute", selected.Name, selected.Root)
+	}
+	canonical, err := filepath.EvalSymlinks(selected.Root)
+	if err != nil {
+		return nil, nil, fmt.Errorf("selected workspace %q root %q: %w",
+			selected.Name, selected.Root, err)
+	}
+	if canonical != filepath.Clean(selected.Root) {
+		return nil, nil, fmt.Errorf(
+			"selected workspace %q root changed since selector refresh: %q now resolves to %q",
+			selected.Name, selected.Root, canonical,
+		)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return nil, nil, fmt.Errorf("selected workspace %q root %q: %w",
+			selected.Name, canonical, err)
+	}
+	if !info.IsDir() {
+		return nil, nil, fmt.Errorf("selected workspace %q root %q is not a directory",
+			selected.Name, canonical)
+	}
+	return workspace.FromMeta(
+		selected.Name,
+		state.Meta{Kind: "folder", Root: selected.Root},
+		cfg,
+		discover,
+	)
+}
+
+func runSelectedWrapChild(executable string, selected workspaces.Workspace) (string, error) {
+	cmd := exec.Command(executable, "tui-attach", selected.Name, selected.Root)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			return "", fmt.Errorf("launch workspace %s at %s: %s: %w",
+				selected.Name, selected.Root, detail, err)
+		}
+		return "", fmt.Errorf("launch workspace %s at %s: %w", selected.Name, selected.Root, err)
+	}
+	return strings.TrimSpace(stderr.String()), nil
 }
 
 // loadConfigOptional: absent file is fine (nil config); a broken file
