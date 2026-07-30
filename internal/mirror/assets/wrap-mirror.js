@@ -212,6 +212,7 @@ let connection = null;
 let sessions = [];
 let current = null;
 let closing = null;
+let awaitingCloseAcknowledgement = false;
 let reconnectAttempt = 0;
 let reconnectTimer = 0;
 let stopped = false;
@@ -314,7 +315,7 @@ function dimensions() {
 }
 
 function openSession(session) {
-  if (!connection?.authenticated || closing) {
+  if (!connection?.authenticated || closing || awaitingCloseAcknowledgement) {
     return;
   }
   terminal.reset();
@@ -413,6 +414,7 @@ async function receiveMessage(target, data) {
             (session) => session.id === closing.id && session.generation === closing.generation,
           );
           if (!closingStillMirrored) {
+            awaitingCloseAcknowledgement = true;
             closing = null;
             renderSessions(sessions);
           }
@@ -432,8 +434,13 @@ async function receiveMessage(target, data) {
       }
       break;
     case TAG.close:
-      if (!target.authenticated || !closing || frame.payload.length !== 0) {
+      if (!target.authenticated || frame.payload.length !== 0 ||
+        (!closing && !awaitingCloseAcknowledgement)) {
         throw new Error("unexpected close acknowledgement");
+      }
+      if (awaitingCloseAcknowledgement) {
+        awaitingCloseAcknowledgement = false;
+        break;
       }
       closing = null;
       renderSessions(sessions);
@@ -461,6 +468,9 @@ async function receiveMessage(target, data) {
       );
       if (isCurrent || isClosing) {
         current = null;
+        if (isClosing) {
+          awaitingCloseAcknowledgement = true;
+        }
         closing = null;
         showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
         setTimeout(() => renderSessions(sessions), 700);
@@ -489,6 +499,9 @@ async function receiveMessage(target, data) {
       const problem = parseJSON(frame.payload);
       if (problem.retry === false) {
         stopped = true;
+      }
+      if (closing) {
+        awaitingCloseAcknowledgement = true;
       }
       current = null;
       closing = null;
@@ -562,6 +575,7 @@ function connect() {
     connection = null;
     current = null;
     closing = null;
+    awaitingCloseAcknowledgement = false;
     if (event.code === 1008) {
       stopped = true;
       sessionStorage.removeItem(STORAGE_KEY);

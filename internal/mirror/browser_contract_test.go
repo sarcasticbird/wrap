@@ -105,13 +105,19 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 		}
 	}
 	for _, want := range []string{
+		`let awaitingCloseAcknowledgement = false`,
 		`const closingStillMirrored = sessions.some(`,
 		`if (!closingStillMirrored) {`,
 		`const isClosing = closing?.id === revoked.id`,
 		`if (isCurrent || isClosing) {`,
+		`(!closing && !awaitingCloseAcknowledgement)`,
+		`if (awaitingCloseAcknowledgement) {`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client does not resolve server-side close race %q", want)
 		}
+	}
+	if count := strings.Count(source, "awaitingCloseAcknowledgement = true"); count < 3 {
+		t.Errorf("browser client marks only %d of 3 server-resolved close paths", count)
 	}
 }

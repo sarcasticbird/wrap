@@ -138,6 +138,22 @@ func TestClientDispatchDropsFramesForViewerThatJustEnded(t *testing.T) {
 	}
 }
 
+func TestClientDispatchAcknowledgesCloseAfterViewerEnded(t *testing.T) {
+	client := &Client{
+		handler: dispatchHandler{},
+		queue:   newOutboundQueue(MaxClientQueueBytes),
+	}
+	if err := client.dispatch(t.Context(), TagClose, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	frame, ok := client.queue.pop(ctx)
+	if !ok || frame.tag != TagClose || len(frame.payload) != 0 {
+		t.Fatalf("stale close acknowledgement = %+v, %v", frame, ok)
+	}
+}
+
 func TestClientDispatchValidatesFramesForViewerThatJustEnded(t *testing.T) {
 	for _, test := range []struct {
 		name    string

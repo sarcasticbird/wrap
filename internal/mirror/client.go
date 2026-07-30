@@ -341,16 +341,16 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 			return err
 		}
 		if !c.viewerOpen.Load() {
-			return nil
+			return c.sendCloseAcknowledgement(ctx)
 		}
 		if err := c.handler.Close(c); err != nil {
 			if !c.viewerOpen.Load() {
-				return nil
+				return c.sendCloseAcknowledgement(ctx)
 			}
 			return err
 		}
 		if !c.viewerOpen.CompareAndSwap(true, false) {
-			return nil
+			return c.sendCloseAcknowledgement(ctx)
 		}
 		return c.sendCloseAcknowledgement(ctx)
 	case TagInput:
