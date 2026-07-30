@@ -85,9 +85,12 @@ func (f *PTYViewerFactory) Open(
 		)
 	}
 	viewer := &ptyViewer{
-		command:    command,
-		ptmx:       ptmx,
-		output:     output,
+		command: command,
+		ptmx:    ptmx,
+		output:  output,
+		terminalEnded: func() (bool, error) {
+			return f.viewerTerminalEnded(identity)
+		},
 		releasePin: releasePin,
 		done:       make(chan error, 1),
 		finished:   make(chan struct{}),
@@ -262,6 +265,24 @@ func (f *PTYViewerFactory) runTmux(args []string) (string, error) {
 	return string(output), nil
 }
 
+func (f *PTYViewerFactory) viewerTerminalEnded(identity Identity) (bool, error) {
+	result, err := f.runTmux([]string{
+		"display-message",
+		"-p",
+		"-t",
+		identity.ID,
+		"#{" + tmux.ServerGenerationOption + "}",
+	})
+	if errors.Is(err, tmux.ErrServerGenerationChanged) ||
+		tmux.IsMissingTargetError(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check mirrored terminal identity: %w", err)
+	}
+	return strings.TrimSpace(result) != identity.Generation, nil
+}
+
 func (f *PTYViewerFactory) commandSettings() (string, string, error) {
 	tmuxPath := f.TmuxPath
 	if tmuxPath == "" {
@@ -299,12 +320,13 @@ func cleanViewerEnvironment(environment []string) []string {
 }
 
 type ptyViewer struct {
-	command    *exec.Cmd
-	ptmx       *os.File
-	output     func([]byte) error
-	releasePin func() error
-	done       chan error
-	finished   chan struct{}
+	command       *exec.Cmd
+	ptmx          *os.File
+	output        func([]byte) error
+	terminalEnded func() (bool, error)
+	releasePin    func() error
+	done          chan error
+	finished      chan struct{}
 
 	ioMu          sync.Mutex
 	resultMu      sync.Mutex
@@ -381,7 +403,7 @@ func (v *ptyViewer) run() {
 	waitErr := v.command.Wait()
 	intentional := v.closing.Load()
 	v.terminate()
-	waitErr = viewerWaitError(waitErr, intentional)
+	waitErr = viewerExitResult(waitErr, intentional, v.terminalEnded)
 	var releaseErr error
 	if v.releasePin != nil {
 		releaseErr = v.releasePin()
@@ -404,4 +426,16 @@ func viewerWaitError(err error, intentional bool) error {
 		return nil
 	}
 	return err
+}
+
+func viewerExitResult(
+	waitErr error,
+	intentional bool,
+	terminalEnded func() (bool, error),
+) error {
+	if waitErr == nil || intentional || terminalEnded == nil {
+		return viewerWaitError(waitErr, intentional)
+	}
+	ended, probeErr := terminalEnded()
+	return errors.Join(viewerWaitError(waitErr, ended), probeErr)
 }

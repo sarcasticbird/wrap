@@ -70,6 +70,42 @@ func TestIntentionalViewerTerminationSuppressesKilledExit(t *testing.T) {
 	}
 }
 
+func TestViewerExitResultTreatsMissingTerminalAsGraceful(t *testing.T) {
+	command := exec.Command("sh", "-c", "exit 1")
+	waitErr := command.Run()
+	if waitErr == nil {
+		t.Fatal("fixture command unexpectedly succeeded")
+	}
+
+	probeCalls := 0
+	got := viewerExitResult(waitErr, false, func() (bool, error) {
+		probeCalls++
+		return true, nil
+	})
+	if got != nil {
+		t.Fatalf("missing-terminal exit result = %v", got)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("missing-terminal probe calls = %d, want 1", probeCalls)
+	}
+}
+
+func TestViewerExitResultPreservesUnexpectedExitAndProbeError(t *testing.T) {
+	command := exec.Command("sh", "-c", "exit 1")
+	waitErr := command.Run()
+	if waitErr == nil {
+		t.Fatal("fixture command unexpectedly succeeded")
+	}
+	probeErr := errors.New("probe failed")
+
+	got := viewerExitResult(waitErr, false, func() (bool, error) {
+		return false, probeErr
+	})
+	if !errors.Is(got, waitErr) || !errors.Is(got, probeErr) {
+		t.Fatalf("unexpected-exit result = %v", got)
+	}
+}
+
 func TestPTYViewerFactoryRejectsInvalidIdentityAndSize(t *testing.T) {
 	factory := PTYViewerFactory{TmuxPath: "/usr/bin/tmux", SessionSocket: "wrap-test"}
 	if _, err := factory.buildCommand(
