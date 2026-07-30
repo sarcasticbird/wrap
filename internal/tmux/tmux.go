@@ -499,6 +499,12 @@ func (s *Server) runSessionCommandIfGeneration(id, generation, command string) e
 const generationMismatchMessage = "wrap-server-generation-mismatch"
 const sessionIdentityMismatchMessage = "wrap-session-identity-mismatch"
 
+// IsGenerationMismatchOutput reports whether tmux emitted the sentinel used by
+// generation-guarded commands when their server identity no longer matches.
+func IsGenerationMismatchOutput(out string) bool {
+	return strings.TrimSpace(out) == generationMismatchMessage
+}
+
 func escapeFormatLiteral(value string) string {
 	value = strings.ReplaceAll(value, "#", "##")
 	value = strings.ReplaceAll(value, ",", "#,")

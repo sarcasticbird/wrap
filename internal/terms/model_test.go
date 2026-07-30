@@ -354,6 +354,27 @@ func TestMirrorOverlayOmitsQRThatCannotFitScrollViewport(t *testing.T) {
 	}
 }
 
+func TestMirrorOverlayShowsStartupFailureDetail(t *testing.T) {
+	m := Model{
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State: mirrorapi.StateFailed,
+			Err:   "start cloudflared: timeout\nINF dial tcp blocked",
+		},
+	}
+	m.Width = 18
+	m.Height = 12
+	content := ansi.Strip(m.mirrorView("Terminals"))
+	flatContent := strings.ReplaceAll(content, "\n", "")
+	if want := "start cloudflared: timeoutINF dial tcp blocked"; !strings.Contains(flatContent, want) {
+		t.Fatalf("failed mirror overlay omitted diagnostic %q:\n%s", want, content)
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if runewidth.StringWidth(line) > m.Width {
+			t.Fatalf("failed mirror overlay emitted %d-cell line:\n%s", runewidth.StringWidth(line), content)
+		}
+	}
+}
+
 func writeMalformedSelection(t *testing.T, ws string) {
 	t.Helper()
 	stateHome := t.TempDir()

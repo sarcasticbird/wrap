@@ -1,6 +1,8 @@
 package mirror
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"io/fs"
 	"regexp"
 	"strings"
@@ -24,6 +26,21 @@ func TestEmbeddedAssetProvenance(t *testing.T) {
 		}
 		if len(data) == 0 {
 			t.Fatalf("embedded %s is empty", name)
+		}
+	}
+	wantHashes := map[string]string{
+		"assets/vendor/xterm/xterm.mjs":     "3fd3d0046d2604ea5860235e2f96625a2fab158dcf3d4cfb0f7c1655559a5d9a",
+		"assets/vendor/xterm/xterm.css":     "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6",
+		"assets/vendor/xterm/addon-fit.mjs": "aa22c5f28e4d64118ac0e7d60276b3384188e59dd104c96e43760d6e2cedd771",
+		"assets/licenses/xterm-LICENSE":     "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+	}
+	for name, want := range wantHashes {
+		data, err := fs.ReadFile(assets, name)
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", name, err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != want {
+			t.Errorf("%s hash %s, want %s", name, got, want)
 		}
 	}
 

@@ -1204,6 +1204,12 @@ func (m Model) mirrorContentLines() []string {
 			"Encrypted mirror unavailable.",
 			"Check cloudflared is installed and retry.",
 		)
+		if m.mirrorSnapshot.Err != "" {
+			lines = append(lines, "")
+			for errLine := range strings.SplitSeq(m.mirrorSnapshot.Err, "\n") {
+				lines = append(lines, mirrorWrapLine(errLine, m.Width)...)
+			}
+		}
 	}
 	return lines
 }
@@ -1222,7 +1228,7 @@ func mirrorWrapLine(line string, width int) []string {
 	var lines []string
 	var chunk []rune
 	chunkWidth := 0
-	for _, r := range []rune(line) {
+	for _, r := range line {
 		runeWidth := runewidth.RuneWidth(r)
 		if chunkWidth+runeWidth > width && len(chunk) != 0 {
 			lines = append(lines, string(chunk))

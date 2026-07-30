@@ -1148,6 +1148,26 @@ func TestSessionCurrentPathIfGenerationClassifiesFailures(t *testing.T) {
 	}
 }
 
+func TestIsGenerationMismatchOutput(t *testing.T) {
+	for _, output := range []string{
+		"wrap-server-generation-mismatch",
+		" wrap-server-generation-mismatch\n",
+	} {
+		if !IsGenerationMismatchOutput(output) {
+			t.Fatalf("IsGenerationMismatchOutput(%q) = false", output)
+		}
+	}
+	for _, output := range []string{
+		"",
+		"wrap-session-identity-mismatch",
+		"prefix wrap-server-generation-mismatch",
+	} {
+		if IsGenerationMismatchOutput(output) {
+			t.Fatalf("IsGenerationMismatchOutput(%q) = true", output)
+		}
+	}
+}
+
 func TestServerConfigFile(t *testing.T) {
 	f := &fakeRunner{}
 	s := &Server{Socket: "wrap-ui", ConfigFile: "/dev/null", R: f}

@@ -256,7 +256,7 @@ func (f *PTYViewerFactory) runTmux(args []string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)
 	}
-	if strings.TrimSpace(string(output)) == "wrap-server-generation-mismatch" {
+	if tmux.IsGenerationMismatchOutput(string(output)) {
 		return "", tmux.ErrServerGenerationChanged
 	}
 	return string(output), nil

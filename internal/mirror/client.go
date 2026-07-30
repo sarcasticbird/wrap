@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 
@@ -245,7 +246,7 @@ func (c *Client) closeWithControl(ctx context.Context, tag byte, value any) erro
 		}()
 		select {
 		case closeErr := <-closed:
-			return closeErr
+			return normalizeWebSocketCloseError(closeErr)
 		case <-ctx.Done():
 			c.closeNow(ctx.Err())
 			return ctx.Err()
@@ -254,6 +255,13 @@ func (c *Client) closeWithControl(ctx context.Context, tag byte, value any) erro
 		c.closeNow(ctx.Err())
 		return ctx.Err()
 	}
+}
+
+func normalizeWebSocketCloseError(err error) error {
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func (c *Client) writeLoop(ctx context.Context) {
@@ -330,27 +338,36 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 		return nil
 	case TagClose:
 		if !c.viewerOpen.Load() {
-			return errors.New("no terminal is open")
+			return nil
 		}
 		if err := ValidateClientFrame(tag, payload); err != nil {
 			return err
 		}
 		if err := c.handler.Close(c); err != nil {
+			if !c.viewerOpen.Load() {
+				return nil
+			}
 			return err
 		}
-		c.viewerOpen.Store(false)
+		if !c.viewerOpen.CompareAndSwap(true, false) {
+			return nil
+		}
 		return c.sendCloseAcknowledgement(ctx)
 	case TagInput:
 		if !c.viewerOpen.Load() {
-			return errors.New("no terminal is open")
+			return nil
 		}
 		if err := ValidateClientFrame(tag, payload); err != nil {
 			return err
 		}
-		return c.handler.Input(c, payload)
+		err := c.handler.Input(c, payload)
+		if err != nil && !c.viewerOpen.Load() {
+			return nil
+		}
+		return err
 	case TagResize:
 		if !c.viewerOpen.Load() {
-			return errors.New("no terminal is open")
+			return nil
 		}
 		var request ResizeRequest
 		if err := DecodeControl(tag, payload, &request); err != nil {
@@ -359,7 +376,11 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 		if err := ValidateClientFrame(tag, request); err != nil {
 			return err
 		}
-		return c.handler.Resize(c, request)
+		err := c.handler.Resize(c, request)
+		if err != nil && !c.viewerOpen.Load() {
+			return nil
+		}
+		return err
 	default:
 		return fmt.Errorf("tag 0x%02x is invalid from client", tag)
 	}

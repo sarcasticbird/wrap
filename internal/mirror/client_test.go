@@ -3,14 +3,22 @@ package mirror
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 )
 
 type dispatchHandler struct {
-	openErr  error
-	onOpen   func(*Client)
-	sessions []Session
+	openErr   error
+	closeErr  error
+	inputErr  error
+	resizeErr error
+	onOpen    func(*Client)
+	onClose   func(*Client)
+	onInput   func(*Client)
+	onResize  func(*Client)
+	sessions  []Session
 }
 
 func (h dispatchHandler) InitialSessions() []Session { return h.sessions }
@@ -21,10 +29,25 @@ func (h dispatchHandler) Open(_ context.Context, client *Client, _ OpenRequest) 
 	}
 	return h.openErr
 }
-func (dispatchHandler) Close(*Client) error                 { return nil }
-func (dispatchHandler) Input(*Client, []byte) error         { return nil }
-func (dispatchHandler) Resize(*Client, ResizeRequest) error { return nil }
-func (dispatchHandler) Disconnected(*Client)                {}
+func (h dispatchHandler) Close(client *Client) error {
+	if h.onClose != nil {
+		h.onClose(client)
+	}
+	return h.closeErr
+}
+func (h dispatchHandler) Input(client *Client, _ []byte) error {
+	if h.onInput != nil {
+		h.onInput(client)
+	}
+	return h.inputErr
+}
+func (h dispatchHandler) Resize(client *Client, _ ResizeRequest) error {
+	if h.onResize != nil {
+		h.onResize(client)
+	}
+	return h.resizeErr
+}
+func (dispatchHandler) Disconnected(*Client) {}
 
 func TestOutboundQueueIsFIFOAndByteBounded(t *testing.T) {
 	queue := newOutboundQueue(40)
@@ -78,9 +101,6 @@ func TestClientDispatchEnforcesOneOpenViewer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.dispatch(t.Context(), TagInput, []byte("x")); err == nil {
-		t.Fatal("input without an open viewer was accepted")
-	}
 	if err := client.dispatch(t.Context(), TagOpen, open); err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +110,101 @@ func TestClientDispatchEnforcesOneOpenViewer(t *testing.T) {
 	if err := client.dispatch(t.Context(), TagClose, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.dispatch(t.Context(), TagClose, nil); err == nil {
-		t.Fatal("close without an open viewer was accepted")
+}
+
+func TestClientDispatchDropsFramesForViewerThatJustEnded(t *testing.T) {
+	resize, err := EncodeControl(TagResize, ResizeRequest{Columns: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		tag     byte
+		payload []byte
+	}{
+		{name: "close", tag: TagClose},
+		{name: "input", tag: TagInput, payload: []byte("x")},
+		{name: "resize", tag: TagResize, payload: resize},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{
+				handler: dispatchHandler{},
+				queue:   newOutboundQueue(MaxClientQueueBytes),
+			}
+			if err := client.dispatch(t.Context(), test.tag, test.payload); err != nil {
+				t.Fatalf("stale viewer frame closed client: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientDispatchDropsHandlerErrorAfterConcurrentViewerEnd(t *testing.T) {
+	handlerErr := errors.New("no terminal is open")
+	resize, err := EncodeControl(TagResize, ResizeRequest{Columns: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		tag     byte
+		payload []byte
+		handler dispatchHandler
+	}{
+		{
+			name: "close", tag: TagClose,
+			handler: dispatchHandler{
+				closeErr: handlerErr,
+				onClose:  func(client *Client) { client.markViewerClosed() },
+			},
+		},
+		{
+			name: "input", tag: TagInput, payload: []byte("x"),
+			handler: dispatchHandler{
+				inputErr: handlerErr,
+				onInput:  func(client *Client) { client.markViewerClosed() },
+			},
+		},
+		{
+			name: "resize", tag: TagResize, payload: resize,
+			handler: dispatchHandler{
+				resizeErr: handlerErr,
+				onResize:  func(client *Client) { client.markViewerClosed() },
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{
+				handler: test.handler,
+				queue:   newOutboundQueue(MaxClientQueueBytes),
+			}
+			client.viewerOpen.Store(true)
+			if err := client.dispatch(t.Context(), test.tag, test.payload); err != nil {
+				t.Fatalf("concurrent viewer end closed client: %v", err)
+			}
+		})
+	}
+}
+
+func TestClientDispatchPreservesHandlerErrorWhileViewerIsOpen(t *testing.T) {
+	handlerErr := errors.New("viewer write failed")
+	client := &Client{
+		handler: dispatchHandler{inputErr: handlerErr},
+		queue:   newOutboundQueue(MaxClientQueueBytes),
+	}
+	client.viewerOpen.Store(true)
+	if err := client.dispatch(t.Context(), TagInput, []byte("x")); !errors.Is(err, handlerErr) {
+		t.Fatalf("active viewer input error = %v, want %v", err, handlerErr)
+	}
+}
+
+func TestNormalizeWebSocketCloseErrorTreatsClosedConnectionAsSuccess(t *testing.T) {
+	wrappedClosed := fmt.Errorf("failed to close WebSocket: %w", net.ErrClosed)
+	if err := normalizeWebSocketCloseError(wrappedClosed); err != nil {
+		t.Fatalf("closed connection cleanup error = %v", err)
+	}
+	other := errors.New("close handshake timed out")
+	if err := normalizeWebSocketCloseError(other); !errors.Is(err, other) {
+		t.Fatalf("non-closure error = %v, want %v", err, other)
 	}
 }
 
