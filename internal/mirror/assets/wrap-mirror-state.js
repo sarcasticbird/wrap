@@ -104,6 +104,34 @@
     state.awaitingCloseAcknowledgement = false;
   }
 
+  function receiveMessage(state, message, effects) {
+    let action;
+    switch (message.type) {
+      case "status":
+        action = status(state, message.sessions);
+        break;
+      case "close":
+        action = acknowledgeClose(state);
+        break;
+      case "revoked":
+        action = revoked(state, message.session);
+        break;
+      case "error":
+        action = error(state);
+        break;
+      default:
+        throw new Error(`unexpected viewer lifecycle message ${message.type}`);
+    }
+    if (action === "render" && typeof effects?.render === "function") {
+      effects.render(state.sessions);
+    } else if (action === "ended" && typeof effects?.ended === "function") {
+      effects.ended(state.sessions);
+    } else if (action === "error" && typeof effects?.error === "function") {
+      effects.error(message.problem);
+    }
+    return action;
+  }
+
   global.WrapMirrorCloseState = Object.freeze({
     create,
     canOpen,
@@ -114,5 +142,6 @@
     revoked,
     error,
     reset,
+    receiveMessage,
   });
 })(globalThis);

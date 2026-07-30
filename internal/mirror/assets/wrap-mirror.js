@@ -275,6 +275,14 @@ function renderSessions(nextSessions) {
   showOnly("list");
 }
 
+const viewerEffects = Object.freeze({
+  render: (nextSessions) => renderSessions(nextSessions),
+  ended: (nextSessions) => {
+    showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
+    setTimeout(() => renderSessions(nextSessions), 700);
+  },
+});
+
 function makeBadge(label) {
   const badge = document.createElement("span");
   badge.className = "badge";
@@ -405,22 +413,18 @@ async function receiveMessage(target, data) {
       }
       {
         const nextSessions = validateSessionList(parseJSON(frame.payload));
-        const action = closeState.status(viewerState, nextSessions);
-        if (action === "render") {
-          renderSessions(viewerState.sessions);
-        } else if (action === "ended") {
-          showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-          setTimeout(() => renderSessions(viewerState.sessions), 700);
-        }
+        closeState.receiveMessage(
+          viewerState,
+          { type: "status", sessions: nextSessions },
+          viewerEffects,
+        );
       }
       break;
     case TAG.close:
       if (!target.authenticated || frame.payload.length !== 0) {
         throw new Error("unexpected close acknowledgement");
       }
-      if (closeState.acknowledgeClose(viewerState) === "render") {
-        renderSessions(viewerState.sessions);
-      }
+      closeState.receiveMessage(viewerState, { type: "close" }, viewerEffects);
       break;
     case TAG.output:
       if (!target.authenticated) {
@@ -436,10 +440,11 @@ async function receiveMessage(target, data) {
       break;
     case TAG.revoked: {
       const revoked = parseJSON(frame.payload);
-      if (closeState.revoked(viewerState, revoked) === "ended") {
-        showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-        setTimeout(() => renderSessions(viewerState.sessions), 700);
-      }
+      closeState.receiveMessage(
+        viewerState,
+        { type: "revoked", session: revoked },
+        viewerEffects,
+      );
       break;
     }
     case TAG.shutdown: {
@@ -465,7 +470,11 @@ async function receiveMessage(target, data) {
       if (problem.retry === false) {
         stopped = true;
       }
-      closeState.error(viewerState);
+      closeState.receiveMessage(
+        viewerState,
+        { type: "error", problem },
+        viewerEffects,
+      );
       showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
       if (problem.retry === false) {
         target.socket.close();

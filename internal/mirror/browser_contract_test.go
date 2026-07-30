@@ -108,9 +108,10 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 	for _, want := range []string{
 		`import "/assets/wrap-mirror-state.js"`,
 		`const viewerState = closeState.create()`,
-		`closeState.status(viewerState, nextSessions)`,
-		`closeState.acknowledgeClose(viewerState)`,
-		`closeState.revoked(viewerState, revoked)`,
+		`closeState.receiveMessage(`,
+		`{ type: "status", sessions: nextSessions }`,
+		`{ type: "close" }`,
+		`{ type: "revoked", session: revoked }`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client does not resolve server-side close race %q", want)
