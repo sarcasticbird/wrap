@@ -54,7 +54,10 @@ func TestExtractQuickTunnelURLAcceptsOnlyExactOrigin(t *testing.T) {
 
 func TestDiagnosticTailIsBounded(t *testing.T) {
 	var tail diagnosticTail
-	tail.Write([]byte(strings.Repeat("a", maxTunnelDiagnostics+100)))
+	input := []byte(strings.Repeat("a", maxTunnelDiagnostics+100))
+	if n, err := tail.Write(input); err != nil || n != len(input) {
+		t.Fatalf("diagnostic tail write = %d, %v", n, err)
+	}
 	got := tail.String()
 	if len(got) != maxTunnelDiagnostics {
 		t.Fatalf("diagnostic tail length = %d", len(got))

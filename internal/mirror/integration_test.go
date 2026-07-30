@@ -190,7 +190,7 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 		t.Fatalf("viewer output frame = 0x%02x %q", tag, payload)
 	}
 	writeEncryptedRaw(t, connection, sealer, TagClose, nil)
-	receiveWithin(t, viewer.done, "viewer close")
+	_ = receiveWithin(t, viewer.done, "viewer close")
 	tag, payload = readEncryptedFrame(t, connection, opener)
 	if tag != TagClose || len(payload) != 0 {
 		t.Fatalf("close acknowledgement = 0x%02x %x", tag, payload)
@@ -213,7 +213,7 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	receiveWithin(t, secondViewer.done, "revoked viewer close")
+	_ = receiveWithin(t, secondViewer.done, "revoked viewer close")
 	assertRevokedFrame(t, connection, opener, Identity{
 		ID: secondSession.ID, Generation: secondSession.Generation,
 	})
