@@ -26,11 +26,13 @@ reconnecting. Quick Tunnel URLs are ephemeral and have no uptime guarantee, so
 an unexpected tunnel exit revokes the workspace mirror and requires a fresh
 `m`.
 
-Use the HTTPS Quick Tunnel URL shown by wrap. Loading the loopback page
-directly is unsupported because browser WebCrypto requires a secure context.
-If the page reports an incompatible encrypted client, update to a browser with
-WebCrypto support and rescan; wrap's crypto self-test intentionally connects
-only after it passes.
+Use the complete HTTPS Quick Tunnel URL shown by wrap. Loading the loopback
+page directly is unsupported because the WebSocket server accepts only the
+exact Quick Tunnel HTTPS origin. `Pairing key missing` means the tab did not
+receive or retain the URL fragment; rescan the current QR code. `Incompatible
+browser` means the page lacks a secure context or working WebCrypto support;
+update the browser and rescan. wrap connects only after its crypto self-test
+passes.
 
 If an open remote terminal ends, disappears from a later poll, or belongs to a
 restarted tmux server generation, wrap closes that viewer instead of attaching
