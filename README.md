@@ -108,14 +108,14 @@ from Help.
 The terminal monitor stays in creation order as names, bell state, and activity
 indicators change. Repository, worktree, root, and diff rows are protected
 there; only `·term·` scratch terminals may be renamed or killed. Expand a
-terminal row to see the active pane's current working directory. Paths inside
-the opened workspace are shown relative to its root; outside paths remain
-absolute.
+terminal row to see the active pane's full current working directory. The
+absolute path is shown when it fits; narrower panes truncate its left side
+with an ellipsis so the most specific path components remain visible.
 
 ```text
   › repo
 ▸ ⌄ scratch
-    ./current/path
+    /Users/alex/Projects/example
 ```
 
 ### tmux prefix and pane control
