@@ -4,6 +4,8 @@
 package terms
 
 import (
+	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/mattn/go-runewidth"
 	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/launcher"
+	mirrorapi "github.com/sarcasticbird/wrap/internal/mirror"
 	"github.com/sarcasticbird/wrap/internal/pane"
 	"github.com/sarcasticbird/wrap/internal/state"
 	"github.com/sarcasticbird/wrap/internal/tmux"
@@ -50,6 +53,16 @@ func (b scratchPaneBackend) KillEntrySession(name, targetID, targetGeneration, s
 type Options struct {
 	WS, Root, Cmd string
 	Keys          config.Keys
+	Mirrors       Mirror
+}
+
+type Mirror interface {
+	Events() <-chan mirrorapi.Event
+	Snapshot() mirrorapi.Snapshot
+	Mirror(context.Context, mirrorapi.HostSession) error
+	Revoke(context.Context, mirrorapi.Identity) error
+	Rotate(context.Context) error
+	Reconcile(context.Context, []mirrorapi.HostSession) error
 }
 
 // row is a single ws-owned session line.
@@ -61,6 +74,7 @@ type row struct {
 	created    int64
 	bell       bool
 	activity   bool
+	mirrored   bool
 	current    bool
 	key        sessionKey
 	expanded   bool
@@ -102,39 +116,62 @@ type rowsMsg struct {
 
 type tickMsg struct{}
 
+type mirrorEventMsg struct {
+	event mirrorapi.Event
+	ok    bool
+}
+
+type mirrorOperationMsg struct {
+	operation string
+	err       error
+}
+
+type mirrorReconcileMsg struct {
+	err error
+}
+
 type Model struct {
 	pane.Nav
-	backend         Backend
-	ws              string
-	root            string
-	cmd             string
-	sessions        map[string]tmux.SessionInfo
-	lastSeen        map[string]int64
-	expanded        map[sessionKey]bool
-	paths           map[sessionKey]pathState
-	current         string // last-read state-selection (the tree's pick)
-	display         string // local Enter/`n` switch override; cleared when state picks anew
-	renaming        bool
-	renameBuf       []rune
-	renameTarget    string // session identity captured at "r" time; survives row churn before enter
-	renameTargetID  string
-	renameTargetGen string
-	alerted         bool   // last workspace-level alert state pushed to the title
-	alertRung       bool   // one-shot BEL attempted for the current alert episode
-	stale           string // why the last session poll failed; "" once one succeeds again
-	selectionStale  string // why the last selection read failed; rows still update
-	alertErr        string // why the last title transition failed; "" once one lands
-	ringErr         string // why this episode's one-shot BEL failed; held until clear
-	displayStale    string // why the displayed-session read failed; last display remains
-	polling         bool
-	timerPending    bool
-	keys            config.Keys
-	helpOpen        bool
+	backend           Backend
+	ws                string
+	root              string
+	cmd               string
+	sessions          map[string]tmux.SessionInfo
+	lastSeen          map[string]int64
+	expanded          map[sessionKey]bool
+	paths             map[sessionKey]pathState
+	current           string // last-read state-selection (the tree's pick)
+	display           string // local Enter/`n` switch override; cleared when state picks anew
+	renaming          bool
+	renameBuf         []rune
+	renameTarget      string // session identity captured at "r" time; survives row churn before enter
+	renameTargetID    string
+	renameTargetGen   string
+	alerted           bool   // last workspace-level alert state pushed to the title
+	alertRung         bool   // one-shot BEL attempted for the current alert episode
+	stale             string // why the last session poll failed; "" once one succeeds again
+	selectionStale    string // why the last selection read failed; rows still update
+	alertErr          string // why the last title transition failed; "" once one lands
+	ringErr           string // why this episode's one-shot BEL failed; held until clear
+	displayStale      string // why the displayed-session read failed; last display remains
+	polling           bool
+	timerPending      bool
+	keys              config.Keys
+	helpOpen          bool
+	mirrors           Mirror
+	mirrorSnapshot    mirrorapi.Snapshot
+	mirrorOpen        bool
+	mirrorTarget      mirrorapi.Identity
+	mirrorTargetName  string
+	mirrorCancel      context.CancelFunc
+	mirrorStarting    bool
+	mirrorReconciling bool
+	mirrorSyncErr     string
 }
 
 // NewModel builds an empty terms Model; the first tick populates rows.
 func NewModel(b Backend, o Options) Model {
-	return Model{
+	model := Model{
 		backend:  b,
 		ws:       o.WS,
 		root:     o.Root,
@@ -144,11 +181,22 @@ func NewModel(b Backend, o Options) Model {
 		expanded: map[sessionKey]bool{},
 		paths:    map[sessionKey]pathState{},
 		keys:     o.Keys.WithDefaults(),
+		mirrors:  o.Mirrors,
 	}
+	if o.Mirrors != nil {
+		model.mirrorSnapshot = o.Mirrors.Snapshot()
+	}
+	return model
 }
 
 func (m Model) Init() tea.Cmd {
-	return func() tea.Msg { return tickMsg{} }
+	if m.mirrors == nil {
+		return func() tea.Msg { return tickMsg{} }
+	}
+	return tea.Batch(
+		func() tea.Msg { return tickMsg{} },
+		waitMirrorEvent(m.mirrors.Events()),
+	)
 }
 
 // fetch snapshots the backend and workspace before returning the
@@ -309,9 +357,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.alertRung = false
 			m.ringErr = ""
 		}
-		return m.scheduleTick()
+		m, tick := m.scheduleTick()
+		if m.mirrors == nil || m.mirrorReconciling {
+			return m, tick
+		}
+		m.mirrorReconciling = true
+		sessions := m.hostMirrorSessions()
+		reconcile := func() tea.Msg {
+			return mirrorReconcileMsg{err: m.mirrors.Reconcile(context.Background(), sessions)}
+		}
+		return m, tea.Batch(tick, reconcile)
+	case mirrorEventMsg:
+		if !msg.ok {
+			return m, nil
+		}
+		if msg.event.Snapshot != nil {
+			m.mirrorSnapshot = *msg.event.Snapshot
+			if m.mirrorSnapshot.State != mirrorapi.StateStarting {
+				m.mirrorStarting = false
+				m.clearMirrorCancel()
+			}
+		}
+		if msg.event.Viewed != nil {
+			for name, session := range m.sessions {
+				if session.ID == msg.event.Viewed.ID &&
+					session.Generation == msg.event.Viewed.Generation {
+					m.lastSeen[name] = msg.event.Viewed.Activity
+					break
+				}
+			}
+		}
+		return m, waitMirrorEvent(m.mirrors.Events())
+	case mirrorOperationMsg:
+		m.mirrorStarting = false
+		m.clearMirrorCancel()
+		if errors.Is(msg.err, context.Canceled) {
+			m.mirrorSyncErr = ""
+		} else if msg.err != nil {
+			m.mirrorSyncErr = "encrypted mirror operation failed; retry"
+		} else {
+			m.mirrorSyncErr = ""
+		}
+		if msg.operation == "revoke" {
+			m.mirrorOpen = false
+		}
+		return m, nil
+	case mirrorReconcileMsg:
+		m.mirrorReconciling = false
+		if msg.err != nil {
+			m.mirrorSyncErr = "encrypted mirror session sync failed"
+		} else {
+			m.mirrorSyncErr = ""
+		}
+		return m, nil
 	case tea.MouseMsg:
-		if m.helpOpen || m.ConfirmKill || m.ConfirmShutdown || m.renaming {
+		if m.mirrorOpen || m.helpOpen || m.ConfirmKill || m.ConfirmShutdown || m.renaming {
 			return m, nil
 		}
 		return m.handleMouse(msg)
@@ -341,6 +441,39 @@ func nextTick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
+func waitMirrorEvent(events <-chan mirrorapi.Event) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-events
+		return mirrorEventMsg{event: event, ok: ok}
+	}
+}
+
+func (m Model) hostMirrorSessions() []mirrorapi.HostSession {
+	sessions := make([]mirrorapi.HostSession, 0, len(m.sessions))
+	for name, session := range m.sessions {
+		if !config.SessionOwnedBy(m.ws, name) {
+			continue
+		}
+		sessions = append(sessions, mirrorapi.HostSession{
+			ID:           session.ID,
+			Generation:   session.Generation,
+			Name:         name,
+			Kind:         session.Kind,
+			Bell:         session.Bell,
+			Activity:     session.Activity,
+			SeenActivity: m.lastSeen[name],
+		})
+	}
+	return sessions
+}
+
+func (m *Model) clearMirrorCancel() {
+	if m.mirrorCancel != nil {
+		m.mirrorCancel()
+		m.mirrorCancel = nil
+	}
+}
+
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
 	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
@@ -358,6 +491,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	rows := m.rows()
+	if m.mirrorOpen {
+		return m.handleMirrorKey(msg)
+	}
 	if m.renaming {
 		return m.handleRenameKey(msg)
 	}
@@ -380,6 +516,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch msg.String() {
+	case "m":
+		if m.mirrors == nil {
+			m.ErrText = "encrypted mirror is unavailable"
+			return m, nil
+		}
+		if m.Cursor >= len(rows) {
+			return m, nil
+		}
+		target := rows[m.Cursor]
+		if !mirrorEligible(m.ws, target) {
+			m.ErrText = "diff terminals cannot be mirrored"
+			return m, nil
+		}
+		m.ErrText = ""
+		m.mirrorOpen = true
+		m.mirrorTarget = mirrorapi.Identity{ID: target.id, Generation: target.generation}
+		m.mirrorTargetName = target.name
+		if target.mirrored {
+			return m, nil
+		}
+		return m.startMirror(target)
 	case "right":
 		if m.Cursor < len(rows) {
 			m.expanded[rows[m.Cursor].key] = true
@@ -481,6 +638,78 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) startMirror(target row) (tea.Model, tea.Cmd) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.clearMirrorCancel()
+	m.mirrorCancel = cancel
+	m.mirrorStarting = true
+	session := mirrorapi.HostSession{
+		ID:           target.id,
+		Generation:   target.generation,
+		Name:         target.name,
+		Kind:         target.kind,
+		Bell:         target.bell,
+		Activity:     m.sessions[target.name].Activity,
+		SeenActivity: m.lastSeen[target.name],
+	}
+	return m, func() tea.Msg {
+		return mirrorOperationMsg{operation: "start", err: m.mirrors.Mirror(ctx, session)}
+	}
+}
+
+func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.clearMirrorCancel()
+		m.mirrorStarting = false
+		m.mirrorOpen = false
+	case "x":
+		if m.mirrors == nil || !m.targetIsMirrored() {
+			return m, nil
+		}
+		identity := m.mirrorTarget
+		return m, func() tea.Msg {
+			return mirrorOperationMsg{
+				operation: "revoke",
+				err:       m.mirrors.Revoke(context.Background(), identity),
+			}
+		}
+	case "R":
+		if m.mirrors == nil || m.mirrorSnapshot.State != mirrorapi.StateReady {
+			return m, nil
+		}
+		return m, func() tea.Msg {
+			return mirrorOperationMsg{
+				operation: "rotate",
+				err:       m.mirrors.Rotate(context.Background()),
+			}
+		}
+	case "m":
+		if m.mirrors == nil || m.mirrorStarting || m.targetIsMirrored() {
+			return m, nil
+		}
+		for _, target := range m.rows() {
+			if target.id == m.mirrorTarget.ID && target.generation == m.mirrorTarget.Generation {
+				return m.startMirror(target)
+			}
+		}
+	}
+	return m, nil
+}
+
+func mirrorEligible(workspace string, target row) bool {
+	return config.SessionOwnedBy(workspace, target.name) && target.kind != tmux.SessionKindDiff
+}
+
+func (m Model) targetIsMirrored() bool {
+	for _, session := range m.mirrorSnapshot.Sessions {
+		if session.ID == m.mirrorTarget.ID && session.Generation == m.mirrorTarget.Generation {
+			return true
+		}
+	}
+	return false
+}
+
 // handleRenameKey handles all key input while renaming: printable runes
 // append to the buffer, backspace removes the last rune, esc cancels,
 // enter commits via backend.RenameTerm against the target captured at
@@ -567,6 +796,12 @@ func successorRow(rows []row, idx int) string {
 func (m Model) rows() []row {
 	var rows []row
 	effective := m.effectiveCurrent()
+	mirrored := make(map[sessionKey]bool, len(m.mirrorSnapshot.Sessions))
+	if m.mirrorSnapshot.State == mirrorapi.StateReady {
+		for _, session := range m.mirrorSnapshot.Sessions {
+			mirrored[sessionKey{generation: session.Generation, id: session.ID}] = true
+		}
+	}
 	for name, info := range m.sessions {
 		if !config.SessionOwnedBy(m.ws, name) {
 			continue
@@ -579,6 +814,7 @@ func (m Model) rows() []row {
 			created:    info.Created,
 			bell:       info.Bell,
 			activity:   info.Activity > m.lastSeen[name],
+			mirrored:   mirrored[sessionKey{generation: info.Generation, id: info.ID}],
 			current:    name == effective,
 			key:        sessionKey{generation: info.Generation, id: info.ID},
 			expanded:   m.expanded[sessionKey{generation: info.Generation, id: info.ID}],
@@ -700,6 +936,9 @@ func (m Model) View() string {
 	if m.helpOpen {
 		return m.helpView(heading)
 	}
+	if m.mirrorOpen {
+		return m.mirrorView(heading)
+	}
 
 	rows := m.rows()
 	visible := m.visibleLines(rows)
@@ -763,6 +1002,9 @@ func renderRow(r row, width int) string {
 	prefix := "  "
 	if r.current {
 		prefix = "▸ "
+	}
+	if r.mirrored {
+		prefix += "📡 "
 	}
 	switch {
 	case r.bell:
@@ -854,5 +1096,63 @@ func (m Model) footer() string {
 	if m.ringErr != "" {
 		return pane.AlertStyle.Render(" alert failed: " + m.ringErr + " ")
 	}
+	if m.mirrorSyncErr != "" {
+		return pane.AlertStyle.Render(" " + m.mirrorSyncErr + " ")
+	}
 	return ""
+}
+
+func (m Model) mirrorView(heading string) string {
+	lines := []string{heading}
+	switch {
+	case m.mirrorStarting || m.mirrorSnapshot.State == mirrorapi.StateStarting:
+		lines = append(lines, "", "Starting encrypted mirror…", "", m.mirrorTargetName)
+	case m.mirrorSnapshot.State == mirrorapi.StateReady:
+		lines = append(lines, "")
+		if m.mirrorSnapshot.QR != "" {
+			lines = append(lines, strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")...)
+		}
+		lines = append(lines,
+			"",
+			m.mirrorSnapshot.PairingURL,
+			"",
+			"Anyone with this URL can control mirrored terminals.",
+			"",
+			m.mirrorTargetName+" · "+strconv.Itoa(len(m.mirrorSnapshot.Sessions))+" mirrored",
+		)
+	default:
+		lines = append(lines,
+			"",
+			"Encrypted mirror unavailable.",
+			"Check cloudflared is installed and retry.",
+		)
+	}
+	footer := "esc close"
+	if m.mirrorSnapshot.State == mirrorapi.StateReady {
+		footer = "x revoke · R rotate · esc close"
+	} else if !m.mirrorStarting {
+		footer = "m retry · esc close"
+	}
+	maxBody := len(lines)
+	if m.Height > 0 {
+		maxBody = max(1, m.Height-1)
+	}
+	if len(lines) > maxBody {
+		lines = lines[:maxBody]
+	}
+	for i := range lines {
+		if m.Width > 0 {
+			lines[i] = runewidth.Truncate(lines[i], m.Width, "")
+		}
+	}
+	if m.Height > 0 {
+		for len(lines) < m.Height-1 {
+			lines = append(lines, "")
+		}
+	}
+	if m.Width > 0 {
+		footer = runewidth.Truncate(footer, m.Width, "")
+	}
+	lines = append(lines, pane.DimStyle.Render(footer))
+	return strings.Join(lines, "\n")
 }

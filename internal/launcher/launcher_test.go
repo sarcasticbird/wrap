@@ -1114,6 +1114,32 @@ func TestShowInMiddle(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeSessionClearsBellWithoutSwitchingClient(t *testing.T) {
+	f := &fakeRunner{sessionGeneration: testGeneration}
+	m := newTestManagerWS(f, "vb")
+
+	if err := m.AcknowledgeSession("$7", testGeneration); err != nil {
+		t.Fatal(err)
+	}
+	all := f.all()
+	if !strings.Contains(all, "set-option -t $7 "+tmux.BellOption+" 0") {
+		t.Fatalf("acknowledgement did not clear the guarded bell option:\n%s", all)
+	}
+	if strings.Contains(all, "switch-client") || strings.Contains(all, "select-pane") {
+		t.Fatalf("acknowledgement moved a desktop client:\n%s", all)
+	}
+}
+
+func TestAcknowledgeSessionRejectsChangedGeneration(t *testing.T) {
+	f := &fakeRunner{sessionGeneration: testGeneration}
+	m := newTestManagerWS(f, "vb")
+
+	err := m.AcknowledgeSession("$7", "fedcba9876543210fedcba9876543210")
+	if !errors.Is(err, tmux.ErrServerGenerationChanged) {
+		t.Fatalf("AcknowledgeSession error = %v, want generation change", err)
+	}
+}
+
 func TestShowInMiddleUsesValidatedStableSessionID(t *testing.T) {
 	dir := t.TempDir()
 	canonical := configureMappedEntry(t, "vb/repo", dir)

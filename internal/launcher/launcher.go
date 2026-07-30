@@ -983,11 +983,17 @@ func (m *Manager) ShowInMiddle(target string) error {
 	// clear failure. The error is still returned rather than dropped: a
 	// bell that cannot be cleared stays lit forever, and a session that
 	// permanently claims to need attention is worse than a visible error.
-	err = m.Sess.SetSessionOptionIfGeneration(identity.ID, identity.Generation, tmux.BellOption, "0")
+	err = m.AcknowledgeSession(identity.ID, identity.Generation)
 	if err != nil {
 		return fmt.Errorf("showing %s: bell not cleared: %w", target, err)
 	}
 	return nil
+}
+
+// AcknowledgeSession clears wrap's durable attention flag for exactly one
+// generation-guarded session without switching or focusing a desktop client.
+func (m *Manager) AcknowledgeSession(id, generation string) error {
+	return m.Sess.SetSessionOptionIfGeneration(id, generation, tmux.BellOption, "0")
 }
 
 // SwitchMiddle points the middle pane's nested client at target and

@@ -1,6 +1,7 @@
 package terms
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,9 +13,42 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"github.com/sarcasticbird/wrap/internal/config"
+	mirrorapi "github.com/sarcasticbird/wrap/internal/mirror"
 	"github.com/sarcasticbird/wrap/internal/state"
 	"github.com/sarcasticbird/wrap/internal/tmux"
 )
+
+type fakeMirror struct {
+	events     chan mirrorapi.Event
+	snapshot   mirrorapi.Snapshot
+	mirrored   []mirrorapi.HostSession
+	revoked    []mirrorapi.Identity
+	rotations  int
+	reconciles [][]mirrorapi.HostSession
+}
+
+func newFakeMirror() *fakeMirror {
+	return &fakeMirror{events: make(chan mirrorapi.Event, 8)}
+}
+
+func (m *fakeMirror) Events() <-chan mirrorapi.Event { return m.events }
+func (m *fakeMirror) Snapshot() mirrorapi.Snapshot   { return m.snapshot }
+func (m *fakeMirror) Mirror(_ context.Context, session mirrorapi.HostSession) error {
+	m.mirrored = append(m.mirrored, session)
+	return nil
+}
+func (m *fakeMirror) Revoke(_ context.Context, identity mirrorapi.Identity) error {
+	m.revoked = append(m.revoked, identity)
+	return nil
+}
+func (m *fakeMirror) Rotate(context.Context) error {
+	m.rotations++
+	return nil
+}
+func (m *fakeMirror) Reconcile(_ context.Context, sessions []mirrorapi.HostSession) error {
+	m.reconciles = append(m.reconciles, sessions)
+	return nil
+}
 
 type fakeBackend struct {
 	sessionsErr      error
@@ -141,6 +175,56 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+}
+
+func TestMirrorEligibilityAndRowMarker(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		row  row
+		want bool
+	}{
+		{"root", row{name: "vb", kind: ""}, true},
+		{"entry", row{name: "vb/api", kind: tmux.SessionKindEntry}, true},
+		{"scratch", row{name: "vb·term·1", kind: tmux.SessionKindScratch}, true},
+		{"legacy", row{name: "vb/legacy"}, true},
+		{"diff", row{name: "vb/diff", kind: tmux.SessionKindDiff}, false},
+		{"other workspace", row{name: "other/api", kind: tmux.SessionKindEntry}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := mirrorEligible("vb", test.row); got != test.want {
+				t.Fatalf("mirrorEligible = %v, want %v", got, test.want)
+			}
+		})
+	}
+	got := renderRow(row{name: "vb/api", mirrored: true, bell: true, activity: true}, 80)
+	if !strings.Contains(got, "📡") || !strings.Contains(got, "🔔") {
+		t.Fatalf("mirrored bell row = %q", got)
+	}
+}
+
+func TestMirrorKeyStartsEligibleRowAndOverlayBlocksOrdinaryKeys(t *testing.T) {
+	mirrors := newFakeMirror()
+	m := NewModel(&fakeBackend{}, Options{WS: "vb", Root: "/workspace", Mirrors: mirrors})
+	var mod tea.Model = m
+	mod, _ = mod.Update(rowsMsg{sessions: []tmux.SessionInfo{{
+		ID: "$7", Generation: "generation-a", Name: "vb/api", Kind: tmux.SessionKindEntry,
+	}}})
+	mod, cmd := mod.Update(key("m"))
+	got := mod.(Model)
+	if !got.mirrorOpen || cmd == nil {
+		t.Fatalf("mirror overlay/cmd = %v/%v", got.mirrorOpen, cmd)
+	}
+	if msg := cmd(); msg == nil {
+		t.Fatal("mirror command returned no result message")
+	}
+	if len(mirrors.mirrored) != 1 || mirrors.mirrored[0].ID != "$7" {
+		t.Fatalf("mirror calls = %+v", mirrors.mirrored)
+	}
+	before := got.Cursor
+	mod, _ = got.Update(key("j"))
+	if mod.(Model).Cursor != before {
+		t.Fatal("navigation escaped the mirror overlay")
+	}
 }
 
 func writeMalformedSelection(t *testing.T, ws string) {

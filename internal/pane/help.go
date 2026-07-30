@@ -51,7 +51,7 @@ func HelpBody(keys config.Keys, width, height int) string {
 		),
 		"move   ↑/↓ or j/k · ←/→ collapse/expand · ↵ open",
 		"Git    ↵ select/open · ←/→ files · x kill",
-		"terms  ↵ show · ←/→ details · n new/bind · r rename · x kill",
+		"terms  ↵ show · ←/→ details · n new/bind · m mirror · r rename · x kill",
 		"wrap   q detach · Q shutdown",
 	}
 	if height > 0 && len(lines) > height {

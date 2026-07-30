@@ -32,7 +32,7 @@ func TestPaneChromeUsesEffectiveKeys(t *testing.T) {
 		t.Fatalf("heading = %q", got)
 	}
 	help := ansi.Strip(HelpBody(keys, 80, 20))
-	for _, want := range []string{"⌥a terminal", "C-g Git", "⌥9 Terminals"} {
+	for _, want := range []string{"⌥a terminal", "C-g Git", "⌥9 Terminals", "m mirror"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("HelpBody missing %q:\n%s", want, help)
 		}

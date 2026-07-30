@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -11,10 +12,12 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/gitx"
 	"github.com/sarcasticbird/wrap/internal/launcher"
+	"github.com/sarcasticbird/wrap/internal/mirror"
 	"github.com/sarcasticbird/wrap/internal/state"
 	"github.com/sarcasticbird/wrap/internal/terms"
 	"github.com/sarcasticbird/wrap/internal/tmux"
@@ -344,10 +347,22 @@ func runWatch(ws string) error {
 	if err != nil {
 		return err
 	}
-	return terms.Run(m, terms.Options{
-		WS: ws, Root: w.Root, Cmd: w.Cmd,
-		Keys: w.Keys.WithDefaults(),
+	mirrors, err := mirror.NewManager(mirror.ManagerOptions{
+		Workspace:     ws,
+		SessionSocket: tmux.SocketSessions,
+		Acknowledger:  m,
 	})
+	if err != nil {
+		return err
+	}
+	runErr := terms.Run(m, terms.Options{
+		WS: ws, Root: w.Root, Cmd: w.Cmd,
+		Keys:    w.Keys.WithDefaults(),
+		Mirrors: mirrors,
+	})
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return errors.Join(runErr, mirrors.Shutdown(shutdownCtx))
 }
 
 func runAttach(ws string) error {
