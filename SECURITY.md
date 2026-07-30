@@ -17,10 +17,27 @@ mitigations. Do not open a public issue for an undisclosed vulnerability.
 
 ## Trust boundaries
 
-wrap itself performs no network requests and needs no elevated privileges. It
-does start other programs, query repositories, and operate persistent tmux
-servers:
+wrap needs no elevated privileges. Ordinary local use performs no network
+requests; an explicitly started browser mirror launches `cloudflared` and
+accepts encrypted terminal input through its Quick Tunnel. wrap also starts
+other programs, queries repositories, and operates persistent tmux servers:
 
+- **A mirror URL is an interactive-shell credential.** Anyone with the full
+  URL fragment can control every terminal currently shared by that workspace.
+  Do not post, log, or screenshot it. Revoke the final terminal or rotate the
+  credential with `R` if it may have escaped.
+- **Cloudflare is an active endpoint.** Browser-to-host frames use
+  fragment-derived AES-GCM keys, so the credential does not enter an HTTP
+  request and passive tunnel inspection cannot read terminal traffic.
+  Cloudflare terminates TLS and can replace the browser page before encryption
+  starts, so the mirror does not protect against a malicious or compromised
+  edge, host, or browser. Quick Tunnels are ephemeral and have no uptime
+  guarantee.
+- **The mirror exposes only a loopback listener locally.** The server binds
+  `127.0.0.1`, checks the exact Quick Tunnel origin, limits handshakes,
+  clients, messages, and queues, and serves no health or debug endpoint.
+  `cloudflared` remains a separately installed program running with the user's
+  permissions.
 - **Configured commands are trusted.** `[defaults].cmd` is passed to tmux's
   shell handling in each selected directory. wrap does not parse, inspect, or
   sandbox it. A configured command—and any program you start inside a

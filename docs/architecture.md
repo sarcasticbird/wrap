@@ -1,8 +1,47 @@
 # Architecture and trust boundaries
 
 wrap is a local terminal UI over two dedicated tmux servers, Git subprocesses,
-and small JSON state files. It has no daemon, container, database, or network
-client.
+and small JSON state files. It has no daemon, container, or database. Its
+optional browser mirror starts a short-lived local server and Quick Tunnel
+only when requested.
+
+## Optional encrypted mirror
+
+Each `wrap watch` process owns one inert mirror manager for its workspace. The
+first `m` action starts an HTTP listener on `127.0.0.1` and a `cloudflared`
+Quick Tunnel; additional mirrored terminals reuse both. The final revoke,
+workspace shutdown, server-generation change, or unexpected tunnel exit
+closes viewers and clients, stops the listener and tunnel, and clears the
+in-memory credential.
+
+Browser connections require the exact Quick Tunnel origin, a versioned
+encrypted hello, and a 32-byte credential carried only in the pairing URL
+fragment. HKDF-SHA-256 derives separate client-to-server and
+server-to-client AES-256-GCM keys from fresh 16-byte nonces. Monotonic
+directional counters form 96-bit GCM nonces. The server permits at most 16
+concurrent handshakes, eight authenticated clients, 128 KiB encrypted
+messages, and a 1 MiB outbound queue per client.
+
+Each device opens an independent PTY-backed tmux client with
+`attach-session -f ignore-size`, guarded by the same `(session ID, tmux server
+generation)` identity used elsewhere in wrap. While any remote viewer is
+attached, wrap pins that exact tmux window's current dimensions with its
+per-window `window-size=manual` mode; the last viewer restores the prior mode.
+The pin is keyed by the stable tmux window ID, shared across linked sessions,
+and remembers whether the prior mode was local or inherited. Attach refuses if
+the session's current window changes between pin and attach, and the last
+viewer either restores the local value or removes wrap's override. These
+operations are generation-guarded, so phone-sized PTYs cannot resize a
+detached shared window and a restarted server cannot redirect restoration to
+a reused identity. Browser resize affects the remote PTY only.
+Opening remotely acknowledges the exact session activity baseline but does not
+switch the desktop middle pane.
+
+Cloudflare terminates TLS and can serve or replace the embedded page. Frame
+encryption prevents passive intermediaries from reading or editing terminal
+traffic, but it cannot defend against an edge that replaces the JavaScript
+before key derivation. The pairing URL is an interactive-shell credential;
+rotation and final revoke are the host-side recovery controls.
 
 ## Workspace identity
 
@@ -254,9 +293,10 @@ empty, clears the selection, and only then closes that workspace's UI. Errors
 are joined and shown before the UI is destroyed. A later explicit launch clears
 the barrier while holding the same lock.
 
-wrap itself makes no network calls. Configured commands and programs inside
-sessions have the normal authority of the local user, including network
-access.
+wrap makes no network calls during ordinary local use. An explicitly started
+browser mirror launches `cloudflared`, which connects to Cloudflare's network.
+Configured commands and programs inside sessions have the normal authority of
+the local user, including network access.
 
 The session server is usable without wrap:
 
