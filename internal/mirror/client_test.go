@@ -4,15 +4,17 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 type dispatchHandler struct {
-	openErr error
-	onOpen  func(*Client)
+	openErr  error
+	onOpen   func(*Client)
+	sessions []Session
 }
 
-func (dispatchHandler) InitialSessions() []Session { return nil }
-func (dispatchHandler) Connected(*Client)          {}
+func (h dispatchHandler) InitialSessions() []Session { return h.sessions }
+func (dispatchHandler) Connected(*Client)            {}
 func (h dispatchHandler) Open(_ context.Context, client *Client, _ OpenRequest) error {
 	if h.onOpen != nil {
 		h.onOpen(client)
@@ -140,5 +142,32 @@ func TestClientDispatchDoesNotOverwriteImmediateViewerClose(t *testing.T) {
 	}
 	if client.viewerOpen.Load() {
 		t.Fatal("immediate viewer exit was overwritten by open completion")
+	}
+}
+
+func TestClientDispatchCloseQueuesStatusAcknowledgement(t *testing.T) {
+	sessions := []Session{{
+		ID: "$7", Generation: "generation-a", Name: "vb/api",
+	}}
+	client := &Client{
+		handler: dispatchHandler{sessions: sessions},
+		queue:   newOutboundQueue(MaxClientQueueBytes),
+	}
+	client.viewerOpen.Store(true)
+	if err := client.dispatch(t.Context(), TagClose, nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	frame, ok := client.queue.pop(ctx)
+	if !ok || frame.tag != TagStatus {
+		t.Fatalf("close acknowledgement = %+v, %v", frame, ok)
+	}
+	var list SessionList
+	if err := DecodeControl(frame.tag, frame.payload, &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Sessions) != 1 || list.Sessions[0].ID != "$7" {
+		t.Fatalf("close acknowledgement sessions = %+v", list.Sessions)
 	}
 }

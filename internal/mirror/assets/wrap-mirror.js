@@ -3,6 +3,7 @@ import { FitAddon } from "/assets/vendor/xterm/addon-fit.mjs";
 
 const STORAGE_KEY = "wrap.mirror.v1.secret";
 const MAX_WIRE_MESSAGE = 128 * 1024;
+const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17;
 const TAG = Object.freeze({
   hello: 0x01,
   list: 0x02,
@@ -154,16 +155,24 @@ if (fragmentKey !== null) {
   }
 }
 
-let secret;
+let secret = null;
+let incompatibleBrowser = false;
 try {
   secret = decodeBase64URL(sessionStorage.getItem(STORAGE_KEY) || "");
-  if (!globalThis.isSecureContext || !crypto.subtle) {
-    throw new Error("secure browser context required");
-  }
-  await cryptoSelfTest();
 } catch {
-  secret?.fill(0);
-  secret = null;
+  sessionStorage.removeItem(STORAGE_KEY);
+}
+if (secret) {
+  try {
+    if (!globalThis.isSecureContext || !crypto.subtle) {
+      throw new Error("secure browser context required");
+    }
+    await cryptoSelfTest();
+  } catch {
+    secret.fill(0);
+    secret = null;
+    incompatibleBrowser = true;
+  }
 }
 
 const elements = {
@@ -202,6 +211,7 @@ terminal.open(elements.terminal);
 let connection = null;
 let sessions = [];
 let current = null;
+let closing = null;
 let reconnectAttempt = 0;
 let reconnectTimer = 0;
 let stopped = false;
@@ -304,7 +314,7 @@ function dimensions() {
 }
 
 function openSession(session) {
-  if (!connection?.authenticated) {
+  if (!connection?.authenticated || closing) {
     return;
   }
   terminal.reset();
@@ -324,10 +334,11 @@ function openSession(session) {
 
 function closeSession() {
   if (current && connection?.authenticated) {
+    closing = current;
     queueFrame(TAG.close, new Uint8Array());
+    current = null;
+    showMessage("Closing terminal…", "Waiting for the encrypted host acknowledgement.", "Encrypted");
   }
-  current = null;
-  renderSessions(sessions);
 }
 
 function sendJSON(tag, value) {
@@ -396,7 +407,10 @@ async function receiveMessage(target, data) {
       }
       {
         const nextSessions = validateSessionList(parseJSON(frame.payload));
-        if (current) {
+        if (closing) {
+          closing = null;
+          renderSessions(nextSessions);
+        } else if (current) {
           sessions = nextSessions;
           const stillMirrored = sessions.some(
             (session) => session.id === current.id && session.generation === current.generation,
@@ -412,20 +426,34 @@ async function receiveMessage(target, data) {
       }
       break;
     case TAG.output:
-      if (!target.authenticated || !current) {
+      if (!target.authenticated) {
+        throw new Error("output without open terminal");
+      }
+      if (closing) {
+        break;
+      }
+      if (!current) {
         throw new Error("output without open terminal");
       }
       terminal.write(frame.payload);
       break;
     case TAG.revoked: {
       const revoked = parseJSON(frame.payload);
-      if (current?.id === revoked.id && current?.generation === revoked.generation) {
-        current = null;
-      }
-      showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-      setTimeout(() => renderSessions(sessions.filter(
+      const isCurrent = current?.id === revoked.id &&
+        current?.generation === revoked.generation;
+      const isClosing = closing?.id === revoked.id &&
+        closing?.generation === revoked.generation;
+      sessions = sessions.filter(
         (session) => session.id !== revoked.id || session.generation !== revoked.generation,
-      )), 700);
+      );
+      if (isCurrent) {
+        current = null;
+        showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
+        setTimeout(() => renderSessions(sessions), 700);
+      } else if (isClosing) {
+        closing = null;
+        renderSessions(sessions);
+      }
       break;
     }
     case TAG.shutdown: {
@@ -452,6 +480,7 @@ async function receiveMessage(target, data) {
         stopped = true;
       }
       current = null;
+      closing = null;
       showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
       if (problem.retry === false) {
         target.socket.close();
@@ -521,6 +550,7 @@ function connect() {
     }
     connection = null;
     current = null;
+    closing = null;
     if (event.code === 1008) {
       stopped = true;
       sessionStorage.removeItem(STORAGE_KEY);
@@ -557,6 +587,16 @@ function setControlSticky(value) {
   button.setAttribute("aria-pressed", String(value));
 }
 
+function sendInput(data) {
+  const payload = encoder.encode(applyControl(data));
+  for (let offset = 0; offset < payload.length; offset += MAX_FRAME_PAYLOAD) {
+    queueFrame(
+      TAG.input,
+      payload.subarray(offset, offset + MAX_FRAME_PAYLOAD),
+    );
+  }
+}
+
 const toolbarData = Object.freeze({
   enter: "\r",
   escape: "\u001b",
@@ -574,7 +614,7 @@ const toolbarData = Object.freeze({
 
 terminal.onData((data) => {
   if (current && connection?.authenticated) {
-    queueFrame(TAG.input, encoder.encode(applyControl(data)));
+    sendInput(data);
   }
 });
 elements.toolbar.addEventListener("pointerdown", (event) => event.preventDefault());
@@ -590,7 +630,7 @@ elements.toolbar.addEventListener("click", (event) => {
   }
   const data = toolbarData[key];
   if (data) {
-    queueFrame(TAG.input, encoder.encode(applyControl(data)));
+    sendInput(data);
     terminal.focus();
   }
 });
@@ -611,10 +651,17 @@ window.addEventListener("resize", scheduleResize);
 globalThis.visualViewport?.addEventListener("resize", scheduleResize);
 
 if (!secret) {
-  showMessage(
-    "Pairing key missing",
-    "Scan the QR code shown by wrap. This page will not connect without its URL fragment.",
-  );
+  if (incompatibleBrowser) {
+    showMessage(
+      "Incompatible browser",
+      "A secure browser context with working WebCrypto support is required.",
+    );
+  } else {
+    showMessage(
+      "Pairing key missing",
+      "Scan the QR code shown by wrap. This page will not connect without its URL fragment.",
+    );
+  }
 } else {
   connect();
 }

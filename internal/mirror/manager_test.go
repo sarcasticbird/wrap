@@ -507,6 +507,66 @@ func TestManagerEventQueueCoalescesSnapshotsBeforeDroppingViewedEvent(t *testing
 	}
 }
 
+func TestManagerEventQueueCoalescesSnapshotsBehindViewedEvent(t *testing.T) {
+	manager, err := NewManager(ManagerOptions{Workspace: "vb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstViewed := Event{Viewed: &ViewedEvent{
+		ID: "$7", Generation: "generation-a", Activity: 41,
+	}}
+	manager.events <- firstViewed
+	for i := 1; i < cap(manager.events); i++ {
+		manager.events <- Event{Snapshot: &Snapshot{
+			State: StateStarting,
+			Err:   strings.Repeat("x", i),
+		}}
+	}
+	secondViewed := Event{Viewed: &ViewedEvent{
+		ID: "$8", Generation: "generation-a", Activity: 42,
+	}}
+	if !manager.publishViewed(secondViewed) {
+		t.Fatal("viewed event was dropped behind an older viewed event and snapshots")
+	}
+	var activities []int64
+	for len(manager.events) > 0 {
+		event := <-manager.events
+		if event.Viewed != nil {
+			activities = append(activities, event.Viewed.Activity)
+		}
+	}
+	if len(activities) != 2 || activities[0] != 41 || activities[1] != 42 {
+		t.Fatalf("viewed activity events = %v", activities)
+	}
+}
+
+func TestManagerSnapshotCoalescesBehindViewedEvent(t *testing.T) {
+	manager, err := NewManager(ManagerOptions{Workspace: "vb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.events <- Event{Viewed: &ViewedEvent{
+		ID: "$7", Generation: "generation-a", Activity: 41,
+	}}
+	for i := 1; i < cap(manager.events); i++ {
+		manager.events <- Event{Snapshot: &Snapshot{
+			State: StateStarting,
+			Err:   strings.Repeat("x", i),
+		}}
+	}
+	manager.publishSnapshot(Snapshot{State: StateReady, Err: "latest"})
+	var foundViewed, foundLatest bool
+	for len(manager.events) > 0 {
+		event := <-manager.events
+		foundViewed = foundViewed || event.Viewed != nil
+		foundLatest = foundLatest ||
+			event.Snapshot != nil && event.Snapshot.State == StateReady && event.Snapshot.Err == "latest"
+	}
+	if !foundViewed || !foundLatest {
+		t.Fatalf("coalesced events viewed/latest = %v/%v", foundViewed, foundLatest)
+	}
+}
+
 func TestManagerViewerExitClosesActiveSessionAndNotifiesClient(t *testing.T) {
 	viewer := &fakeViewer{done: make(chan error, 1)}
 	tunnel := &fakeTunnelResource{

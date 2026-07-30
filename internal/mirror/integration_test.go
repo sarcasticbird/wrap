@@ -7,6 +7,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -190,6 +191,7 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	}
 	writeEncryptedRaw(t, connection, sealer, TagClose, nil)
 	receiveWithin(t, viewer.done, "viewer close")
+	assertSessionFrame(t, connection, opener, TagStatus, "vb/api", "vb/web")
 
 	writeEncryptedControl(t, connection, sealer, TagOpen, OpenRequest{
 		ID: secondSession.ID, Generation: secondSession.Generation, Columns: 90, Rows: 30,
@@ -248,6 +250,47 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	if got := manager.Snapshot().State; got != StateStopped {
 		t.Fatalf("state after last-session revoke = %v", got)
 	}
+}
+
+func TestManagerUnexpectedTunnelExitRevokesBrowserCredential(t *testing.T) {
+	const publicHost = "quiet-river.trycloudflare.com"
+	var localServer *LocalServer
+	tunnel := &fakeTunnelResource{
+		url:  "https://" + publicHost,
+		done: make(chan error, 1),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		StartServer: func(ctx context.Context, options ServerOptions) (ServerResource, error) {
+			server, startErr := StartLocalServer(ctx, options)
+			localServer = server
+			return server, startErr
+		},
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}
+	if err := manager.Mirror(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+
+	secret := pairingSecret(t, manager.Snapshot().PairingURL)
+	connection, _, opener := dialEncryptedManager(
+		t, localServer.LocalURL(), publicHost, secret, 0x70,
+	)
+	assertSessionFrame(t, connection, opener, TagMirrorList, "vb/api")
+	assertSessionFrame(t, connection, opener, TagStatus, "vb/api")
+
+	tunnel.done <- errors.New("process exited")
+	assertShutdownFrame(t, connection, opener, "Quick Tunnel exited")
+	_ = connection.Close(websocket.StatusNormalClosure, "shutdown received")
 }
 
 func pairingSecret(t *testing.T, pairingURL string) Secret {

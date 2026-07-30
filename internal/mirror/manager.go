@@ -622,7 +622,7 @@ func (m *Manager) watchTunnel(tunnel TunnelResource) {
 	m.mu.Unlock()
 	_ = cleanup.close(context.Background(), Shutdown{
 		Reason: "Quick Tunnel exited",
-		Retry:  true,
+		Retry:  false,
 	})
 	m.publishSnapshot(snapshot)
 }
@@ -727,20 +727,13 @@ func (m *Manager) publishSnapshot(snapshot Snapshot) {
 	defer m.eventMu.Unlock()
 	select {
 	case m.events <- event:
+		return
 	default:
-		// Snapshot traffic is coalescible. If the oldest queued item is
-		// another snapshot, replace it with the newest state. Never evict a
-		// ViewedEvent: the host needs each one to advance its activity
-		// baseline.
-		select {
-		case oldest := <-m.events:
-			if oldest.Viewed != nil {
-				m.events <- oldest
-				return
-			}
-			m.events <- event
-		default:
-		}
+	}
+	viewed, _ := m.drainEventsLocked()
+	m.refillEventsLocked(viewed)
+	if len(viewed) < cap(m.events) {
+		m.events <- event
 	}
 }
 
@@ -752,16 +745,49 @@ func (m *Manager) publishViewed(event Event) bool {
 		return true
 	default:
 	}
-	select {
-	case oldest := <-m.events:
-		if oldest.Viewed != nil {
-			m.events <- oldest
-			return false
-		}
-		m.events <- event
-		return true
-	default:
+	viewed, latestSnapshot := m.drainEventsLocked()
+	if len(viewed) >= cap(m.events) {
+		m.refillEventsLocked(viewed)
 		return false
+	}
+	viewed = append(viewed, event)
+	m.refillEventsLocked(viewed)
+	if latestSnapshot != nil && len(viewed) < cap(m.events) {
+		m.events <- *latestSnapshot
+	}
+	return true
+}
+
+// drainEventsLocked removes the current queue contents while retaining every
+// non-coalescible viewer acknowledgement and only the newest state snapshot.
+// eventMu must be held by the caller.
+func (m *Manager) drainEventsLocked() ([]Event, *Event) {
+	viewed := make([]Event, 0, cap(m.events))
+	var latestSnapshot Event
+	hasSnapshot := false
+	for {
+		select {
+		case event := <-m.events:
+			if event.Viewed != nil {
+				viewed = append(viewed, event)
+			} else if event.Snapshot != nil {
+				latestSnapshot = event
+				hasSnapshot = true
+			}
+		default:
+			if !hasSnapshot {
+				return viewed, nil
+			}
+			return viewed, &latestSnapshot
+		}
+	}
+}
+
+// refillEventsLocked restores a queue slice known to fit the channel. eventMu
+// must be held by the caller.
+func (m *Manager) refillEventsLocked(events []Event) {
+	for _, event := range events {
+		m.events <- event
 	}
 }
 

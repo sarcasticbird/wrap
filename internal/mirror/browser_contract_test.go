@@ -82,3 +82,25 @@ func TestBrowserContractIncludesTerminalAndMobileControls(t *testing.T) {
 		}
 	}
 }
+
+func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	for _, want := range []string{
+		`const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17`,
+		`let closing = null`,
+		`if (closing)`,
+		`closing = null`,
+		`function sendInput(data)`,
+		`payload.subarray(offset, offset + MAX_FRAME_PAYLOAD)`,
+		`const isCurrent = current?.id === revoked.id`,
+		`"Incompatible browser"`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("browser client missing close/input guard %q", want)
+		}
+	}
+}

@@ -123,6 +123,7 @@ type mirrorEventMsg struct {
 
 type mirrorOperationMsg struct {
 	operation string
+	token     uint64
 	err       error
 }
 
@@ -165,6 +166,7 @@ type Model struct {
 	mirrorTargetName  string
 	mirrorCancel      context.CancelFunc
 	mirrorStarting    bool
+	mirrorOperationID uint64
 	mirrorReconciling bool
 	mirrorSyncErr     string
 }
@@ -373,10 +375,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.event.Snapshot != nil {
 			m.mirrorSnapshot = *msg.event.Snapshot
-			if m.mirrorSnapshot.State != mirrorapi.StateStarting {
-				m.mirrorStarting = false
-				m.clearMirrorCancel()
-			}
 		}
 		if msg.event.Viewed != nil {
 			for name, session := range m.sessions {
@@ -389,6 +387,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, waitMirrorEvent(m.mirrors.Events())
 	case mirrorOperationMsg:
+		if msg.token != m.mirrorOperationID {
+			return m, nil
+		}
 		m.mirrorStarting = false
 		m.clearMirrorCancel()
 		if errors.Is(msg.err, context.Canceled) {
@@ -643,6 +644,7 @@ func (m Model) startMirror(target row) (tea.Model, tea.Cmd) {
 	m.clearMirrorCancel()
 	m.mirrorCancel = cancel
 	m.mirrorStarting = true
+	token := m.beginMirrorOperation()
 	session := mirrorapi.HostSession{
 		ID:           target.id,
 		Generation:   target.generation,
@@ -653,7 +655,11 @@ func (m Model) startMirror(target row) (tea.Model, tea.Cmd) {
 		SeenActivity: m.lastSeen[target.name],
 	}
 	return m, func() tea.Msg {
-		return mirrorOperationMsg{operation: "start", err: m.mirrors.Mirror(ctx, session)}
+		return mirrorOperationMsg{
+			operation: "start",
+			token:     token,
+			err:       m.mirrors.Mirror(ctx, session),
+		}
 	}
 }
 
@@ -668,9 +674,11 @@ func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		identity := m.mirrorTarget
+		token := m.beginMirrorOperation()
 		return m, func() tea.Msg {
 			return mirrorOperationMsg{
 				operation: "revoke",
+				token:     token,
 				err:       m.mirrors.Revoke(context.Background(), identity),
 			}
 		}
@@ -678,9 +686,11 @@ func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.mirrors == nil || m.mirrorSnapshot.State != mirrorapi.StateReady {
 			return m, nil
 		}
+		token := m.beginMirrorOperation()
 		return m, func() tea.Msg {
 			return mirrorOperationMsg{
 				operation: "rotate",
+				token:     token,
 				err:       m.mirrors.Rotate(context.Background()),
 			}
 		}
@@ -695,6 +705,11 @@ func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) beginMirrorOperation() uint64 {
+	m.mirrorOperationID++
+	return m.mirrorOperationID
 }
 
 func mirrorEligible(workspace string, target row) bool {
@@ -1104,14 +1119,15 @@ func (m Model) footer() string {
 
 func (m Model) mirrorView(heading string) string {
 	lines := []string{heading}
+	pairingURLLine := -1
+	maxBody := 0
+	if m.Height > 0 {
+		maxBody = max(1, m.Height-1)
+	}
 	switch {
 	case m.mirrorStarting || m.mirrorSnapshot.State == mirrorapi.StateStarting:
 		lines = append(lines, "", "Starting encrypted mirror…", "", m.mirrorTargetName)
 	case m.mirrorSnapshot.State == mirrorapi.StateReady:
-		lines = append(lines, "")
-		if m.mirrorSnapshot.QR != "" {
-			lines = append(lines, strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")...)
-		}
 		lines = append(lines,
 			"",
 			m.mirrorSnapshot.PairingURL,
@@ -1120,6 +1136,26 @@ func (m Model) mirrorView(heading string) string {
 			"",
 			m.mirrorTargetName+" · "+strconv.Itoa(len(m.mirrorSnapshot.Sessions))+" mirrored",
 		)
+		pairingURLLine = 2
+		if m.mirrorSnapshot.QR != "" {
+			qrLines := strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")
+			qrFitsWidth := m.Width <= 0
+			if !qrFitsWidth {
+				qrFitsWidth = true
+				for _, line := range qrLines {
+					if runewidth.StringWidth(line) > m.Width {
+						qrFitsWidth = false
+						break
+					}
+				}
+			}
+			qrFitsHeight := maxBody == 0 ||
+				mirrorRenderedRows(lines, m.Width)+1+len(qrLines) <= maxBody
+			if qrFitsWidth && qrFitsHeight {
+				lines = append(lines, "")
+				lines = append(lines, qrLines...)
+			}
+		}
 	default:
 		lines = append(lines,
 			"",
@@ -1133,15 +1169,14 @@ func (m Model) mirrorView(heading string) string {
 	} else if !m.mirrorStarting {
 		footer = "m retry · esc close"
 	}
-	maxBody := len(lines)
-	if m.Height > 0 {
-		maxBody = max(1, m.Height-1)
+	if maxBody == 0 {
+		maxBody = len(lines)
 	}
 	if len(lines) > maxBody {
 		lines = lines[:maxBody]
 	}
 	for i := range lines {
-		if m.Width > 0 {
+		if m.Width > 0 && i != pairingURLLine {
 			lines[i] = runewidth.Truncate(lines[i], m.Width, "")
 		}
 	}
@@ -1155,4 +1190,16 @@ func (m Model) mirrorView(heading string) string {
 	}
 	lines = append(lines, pane.DimStyle.Render(footer))
 	return strings.Join(lines, "\n")
+}
+
+func mirrorRenderedRows(lines []string, width int) int {
+	if width <= 0 {
+		return len(lines)
+	}
+	rows := 0
+	for _, line := range lines {
+		lineRows := (runewidth.StringWidth(line) + width - 1) / width
+		rows += max(1, lineRows)
+	}
+	return rows
 }

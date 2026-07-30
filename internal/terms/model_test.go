@@ -227,6 +227,66 @@ func TestMirrorKeyStartsEligibleRowAndOverlayBlocksOrdinaryKeys(t *testing.T) {
 	}
 }
 
+func TestMirrorOperationMessagesIgnoreStaleCompletionsAndSnapshots(t *testing.T) {
+	mirrors := newFakeMirror()
+	canceled := false
+	m := NewModel(&fakeBackend{}, Options{WS: "vb", Mirrors: mirrors})
+	m.mirrorOpen = true
+	m.mirrorStarting = true
+	m.mirrorOperationID = 2
+	m.mirrorCancel = func() { canceled = true }
+
+	staleSnapshot := mirrorapi.Snapshot{State: mirrorapi.StateStopped}
+	mod, _ := m.Update(mirrorEventMsg{
+		event: mirrorapi.Event{Snapshot: &staleSnapshot},
+		ok:    true,
+	})
+	got := mod.(Model)
+	if !got.mirrorStarting || canceled {
+		t.Fatal("stale snapshot canceled the active mirror operation")
+	}
+
+	mod, _ = got.Update(mirrorOperationMsg{
+		operation: "revoke",
+		token:     1,
+	})
+	got = mod.(Model)
+	if !got.mirrorStarting || !got.mirrorOpen || canceled {
+		t.Fatal("stale operation completion mutated the active mirror operation")
+	}
+
+	mod, _ = got.Update(mirrorOperationMsg{
+		operation: "start",
+		token:     2,
+	})
+	got = mod.(Model)
+	if got.mirrorStarting || !canceled {
+		t.Fatal("current operation completion did not clear its cancellation state")
+	}
+}
+
+func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
+	const pairingURL = "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	m := Model{
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: pairingURL,
+			QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+			Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+		},
+	}
+	m.Width = 30
+	m.Height = 8
+	view := ansi.Strip(m.mirrorView("Terminals"))
+	if !strings.Contains(view, pairingURL) {
+		t.Fatalf("narrow mirror overlay omitted or truncated pairing URL:\n%s", view)
+	}
+	if strings.Contains(view, "QR-LINE") {
+		t.Fatalf("narrow mirror overlay rendered a partial QR:\n%s", view)
+	}
+}
+
 func writeMalformedSelection(t *testing.T, ws string) {
 	t.Helper()
 	stateHome := t.TempDir()
