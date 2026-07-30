@@ -1207,7 +1207,7 @@ func (m Model) mirrorContentLines() []string {
 		if m.mirrorSnapshot.Err != "" {
 			lines = append(lines, "")
 			for errLine := range strings.SplitSeq(m.mirrorSnapshot.Err, "\n") {
-				lines = append(lines, mirrorWrapLine(errLine, m.Width)...)
+				lines = append(lines, mirrorWrapLine(pane.SafeLabel(errLine), m.Width)...)
 			}
 		}
 	}

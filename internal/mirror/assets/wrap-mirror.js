@@ -409,6 +409,13 @@ async function receiveMessage(target, data) {
         const nextSessions = validateSessionList(parseJSON(frame.payload));
         if (closing) {
           sessions = nextSessions;
+          const closingStillMirrored = sessions.some(
+            (session) => session.id === closing.id && session.generation === closing.generation,
+          );
+          if (!closingStillMirrored) {
+            closing = null;
+            renderSessions(sessions);
+          }
         } else if (current) {
           sessions = nextSessions;
           const stillMirrored = sessions.some(
@@ -447,11 +454,14 @@ async function receiveMessage(target, data) {
       const revoked = parseJSON(frame.payload);
       const isCurrent = current?.id === revoked.id &&
         current?.generation === revoked.generation;
+      const isClosing = closing?.id === revoked.id &&
+        closing?.generation === revoked.generation;
       sessions = sessions.filter(
         (session) => session.id !== revoked.id || session.generation !== revoked.generation,
       );
-      if (isCurrent) {
+      if (isCurrent || isClosing) {
         current = null;
+        closing = null;
         showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
         setTimeout(() => renderSessions(sessions), 700);
       }

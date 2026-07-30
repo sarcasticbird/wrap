@@ -337,11 +337,11 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 		}
 		return nil
 	case TagClose:
-		if !c.viewerOpen.Load() {
-			return nil
-		}
 		if err := ValidateClientFrame(tag, payload); err != nil {
 			return err
+		}
+		if !c.viewerOpen.Load() {
+			return nil
 		}
 		if err := c.handler.Close(c); err != nil {
 			if !c.viewerOpen.Load() {
@@ -354,11 +354,11 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 		}
 		return c.sendCloseAcknowledgement(ctx)
 	case TagInput:
-		if !c.viewerOpen.Load() {
-			return nil
-		}
 		if err := ValidateClientFrame(tag, payload); err != nil {
 			return err
+		}
+		if !c.viewerOpen.Load() {
+			return nil
 		}
 		err := c.handler.Input(c, payload)
 		if err != nil && !c.viewerOpen.Load() {
@@ -366,15 +366,15 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 		}
 		return err
 	case TagResize:
-		if !c.viewerOpen.Load() {
-			return nil
-		}
 		var request ResizeRequest
 		if err := DecodeControl(tag, payload, &request); err != nil {
 			return err
 		}
 		if err := ValidateClientFrame(tag, request); err != nil {
 			return err
+		}
+		if !c.viewerOpen.Load() {
+			return nil
 		}
 		err := c.handler.Resize(c, request)
 		if err != nil && !c.viewerOpen.Load() {

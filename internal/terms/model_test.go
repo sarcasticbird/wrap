@@ -358,15 +358,20 @@ func TestMirrorOverlayShowsStartupFailureDetail(t *testing.T) {
 	m := Model{
 		mirrorSnapshot: mirrorapi.Snapshot{
 			State: mirrorapi.StateFailed,
-			Err:   "start cloudflared: timeout\nINF dial tcp blocked",
+			Err:   "start cloudflared: timeout\nINF \x1b]52;c;Y2xpcGJvYXJk\a dial tcp blocked",
 		},
 	}
 	m.Width = 18
-	m.Height = 12
+	m.Height = 14
 	content := ansi.Strip(m.mirrorView("Terminals"))
 	flatContent := strings.ReplaceAll(content, "\n", "")
-	if want := "start cloudflared: timeoutINF dial tcp blocked"; !strings.Contains(flatContent, want) {
+	if want := "start cloudflared: timeoutINF \\x1b]52;c;Y2xpcGJvYXJk\\a dial tcp blocked"; !strings.Contains(flatContent, want) {
 		t.Fatalf("failed mirror overlay omitted diagnostic %q:\n%s", want, content)
+	}
+	for _, r := range content {
+		if r < 0x20 && r != '\n' {
+			t.Fatalf("failed mirror overlay retained control byte %#x:\n%q", r, content)
+		}
 	}
 	for _, line := range strings.Split(content, "\n") {
 		if runewidth.StringWidth(line) > m.Width {

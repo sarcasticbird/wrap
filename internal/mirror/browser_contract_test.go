@@ -104,8 +104,14 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 			t.Errorf("browser client missing close/input guard %q", want)
 		}
 	}
-	if !strings.Contains(source, `if (closing) {
-          sessions = nextSessions;`) {
-		t.Error("browser status handling can clear a pending close acknowledgement")
+	for _, want := range []string{
+		`const closingStillMirrored = sessions.some(`,
+		`if (!closingStillMirrored) {`,
+		`const isClosing = closing?.id === revoked.id`,
+		`if (isCurrent || isClosing) {`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Errorf("browser client does not resolve server-side close race %q", want)
+		}
 	}
 }

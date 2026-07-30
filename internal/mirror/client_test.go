@@ -138,6 +138,28 @@ func TestClientDispatchDropsFramesForViewerThatJustEnded(t *testing.T) {
 	}
 }
 
+func TestClientDispatchValidatesFramesForViewerThatJustEnded(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		tag     byte
+		payload []byte
+	}{
+		{name: "non-empty close", tag: TagClose, payload: []byte("x")},
+		{name: "oversized input", tag: TagInput, payload: make([]byte, MaxWireMessage)},
+		{name: "malformed resize", tag: TagResize, payload: []byte("{")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{
+				handler: dispatchHandler{},
+				queue:   newOutboundQueue(MaxClientQueueBytes),
+			}
+			if err := client.dispatch(t.Context(), test.tag, test.payload); err == nil {
+				t.Fatal("invalid stale viewer frame was accepted")
+			}
+		})
+	}
+}
+
 func TestClientDispatchDropsHandlerErrorAfterConcurrentViewerEnd(t *testing.T) {
 	handlerErr := errors.New("no terminal is open")
 	resize, err := EncodeControl(TagResize, ResizeRequest{Columns: 80, Rows: 24})
