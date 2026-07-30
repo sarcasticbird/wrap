@@ -11,7 +11,11 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(sourceBytes)
+	stateBytes, err := fs.ReadFile(assets, "assets/wrap-mirror-state.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes) + "\n" + string(stateBytes)
 	for _, want := range []string{
 		`from "/assets/vendor/xterm/xterm.mjs"`,
 		`from "/assets/vendor/xterm/addon-fit.mjs"`,
@@ -91,13 +95,10 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 	source := string(sourceBytes)
 	for _, want := range []string{
 		`const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17`,
-		`let closing = null`,
-		`if (closing)`,
-		`closing = null`,
 		`case TAG.close:`,
 		`function sendInput(data)`,
 		`payload.subarray(offset, offset + MAX_FRAME_PAYLOAD)`,
-		`const isCurrent = current?.id === revoked.id`,
+		`closeState.beginClose(viewerState)`,
 		`"Incompatible browser"`,
 	} {
 		if !strings.Contains(source, want) {
@@ -105,23 +106,14 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 		}
 	}
 	for _, want := range []string{
-		`let awaitingCloseAcknowledgement = false`,
-		`function closeStateSelfTest()`,
-		`status followed by close acknowledgement`,
-		`revocation followed by close acknowledgement`,
-		`closeStateSelfTest();`,
-		`const closingStillMirrored = nextSessions.some(`,
-		`if (closingStillMirrored) {`,
-		`const isClosing = closing?.id === revoked.id`,
-		`if (isCurrent || isClosing) {`,
-		`(!closing && !awaitingCloseAcknowledgement)`,
-		`if (awaitingCloseAcknowledgement) {`,
+		`import "/assets/wrap-mirror-state.js"`,
+		`const viewerState = closeState.create()`,
+		`closeState.status(viewerState, nextSessions)`,
+		`closeState.acknowledgeClose(viewerState)`,
+		`closeState.revoked(viewerState, revoked)`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client does not resolve server-side close race %q", want)
 		}
-	}
-	if count := strings.Count(source, "awaitingCloseAcknowledgement = true"); count < 3 {
-		t.Errorf("browser client marks only %d of 3 server-resolved close paths", count)
 	}
 }

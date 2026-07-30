@@ -1,5 +1,6 @@
 import { Terminal } from "/assets/vendor/xterm/xterm.mjs";
 import { FitAddon } from "/assets/vendor/xterm/addon-fit.mjs";
+import "/assets/wrap-mirror-state.js";
 
 const STORAGE_KEY = "wrap.mirror.v1.secret";
 const MAX_WIRE_MESSAGE = 128 * 1024;
@@ -209,94 +210,13 @@ terminal.loadAddon(fitAddon);
 terminal.open(elements.terminal);
 
 let connection = null;
-let sessions = [];
-let current = null;
-let closing = null;
-let awaitingCloseAcknowledgement = false;
+const closeState = globalThis.WrapMirrorCloseState;
+const viewerState = closeState.create();
 let reconnectAttempt = 0;
 let reconnectTimer = 0;
 let stopped = false;
 let controlSticky = false;
 let resizeTimer = 0;
-
-function canOpenSession() {
-  return !closing && !awaitingCloseAcknowledgement;
-}
-
-function resolveClosingFromStatus(nextSessions) {
-  if (!closing) {
-    return false;
-  }
-  const closingStillMirrored = nextSessions.some(
-    (session) => session.id === closing.id && session.generation === closing.generation,
-  );
-  if (closingStillMirrored) {
-    return false;
-  }
-  awaitingCloseAcknowledgement = true;
-  closing = null;
-  return true;
-}
-
-function resolveClosingFromRevocation(revoked) {
-  const isClosing = closing?.id === revoked.id &&
-    closing?.generation === revoked.generation;
-  if (isClosing) {
-    awaitingCloseAcknowledgement = true;
-    closing = null;
-  }
-  return isClosing;
-}
-
-function resolveClosingFromError() {
-  if (closing) {
-    awaitingCloseAcknowledgement = true;
-    closing = null;
-  }
-}
-
-function acceptCloseAcknowledgement() {
-  if (awaitingCloseAcknowledgement) {
-    awaitingCloseAcknowledgement = false;
-    return "late";
-  }
-  if (closing) {
-    closing = null;
-    return "current";
-  }
-  return "";
-}
-
-function resetCloseState() {
-  closing = null;
-  awaitingCloseAcknowledgement = false;
-}
-
-function closeStateSelfTest() {
-  const savedClosing = closing;
-  const savedAwaiting = awaitingCloseAcknowledgement;
-  const session = { id: "$self-test", generation: "self-test-generation" };
-  try {
-    closing = session;
-    awaitingCloseAcknowledgement = false;
-    if (!resolveClosingFromStatus([]) ||
-      acceptCloseAcknowledgement() !== "late" ||
-      !canOpenSession()) {
-      throw new Error("status followed by close acknowledgement failed");
-    }
-
-    closing = session;
-    awaitingCloseAcknowledgement = false;
-    if (!resolveClosingFromRevocation(session) ||
-      acceptCloseAcknowledgement() !== "late" ||
-      !canOpenSession()) {
-      throw new Error("revocation followed by close acknowledgement failed");
-    }
-  } finally {
-    closing = savedClosing;
-    awaitingCloseAcknowledgement = savedAwaiting;
-  }
-}
 
 function showOnly(view) {
   elements.message.classList.toggle("hidden", view !== "message");
@@ -318,7 +238,8 @@ function setOnline() {
 }
 
 function renderSessions(nextSessions) {
-  sessions = nextSessions;
+  viewerState.sessions = nextSessions;
+  const sessions = viewerState.sessions;
   elements.sessionList.replaceChildren();
   elements.sessionCount.textContent = String(sessions.length);
   if (sessions.length === 0) {
@@ -349,7 +270,7 @@ function renderSessions(nextSessions) {
     button.addEventListener("click", () => openSession(session));
     elements.sessionList.append(button);
   }
-  current = null;
+  viewerState.current = null;
   setOnline();
   showOnly("list");
 }
@@ -394,11 +315,10 @@ function dimensions() {
 }
 
 function openSession(session) {
-  if (!connection?.authenticated || !canOpenSession()) {
+  if (!connection?.authenticated || !closeState.open(viewerState, session)) {
     return;
   }
   terminal.reset();
-  current = session;
   elements.terminalTitle.textContent = session.name;
   showOnly("terminal");
   requestAnimationFrame(() => {
@@ -413,10 +333,8 @@ function openSession(session) {
 }
 
 function closeSession() {
-  if (current && connection?.authenticated) {
-    closing = current;
+  if (connection?.authenticated && closeState.beginClose(viewerState)) {
     queueFrame(TAG.close, new Uint8Array());
-    current = null;
     showMessage("Closing terminal…", "Waiting for the encrypted host acknowledgement.", "Encrypted");
   }
 }
@@ -487,60 +405,40 @@ async function receiveMessage(target, data) {
       }
       {
         const nextSessions = validateSessionList(parseJSON(frame.payload));
-        if (closing) {
-          sessions = nextSessions;
-          if (resolveClosingFromStatus(nextSessions)) {
-            renderSessions(sessions);
-          }
-        } else if (current) {
-          sessions = nextSessions;
-          const stillMirrored = sessions.some(
-            (session) => session.id === current.id && session.generation === current.generation,
-          );
-          if (!stillMirrored) {
-            current = null;
-            showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-            setTimeout(() => renderSessions(sessions), 700);
-          }
-        } else {
-          renderSessions(nextSessions);
+        const action = closeState.status(viewerState, nextSessions);
+        if (action === "render") {
+          renderSessions(viewerState.sessions);
+        } else if (action === "ended") {
+          showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
+          setTimeout(() => renderSessions(viewerState.sessions), 700);
         }
       }
       break;
     case TAG.close:
-      if (!target.authenticated || frame.payload.length !== 0 ||
-        (!closing && !awaitingCloseAcknowledgement)) {
+      if (!target.authenticated || frame.payload.length !== 0) {
         throw new Error("unexpected close acknowledgement");
       }
-      if (acceptCloseAcknowledgement() === "late") {
-        break;
+      if (closeState.acknowledgeClose(viewerState) === "render") {
+        renderSessions(viewerState.sessions);
       }
-      renderSessions(sessions);
       break;
     case TAG.output:
       if (!target.authenticated) {
         throw new Error("output without open terminal");
       }
-      if (closing) {
+      if (viewerState.closing) {
         break;
       }
-      if (!current) {
+      if (!viewerState.current) {
         throw new Error("output without open terminal");
       }
       terminal.write(frame.payload);
       break;
     case TAG.revoked: {
       const revoked = parseJSON(frame.payload);
-      const isCurrent = current?.id === revoked.id &&
-        current?.generation === revoked.generation;
-      const isClosing = resolveClosingFromRevocation(revoked);
-      sessions = sessions.filter(
-        (session) => session.id !== revoked.id || session.generation !== revoked.generation,
-      );
-      if (isCurrent || isClosing) {
-        current = null;
+      if (closeState.revoked(viewerState, revoked) === "ended") {
         showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-        setTimeout(() => renderSessions(sessions), 700);
+        setTimeout(() => renderSessions(viewerState.sessions), 700);
       }
       break;
     }
@@ -567,13 +465,12 @@ async function receiveMessage(target, data) {
       if (problem.retry === false) {
         stopped = true;
       }
-      resolveClosingFromError();
-      current = null;
+      closeState.error(viewerState);
       showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
       if (problem.retry === false) {
         target.socket.close();
       } else {
-        setTimeout(() => renderSessions(sessions), 700);
+        setTimeout(() => renderSessions(viewerState.sessions), 700);
       }
       break;
     }
@@ -637,8 +534,7 @@ function connect() {
       return;
     }
     connection = null;
-    current = null;
-    resetCloseState();
+    closeState.reset(viewerState);
     if (event.code === 1008) {
       stopped = true;
       sessionStorage.removeItem(STORAGE_KEY);
@@ -701,14 +597,14 @@ const toolbarData = Object.freeze({
 });
 
 terminal.onData((data) => {
-  if (current && connection?.authenticated) {
+  if (viewerState.current && connection?.authenticated) {
     sendInput(data);
   }
 });
 elements.toolbar.addEventListener("pointerdown", (event) => event.preventDefault());
 elements.toolbar.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-key]");
-  if (!button || !current) {
+  if (!button || !viewerState.current) {
     return;
   }
   const key = button.dataset.key;
@@ -728,7 +624,7 @@ elements.close.addEventListener("click", closeSession);
 function scheduleResize() {
   window.clearTimeout(resizeTimer);
   resizeTimer = window.setTimeout(() => {
-    if (!current || !connection?.authenticated) {
+    if (!viewerState.current || !connection?.authenticated) {
       return;
     }
     sendJSON(TAG.resize, dimensions());
@@ -738,19 +634,7 @@ function scheduleResize() {
 window.addEventListener("resize", scheduleResize);
 globalThis.visualViewport?.addEventListener("resize", scheduleResize);
 
-let closeStateCompatible = true;
-try {
-  closeStateSelfTest();
-} catch {
-  closeStateCompatible = false;
-}
-
-if (!closeStateCompatible) {
-  showMessage(
-    "Incompatible browser",
-    "The browser terminal state self-test failed.",
-  );
-} else if (!secret) {
+if (!secret) {
   if (incompatibleBrowser) {
     showMessage(
       "Incompatible browser",
