@@ -104,32 +104,43 @@
     state.awaitingCloseAcknowledgement = false;
   }
 
-  function receiveMessage(state, message, effects) {
+  function receiveMessage(state, target, frame, effects) {
     let action;
-    switch (message.type) {
-      case "status":
-        action = status(state, message.sessions);
+    let problem;
+    switch (frame.tag) {
+      case effects.tags.status:
+        if (!target.authenticated) {
+          throw new Error("status before authentication");
+        }
+        action = status(
+          state,
+          effects.validateSessionList(effects.parseJSON(frame.payload)),
+        );
         break;
-      case "close":
+      case effects.tags.close:
+        if (!target.authenticated || frame.payload.length !== 0) {
+          throw new Error("unexpected close acknowledgement");
+        }
         action = acknowledgeClose(state);
         break;
-      case "revoked":
-        action = revoked(state, message.session);
+      case effects.tags.revoked:
+        action = revoked(state, effects.parseJSON(frame.payload));
         break;
-      case "error":
+      case effects.tags.error:
+        problem = effects.parseJSON(frame.payload);
         action = error(state);
         break;
       default:
-        throw new Error(`unexpected viewer lifecycle message ${message.type}`);
+        return false;
     }
     if (action === "render" && typeof effects?.render === "function") {
       effects.render(state.sessions);
     } else if (action === "ended" && typeof effects?.ended === "function") {
       effects.ended(state.sessions);
     } else if (action === "error" && typeof effects?.error === "function") {
-      effects.error(message.problem);
+      effects.error(problem, target);
     }
-    return action;
+    return true;
   }
 
   global.WrapMirrorCloseState = Object.freeze({

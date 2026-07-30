@@ -92,13 +92,18 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(sourceBytes)
+	stateBytes, err := fs.ReadFile(assets, "assets/wrap-mirror-state.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes) + "\n" + string(stateBytes)
 	for _, want := range []string{
 		`const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17`,
-		`case TAG.close:`,
+		`case effects.tags.close:`,
 		`function sendInput(data)`,
 		`payload.subarray(offset, offset + MAX_FRAME_PAYLOAD)`,
 		`closeState.beginClose(viewerState)`,
+		`setTimeout(() => renderSessions(viewerState.sessions), 700)`,
 		`"Incompatible browser"`,
 	} {
 		if !strings.Contains(source, want) {
@@ -108,10 +113,9 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 	for _, want := range []string{
 		`import "/assets/wrap-mirror-state.js"`,
 		`const viewerState = closeState.create()`,
-		`closeState.receiveMessage(`,
-		`{ type: "status", sessions: nextSessions }`,
-		`{ type: "close" }`,
-		`{ type: "revoked", session: revoked }`,
+		`closeState.receiveMessage(viewerState, target, frame, viewerEffects)`,
+		`case effects.tags.status:`,
+		`case effects.tags.revoked:`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client does not resolve server-side close race %q", want)

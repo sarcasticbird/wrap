@@ -276,10 +276,24 @@ function renderSessions(nextSessions) {
 }
 
 const viewerEffects = Object.freeze({
+  tags: TAG,
+  parseJSON,
+  validateSessionList,
   render: (nextSessions) => renderSessions(nextSessions),
-  ended: (nextSessions) => {
+  ended: () => {
     showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-    setTimeout(() => renderSessions(nextSessions), 700);
+    setTimeout(() => renderSessions(viewerState.sessions), 700);
+  },
+  error: (problem, target) => {
+    if (problem.retry === false) {
+      stopped = true;
+    }
+    showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
+    if (problem.retry === false) {
+      target.socket.close();
+    } else {
+      setTimeout(() => renderSessions(viewerState.sessions), 700);
+    }
   },
 });
 
@@ -398,6 +412,9 @@ async function receiveMessage(target, data) {
   }
   const frame = await decryptFrame(target.receiveKey, target.receiveCounter, bytes);
   target.receiveCounter += 1n;
+  if (closeState.receiveMessage(viewerState, target, frame, viewerEffects)) {
+    return;
+  }
   switch (frame.tag) {
     case TAG.list:
       if (target.authenticated) {
@@ -406,25 +423,6 @@ async function receiveMessage(target, data) {
       target.authenticated = true;
       reconnectAttempt = 0;
       renderSessions(validateSessionList(parseJSON(frame.payload)));
-      break;
-    case TAG.status:
-      if (!target.authenticated) {
-        throw new Error("status before authentication");
-      }
-      {
-        const nextSessions = validateSessionList(parseJSON(frame.payload));
-        closeState.receiveMessage(
-          viewerState,
-          { type: "status", sessions: nextSessions },
-          viewerEffects,
-        );
-      }
-      break;
-    case TAG.close:
-      if (!target.authenticated || frame.payload.length !== 0) {
-        throw new Error("unexpected close acknowledgement");
-      }
-      closeState.receiveMessage(viewerState, { type: "close" }, viewerEffects);
       break;
     case TAG.output:
       if (!target.authenticated) {
@@ -438,15 +436,6 @@ async function receiveMessage(target, data) {
       }
       terminal.write(frame.payload);
       break;
-    case TAG.revoked: {
-      const revoked = parseJSON(frame.payload);
-      closeState.receiveMessage(
-        viewerState,
-        { type: "revoked", session: revoked },
-        viewerEffects,
-      );
-      break;
-    }
     case TAG.shutdown: {
       const shutdown = parseJSON(frame.payload);
       if (typeof shutdown.retry !== "boolean") {
@@ -463,24 +452,6 @@ async function receiveMessage(target, data) {
         shutdown.retry ? "The tunnel stopped. Reconnecting if it returns…" : "Scan the new QR code on the host.",
       );
       target.socket.close();
-      break;
-    }
-    case TAG.error: {
-      const problem = parseJSON(frame.payload);
-      if (problem.retry === false) {
-        stopped = true;
-      }
-      closeState.receiveMessage(
-        viewerState,
-        { type: "error", problem },
-        viewerEffects,
-      );
-      showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
-      if (problem.retry === false) {
-        target.socket.close();
-      } else {
-        setTimeout(() => renderSessions(viewerState.sessions), 700);
-      }
       break;
     }
     default:
