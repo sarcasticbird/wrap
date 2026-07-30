@@ -108,6 +108,15 @@ func isMissingTargetError(err error) bool {
 		strings.Contains(msg, "no such window")
 }
 
+// IsMissingTargetError reports whether err proves that a tmux session,
+// window, or its server no longer exists.
+func IsMissingTargetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrMissingTarget) || isMissingTargetError(err)
+}
+
 // NewSession creates a detached session. Empty cmd starts the default shell.
 func (s *Server) NewSession(name, dir, cmd string) error {
 	args := []string{"new-session", "-d", "-s", name, "-c", dir}
@@ -399,8 +408,77 @@ func (s *Server) SwitchClientIfGeneration(clientTTY, id, generation string) erro
 // to-attach race: a restarted server rejects the stale identity instead of
 // attaching to an unrelated session that reused id.
 func AttachSessionIfGenerationArgs(id, generation string) ([]string, error) {
+	return attachSessionIfGenerationArgs(id, generation, false)
+}
+
+// AttachSessionIgnoringSizeIfGenerationArgs returns one tmux command queue
+// operation that validates the server generation and attaches an ignored-size
+// client. Remote mirror viewers pair this flag with a temporary per-window
+// manual-size pin.
+func AttachSessionIgnoringSizeIfGenerationArgs(id, generation string) ([]string, error) {
+	return attachSessionIfGenerationArgs(id, generation, true)
+}
+
+// AttachWindowIgnoringSizeIfGenerationArgs attaches an ignored-size client
+// only while id still has windowID selected on the expected server
+// generation. The window guard ensures a viewer cannot pin one window and
+// then attach to another if the session's current window changes.
+func AttachWindowIgnoringSizeIfGenerationArgs(
+	id, generation, windowID string,
+) ([]string, error) {
+	attach := tmuxCommand("attach-session", "-f", "ignore-size", "-t", id)
+	return sessionWindowCommandIfGenerationArgs(id, generation, windowID, attach)
+}
+
+// PinWindowSizeIfGenerationArgs returns one tmux command queue operation that
+// prints the stable current window ID and its effective window-size option
+// (including whether the value is inherited), then switches that exact
+// generation's window to manual sizing.
+func PinWindowSizeIfGenerationArgs(id, generation string) ([]string, error) {
+	pin := tmuxCommand(
+		"display-message", "-p", "-t", id, "#{window_id}",
+	) + " ; " + tmuxCommand(
+		"show-options", "-w", "-A", "-t", id, "window-size",
+	) + " ; " + tmuxCommand(
+		"set-option", "-w", "-t", id, "window-size", "manual",
+	)
+	return sessionCommandIfGenerationArgs(id, generation, pin)
+}
+
+// RestoreWindowSizeIfGenerationArgs returns one generation-guarded tmux
+// command queue operation that restores the stable window captured by
+// PinWindowSizeIfGenerationArgs. Inherited values are restored by removing the
+// temporary window-local override rather than freezing the old effective
+// value.
+func RestoreWindowSizeIfGenerationArgs(
+	generation, windowID, mode string,
+	inherited bool,
+) ([]string, error) {
+	if !isWindowID(windowID) {
+		return nil, fmt.Errorf("invalid tmux window id %q", windowID)
+	}
+	switch mode {
+	case "largest", "smallest", "manual", "latest":
+	default:
+		return nil, fmt.Errorf("invalid tmux window-size mode %q", mode)
+	}
+	var restore string
+	if inherited {
+		restore = tmuxCommand("set-option", "-w", "-u", "-t", windowID, "window-size")
+	} else {
+		restore = tmuxCommand("set-option", "-w", "-t", windowID, "window-size", mode)
+	}
+	return serverCommandIfGenerationArgs(generation, restore)
+}
+
+func attachSessionIfGenerationArgs(id, generation string, ignoreSize bool) ([]string, error) {
+	attach := []string{"attach-session"}
+	if ignoreSize {
+		attach = append(attach, "-f", "ignore-size")
+	}
+	attach = append(attach, "-t", id)
 	return sessionCommandIfGenerationArgs(id, generation,
-		tmuxCommand("attach-session", "-t", id))
+		tmuxCommand(attach...))
 }
 
 func (s *Server) runSessionCommandIfGeneration(id, generation, command string) error {
@@ -432,6 +510,25 @@ func sessionCommandIfGenerationArgs(id, generation, command string) ([]string, e
 		return nil, fmt.Errorf("invalid tmux session id %q", id)
 	}
 	return serverCommandIfGenerationArgs(generation, command)
+}
+
+func sessionWindowCommandIfGenerationArgs(
+	id, generation, windowID, command string,
+) ([]string, error) {
+	if !isSessionID(id) {
+		return nil, fmt.Errorf("invalid tmux session id %q", id)
+	}
+	if !isWindowID(windowID) {
+		return nil, fmt.Errorf("invalid tmux window id %q", windowID)
+	}
+	if !isGeneration(generation) {
+		return nil, fmt.Errorf("invalid tmux server generation %q", generation)
+	}
+	generationCondition := "#{==:#{" + ServerGenerationOption + "}," + generation + "}"
+	windowCondition := "#{==:#{window_id}," + windowID + "}"
+	condition := "#{&&:" + generationCondition + "," + windowCondition + "}"
+	reject := tmuxCommand("display-message", "-p", generationMismatchMessage)
+	return []string{"if-shell", "-F", "-t", id, condition, command, reject}, nil
 }
 
 func serverCommandIfGenerationArgs(generation, command string) ([]string, error) {
@@ -703,6 +800,18 @@ func (s *Server) SwitchClient(clientTTY, target string) error {
 
 func isSessionID(target string) bool {
 	if len(target) < 2 || target[0] != '$' {
+		return false
+	}
+	for _, r := range target[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isWindowID(target string) bool {
+	if len(target) < 2 || target[0] != '@' {
 		return false
 	}
 	for _, r := range target[1:] {
