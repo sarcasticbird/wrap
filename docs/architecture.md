@@ -169,9 +169,10 @@ selected session. An expanded row asks tmux for that session's active pane
 working directory on the same poll cycle. The query is guarded by both the
 stable session ID and the session-server generation, so a restarted server or
 reused ID cannot apply a path to the wrong row. Paths inside the workspace are
-rendered relative to its root on a compact, unlabeled detail line. Failed first
-reads show `⚠ unavailable`; later failures retain and mark the last successful
-value stale with `?`.
+not treated specially: the compact, unlabeled detail line displays the full
+absolute path when it fits and truncates its left side with an ellipsis when
+necessary. Failed first reads show `⚠ unavailable`; later failures retain and
+mark the last successful value stale with `?`.
 
 Ordinary rows omit a neutral status marker because `›` and `⌄` already express
 collapsed and expanded state. Activity `!` and bell `🔔` markers appear only

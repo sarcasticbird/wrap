@@ -277,8 +277,8 @@ func TestRenderPathUsesCompactDetailLayout(t *testing.T) {
 		path pathState
 		want string
 	}{
-		{name: "path", path: pathState{value: "/workspace/api", valid: true}, want: "    ./api"},
-		{name: "stale", path: pathState{value: "/workspace/api", valid: true, stale: true}, want: "    ./api ?"},
+		{name: "path", path: pathState{value: "/workspace/api", valid: true}, want: "    /workspace/api"},
+		{name: "stale", path: pathState{value: "/workspace/api", valid: true, stale: true}, want: "    /workspace/api ?"},
 		{name: "unavailable", path: pathState{}, want: "    ⚠ unavailable"},
 	}
 	for _, tt := range tests {
@@ -307,7 +307,7 @@ func TestPWDResultAppliesOnlyToMatchingIdentity(t *testing.T) {
 		},
 	})
 	view := mod.View()
-	if !strings.Contains(view, "    ./api") || strings.Contains(view, "/wrong") {
+	if !strings.Contains(view, "    /workspace/api") || strings.Contains(view, "/wrong") {
 		t.Fatalf("identity-anchored PWD not applied correctly:\n%s", view)
 	}
 }
@@ -332,38 +332,38 @@ func TestPWDFirstFailureAndStaleRecovery(t *testing.T) {
 
 	delete(b.pathErrIdentity, "generation-a|$7")
 	mod, _ = mod.Update(mod.(Model).fetch()())
-	if view := mod.View(); !strings.Contains(view, "    ./api") || strings.Contains(view, "    ./api ?") {
+	if view := mod.View(); !strings.Contains(view, "    /workspace/api") ||
+		strings.Contains(view, "    /workspace/api ?") {
 		t.Fatalf("successful PWD did not clear failure:\n%s", view)
 	}
 
 	b.pathErrIdentity["generation-a|$7"] = errors.New("pane unavailable")
 	mod, _ = mod.Update(mod.(Model).fetch()())
-	if view := mod.View(); !strings.Contains(view, "    ./api ?") {
+	if view := mod.View(); !strings.Contains(view, "    /workspace/api ?") {
 		t.Fatalf("later failure did not retain and mark last path stale:\n%s", view)
 	}
 
 	delete(b.pathErrIdentity, "generation-a|$7")
 	b.pathByIdentity["generation-a|$7"] = "/workspace/api/subdir"
 	mod, _ = mod.Update(mod.(Model).fetch()())
-	if view := mod.View(); !strings.Contains(view, "    ./api/subdir") ||
-		strings.Contains(view, "./api/subdir ?") {
+	if view := mod.View(); !strings.Contains(view, "    /workspace/api/subdir") ||
+		strings.Contains(view, "/workspace/api/subdir ?") {
 		t.Fatalf("recovery did not replace and clear stale PWD:\n%s", view)
 	}
 }
 
-func TestFormatPWDRelativeAbsoluteAndControlSafe(t *testing.T) {
+func TestFormatPWDAbsoluteAndControlSafe(t *testing.T) {
 	tests := []struct {
-		name, root, path, want string
+		name, path, want string
 	}{
-		{"root", "/workspace", "/workspace", "."},
-		{"inside", "/workspace", "/workspace/main/frontend", "./main/frontend"},
-		{"outside", "/workspace", "/tmp/project", "/tmp/project"},
-		{"sibling prefix", "/work", "/workspace", "/workspace"},
-		{"control characters", "/workspace", "/workspace/line\nwith\ttab\x1b", `./line\nwith\ttab\x1b`},
+		{"root", "/workspace", "/workspace"},
+		{"inside", "/workspace/main/frontend", "/workspace/main/frontend"},
+		{"outside", "/tmp/project", "/tmp/project"},
+		{"control characters", "/workspace/line\nwith\ttab\x1b", `/workspace/line\nwith\ttab\x1b`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := formatPWD(tt.root, tt.path); got != tt.want {
+			if got := formatPWD(tt.path); got != tt.want {
 				t.Fatalf("formatPWD = %q, want %q", got, tt.want)
 			}
 		})
@@ -454,7 +454,7 @@ func TestViewportKeepsExpandedParentAndDetailTogether(t *testing.T) {
 	m.Cursor = 1
 
 	view := ansi.Strip(m.View())
-	if !strings.Contains(view, "vb/web") || !strings.Contains(view, "    ./web") {
+	if !strings.Contains(view, "vb/web") || !strings.Contains(view, "    /workspace/web") {
 		t.Fatalf("selected parent/detail pair was split:\n%s", view)
 	}
 	if strings.Contains(view, "vb/api") || strings.Contains(view, "vb/worker") {

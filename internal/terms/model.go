@@ -4,7 +4,6 @@
 package terms
 
 import (
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -796,7 +795,7 @@ func (m Model) renderPath(path pathState) string {
 		}
 		return pane.DimStyle.Render(line)
 	}
-	value := formatPWD(m.root, path.value)
+	value := formatPWD(path.value)
 	suffix := ""
 	if path.stale {
 		suffix = " ?"
@@ -812,17 +811,8 @@ func (m Model) renderPath(path pathState) string {
 	return pane.DimStyle.Render(line)
 }
 
-func formatPWD(root, path string) string {
-	display := path
-	if rel, err := filepath.Rel(root, path); err == nil &&
-		rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		if rel == "." {
-			display = "."
-		} else {
-			display = "." + string(filepath.Separator) + rel
-		}
-	}
-	return pane.SafeLabel(display)
+func formatPWD(path string) string {
+	return pane.SafeLabel(path)
 }
 
 func truncateLeft(value string, width int) string {
