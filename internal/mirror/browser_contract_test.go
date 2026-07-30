@@ -106,8 +106,12 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 	}
 	for _, want := range []string{
 		`let awaitingCloseAcknowledgement = false`,
-		`const closingStillMirrored = sessions.some(`,
-		`if (!closingStillMirrored) {`,
+		`function closeStateSelfTest()`,
+		`status followed by close acknowledgement`,
+		`revocation followed by close acknowledgement`,
+		`closeStateSelfTest();`,
+		`const closingStillMirrored = nextSessions.some(`,
+		`if (closingStillMirrored) {`,
 		`const isClosing = closing?.id === revoked.id`,
 		`if (isCurrent || isClosing) {`,
 		`(!closing && !awaitingCloseAcknowledgement)`,

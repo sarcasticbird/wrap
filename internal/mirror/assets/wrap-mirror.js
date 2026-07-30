@@ -219,6 +219,85 @@ let stopped = false;
 let controlSticky = false;
 let resizeTimer = 0;
 
+function canOpenSession() {
+  return !closing && !awaitingCloseAcknowledgement;
+}
+
+function resolveClosingFromStatus(nextSessions) {
+  if (!closing) {
+    return false;
+  }
+  const closingStillMirrored = nextSessions.some(
+    (session) => session.id === closing.id && session.generation === closing.generation,
+  );
+  if (closingStillMirrored) {
+    return false;
+  }
+  awaitingCloseAcknowledgement = true;
+  closing = null;
+  return true;
+}
+
+function resolveClosingFromRevocation(revoked) {
+  const isClosing = closing?.id === revoked.id &&
+    closing?.generation === revoked.generation;
+  if (isClosing) {
+    awaitingCloseAcknowledgement = true;
+    closing = null;
+  }
+  return isClosing;
+}
+
+function resolveClosingFromError() {
+  if (closing) {
+    awaitingCloseAcknowledgement = true;
+    closing = null;
+  }
+}
+
+function acceptCloseAcknowledgement() {
+  if (awaitingCloseAcknowledgement) {
+    awaitingCloseAcknowledgement = false;
+    return "late";
+  }
+  if (closing) {
+    closing = null;
+    return "current";
+  }
+  return "";
+}
+
+function resetCloseState() {
+  closing = null;
+  awaitingCloseAcknowledgement = false;
+}
+
+function closeStateSelfTest() {
+  const savedClosing = closing;
+  const savedAwaiting = awaitingCloseAcknowledgement;
+  const session = { id: "$self-test", generation: "self-test-generation" };
+  try {
+    closing = session;
+    awaitingCloseAcknowledgement = false;
+    if (!resolveClosingFromStatus([]) ||
+      acceptCloseAcknowledgement() !== "late" ||
+      !canOpenSession()) {
+      throw new Error("status followed by close acknowledgement failed");
+    }
+
+    closing = session;
+    awaitingCloseAcknowledgement = false;
+    if (!resolveClosingFromRevocation(session) ||
+      acceptCloseAcknowledgement() !== "late" ||
+      !canOpenSession()) {
+      throw new Error("revocation followed by close acknowledgement failed");
+    }
+  } finally {
+    closing = savedClosing;
+    awaitingCloseAcknowledgement = savedAwaiting;
+  }
+}
+
 function showOnly(view) {
   elements.message.classList.toggle("hidden", view !== "message");
   elements.list.classList.toggle("hidden", view !== "list");
@@ -315,7 +394,7 @@ function dimensions() {
 }
 
 function openSession(session) {
-  if (!connection?.authenticated || closing || awaitingCloseAcknowledgement) {
+  if (!connection?.authenticated || !canOpenSession()) {
     return;
   }
   terminal.reset();
@@ -410,12 +489,7 @@ async function receiveMessage(target, data) {
         const nextSessions = validateSessionList(parseJSON(frame.payload));
         if (closing) {
           sessions = nextSessions;
-          const closingStillMirrored = sessions.some(
-            (session) => session.id === closing.id && session.generation === closing.generation,
-          );
-          if (!closingStillMirrored) {
-            awaitingCloseAcknowledgement = true;
-            closing = null;
+          if (resolveClosingFromStatus(nextSessions)) {
             renderSessions(sessions);
           }
         } else if (current) {
@@ -438,11 +512,9 @@ async function receiveMessage(target, data) {
         (!closing && !awaitingCloseAcknowledgement)) {
         throw new Error("unexpected close acknowledgement");
       }
-      if (awaitingCloseAcknowledgement) {
-        awaitingCloseAcknowledgement = false;
+      if (acceptCloseAcknowledgement() === "late") {
         break;
       }
-      closing = null;
       renderSessions(sessions);
       break;
     case TAG.output:
@@ -461,17 +533,12 @@ async function receiveMessage(target, data) {
       const revoked = parseJSON(frame.payload);
       const isCurrent = current?.id === revoked.id &&
         current?.generation === revoked.generation;
-      const isClosing = closing?.id === revoked.id &&
-        closing?.generation === revoked.generation;
+      const isClosing = resolveClosingFromRevocation(revoked);
       sessions = sessions.filter(
         (session) => session.id !== revoked.id || session.generation !== revoked.generation,
       );
       if (isCurrent || isClosing) {
         current = null;
-        if (isClosing) {
-          awaitingCloseAcknowledgement = true;
-        }
-        closing = null;
         showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
         setTimeout(() => renderSessions(sessions), 700);
       }
@@ -500,11 +567,8 @@ async function receiveMessage(target, data) {
       if (problem.retry === false) {
         stopped = true;
       }
-      if (closing) {
-        awaitingCloseAcknowledgement = true;
-      }
+      resolveClosingFromError();
       current = null;
-      closing = null;
       showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
       if (problem.retry === false) {
         target.socket.close();
@@ -574,8 +638,7 @@ function connect() {
     }
     connection = null;
     current = null;
-    closing = null;
-    awaitingCloseAcknowledgement = false;
+    resetCloseState();
     if (event.code === 1008) {
       stopped = true;
       sessionStorage.removeItem(STORAGE_KEY);
@@ -675,7 +738,19 @@ function scheduleResize() {
 window.addEventListener("resize", scheduleResize);
 globalThis.visualViewport?.addEventListener("resize", scheduleResize);
 
-if (!secret) {
+let closeStateCompatible = true;
+try {
+  closeStateSelfTest();
+} catch {
+  closeStateCompatible = false;
+}
+
+if (!closeStateCompatible) {
+  showMessage(
+    "Incompatible browser",
+    "The browser terminal state self-test failed.",
+  );
+} else if (!secret) {
   if (incompatibleBrowser) {
     showMessage(
       "Incompatible browser",
