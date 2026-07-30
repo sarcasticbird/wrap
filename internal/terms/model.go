@@ -244,6 +244,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.Width, m.Height = msg.Width, msg.Height
+		m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
 		return m, nil
 	case tickMsg:
 		m.timerPending = false
@@ -671,8 +672,10 @@ func (m Model) startMirror(target row) (tea.Model, tea.Cmd) {
 func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "up", "k":
+		m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
 		m.mirrorScroll = max(0, m.mirrorScroll-1)
 	case "down", "j":
+		m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
 		m.mirrorScroll = min(m.mirrorMaxScroll(), m.mirrorScroll+1)
 	case "esc":
 		m.clearMirrorCancel()
@@ -1189,7 +1192,8 @@ func (m Model) mirrorContentLines() []string {
 					}
 				}
 			}
-			if qrFitsWidth {
+			qrFitsHeight := m.Height <= 0 || len(qrLines) <= max(0, m.Height-2)
+			if qrFitsWidth && qrFitsHeight {
 				lines = append(lines, "")
 				lines = append(lines, qrLines...)
 			}

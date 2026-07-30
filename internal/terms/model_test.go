@@ -332,6 +332,26 @@ func TestMirrorOverlayScrollsThroughCompletePairingURL(t *testing.T) {
 	if mod.(Model).mirrorScroll != 0 {
 		t.Fatal("up did not scroll the mirror overlay")
 	}
+	m.mirrorScroll = m.mirrorMaxScroll()
+	mod, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	if mod.(Model).mirrorScroll != 0 {
+		t.Fatal("resize did not clamp a stale mirror scroll offset")
+	}
+}
+
+func TestMirrorOverlayOmitsQRThatCannotFitScrollViewport(t *testing.T) {
+	m := Model{
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+			QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE",
+		},
+	}
+	m.Width = 30
+	m.Height = 4
+	if content := strings.Join(m.mirrorContentLines(), "\n"); strings.Contains(content, "QR-LINE") {
+		t.Fatalf("scroll content included an unusable partial QR:\n%s", content)
+	}
 }
 
 func writeMalformedSelection(t *testing.T, ws string) {
