@@ -2,15 +2,343 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/gitx"
 	"github.com/sarcasticbird/wrap/internal/state"
+	"github.com/sarcasticbird/wrap/internal/workspaces"
 )
+
+func TestRunArgsDispatchesTUICommand(t *testing.T) {
+	var tuiCalls int
+	var launches []string
+	err := runArgs([]string{"tui"}, commandFuncs{
+		tui: func() error {
+			tuiCalls++
+			return nil
+		},
+		launch: func(target string) error {
+			launches = append(launches, target)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tuiCalls != 1 || len(launches) != 0 {
+		t.Fatalf("tui calls = %d, launches = %v", tuiCalls, launches)
+	}
+}
+
+func TestRunArgsTreatsExplicitTUIDirectoryAsLaunchTarget(t *testing.T) {
+	var tuiCalls int
+	var launches []string
+	err := runArgs([]string{"./tui"}, commandFuncs{
+		tui: func() error {
+			tuiCalls++
+			return nil
+		},
+		launch: func(target string) error {
+			launches = append(launches, target)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tuiCalls != 0 || len(launches) != 1 || launches[0] != "./tui" {
+		t.Fatalf("tui calls = %d, launches = %v", tuiCalls, launches)
+	}
+}
+
+func TestRunArgsDispatchesSelectedWorkspaceIdentity(t *testing.T) {
+	var gotName, gotRoot string
+	err := runArgs([]string{"tui-attach", "alias", "/real/service"}, commandFuncs{
+		tuiAttach: func(name, root string) error {
+			gotName, gotRoot = name, root
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "alias" || gotRoot != "/real/service" {
+		t.Fatalf("selected identity = %q, %q", gotName, gotRoot)
+	}
+}
+
+func TestRunTUILoopReturnsToSelectorAfterDetach(t *testing.T) {
+	selections := []struct {
+		workspace workspaces.Workspace
+		ok        bool
+	}{
+		{workspace: workspaces.Workspace{Name: "alias", Root: "/real/alpha"}, ok: true},
+		{workspace: workspaces.Workspace{Name: "beta", Root: "/work/beta"}, ok: true},
+		{},
+	}
+	var selectorCalls int
+	var launched []workspaces.Workspace
+	err := runTUILoop(func(initialNote string) (workspaces.Workspace, bool, error) {
+		if initialNote != "" {
+			t.Errorf("selector note = %q, want empty", initialNote)
+		}
+		selection := selections[selectorCalls]
+		selectorCalls++
+		return selection.workspace, selection.ok, nil
+	}, func(selected workspaces.Workspace) (string, error) {
+		launched = append(launched, selected)
+		return "", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []workspaces.Workspace{
+		{Name: "alias", Root: "/real/alpha"},
+		{Name: "beta", Root: "/work/beta"},
+	}
+	if !reflect.DeepEqual(launched, want) {
+		t.Fatalf("launched = %v", launched)
+	}
+	if selectorCalls != 3 {
+		t.Fatalf("selector calls = %d, want 3", selectorCalls)
+	}
+}
+
+func TestRunTUILoopReturnsLaunchFailureAsNextInitialNote(t *testing.T) {
+	var selectorCalls int
+	var launchCalls int
+	err := runTUILoop(func(initialNote string) (workspaces.Workspace, bool, error) {
+		selectorCalls++
+		switch selectorCalls {
+		case 1:
+			if initialNote != "" {
+				t.Fatalf("first selector note = %q", initialNote)
+			}
+			return workspaces.Workspace{Name: "bad", Root: "/work/bad"}, true, nil
+		case 2:
+			if initialNote != "cannot launch" {
+				t.Fatalf("second selector note = %q", initialNote)
+			}
+			return workspaces.Workspace{Name: "good", Root: "/work/good"}, true, nil
+		case 3:
+			if initialNote != "" {
+				t.Fatalf("third selector note = %q, want cleared", initialNote)
+			}
+			return workspaces.Workspace{}, false, nil
+		default:
+			t.Fatalf("unexpected selector call %d", selectorCalls)
+			return workspaces.Workspace{}, false, nil
+		}
+	}, func(selected workspaces.Workspace) (string, error) {
+		launchCalls++
+		if selected.Name == "bad" {
+			return "", errors.New("cannot launch")
+		}
+		return "", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if launchCalls != 2 {
+		t.Fatalf("launch calls = %d, want 2", launchCalls)
+	}
+}
+
+func TestRunTUILoopReturnsSelectorFailure(t *testing.T) {
+	want := errors.New("selector failed")
+	err := runTUILoop(func(string) (workspaces.Workspace, bool, error) {
+		return workspaces.Workspace{}, false, want
+	}, func(workspaces.Workspace) (string, error) {
+		t.Fatal("launch called after selector failure")
+		return "", nil
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want selector failure", err)
+	}
+}
+
+func TestRunTUILoopShowsSuccessfulLaunchWarningsOnReturn(t *testing.T) {
+	var selectorCalls int
+	err := runTUILoop(func(initialNote string) (workspaces.Workspace, bool, error) {
+		selectorCalls++
+		switch selectorCalls {
+		case 1:
+			if initialNote != "" {
+				t.Fatalf("first selector note = %q", initialNote)
+			}
+			return workspaces.Workspace{Name: "alpha", Root: "/work/alpha"}, true, nil
+		case 2:
+			if initialNote != "repository discovery incomplete" {
+				t.Fatalf("second selector note = %q", initialNote)
+			}
+			return workspaces.Workspace{}, false, nil
+		default:
+			t.Fatalf("unexpected selector call %d", selectorCalls)
+			return workspaces.Workspace{}, false, nil
+		}
+	}, func(workspaces.Workspace) (string, error) {
+		return "repository discovery incomplete", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunSelectedWrapChildPassesNameAndCanonicalRoot(t *testing.T) {
+	dir := t.TempDir()
+	result := filepath.Join(dir, "result")
+	t.Setenv("WRAP_CHILD_RESULT", result)
+	script := filepath.Join(dir, "wrap-child")
+	if err := os.WriteFile(script, []byte(
+		"#!/bin/sh\nprintf '%s\\n%s\\n%s' \"$1\" \"$2\" \"$3\" > \"$WRAP_CHILD_RESULT\"\n",
+	), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	selected := workspaces.Workspace{Name: "alias", Root: "/real/service"}
+	note, err := runSelectedWrapChild(script, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note != "" {
+		t.Fatalf("child note = %q, want empty", note)
+	}
+	got, err := os.ReadFile(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "tui-attach\nalias\n/real/service" {
+		t.Fatalf("child arguments = %q", got)
+	}
+}
+
+func TestRunSelectedWrapChildReturnsDetailedChildFailure(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "wrap-child")
+	if err := os.WriteFile(script, []byte(
+		"#!/bin/sh\nprintf '%s\\n' 'wrap: workspace \"alias\" is no longer active' >&2\nexit 1\n",
+	), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := runSelectedWrapChild(script, workspaces.Workspace{
+		Name: "alias", Root: "/real/service",
+	})
+	if err == nil || !strings.Contains(err.Error(), `workspace "alias" is no longer active`) {
+		t.Fatalf("child failure = %v, want actionable stderr", err)
+	}
+}
+
+func TestRunSelectedWrapChildDoesNotForwardUnsafeStderr(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "wrap-child")
+	if err := os.WriteFile(script, []byte(
+		"#!/bin/sh\nprintf '\\033]2;unsafe\\007' >&2\nexit 1\n",
+	), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	readStderr, writeStderr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStderr := os.Stderr
+	os.Stderr = writeStderr
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		_ = readStderr.Close()
+		_ = writeStderr.Close()
+	})
+
+	_, _ = runSelectedWrapChild(script, workspaces.Workspace{
+		Name: "alias", Root: "/real/service",
+	})
+	if err := writeStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	forwarded, err := io.ReadAll(readStderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forwarded) != 0 {
+		t.Fatalf("unsafe child stderr was forwarded before UI escaping: %q", forwarded)
+	}
+}
+
+func TestRunSelectedWrapChildReturnsSuccessfulWarningsAsNote(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "wrap-child")
+	if err := os.WriteFile(script, []byte(
+		"#!/bin/sh\nprintf '%s\\n' 'wrap: repository discovery incomplete' >&2\n",
+	), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	note, err := runSelectedWrapChild(script, workspaces.Workspace{
+		Name: "alias", Root: "/real/service",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note != "wrap: repository discovery incomplete" {
+		t.Fatalf("child note = %q", note)
+	}
+}
+
+func TestResolveSelectedWorkspacePreservesAliasIdentity(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, _, err := resolveSelectedWorkspace(
+		workspaces.Workspace{Name: "alias", Root: root},
+		nil,
+		func(got string) ([]gitx.Discovered, []string, error) {
+			if got != root {
+				t.Fatalf("discover root = %q, want %q", got, root)
+			}
+			return nil, nil, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws.Name != "alias" || ws.Root != root {
+		t.Fatalf("resolved selected workspace = %+v", ws)
+	}
+}
+
+func TestResolveSelectedWorkspaceRejectsRetargetedCanonicalRoot(t *testing.T) {
+	parent := t.TempDir()
+	savedRoot := filepath.Join(parent, "service")
+	if err := os.Mkdir(savedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalRoot := filepath.Join(parent, "service-original")
+	if err := os.Rename(savedRoot, originalRoot); err != nil {
+		t.Fatal(err)
+	}
+	replacement := t.TempDir()
+	if err := os.Symlink(replacement, savedRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := resolveSelectedWorkspace(
+		workspaces.Workspace{Name: "service", Root: savedRoot},
+		nil,
+		func(string) ([]gitx.Discovered, []string, error) {
+			return nil, nil, nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "changed since selector refresh") {
+		t.Fatalf("retargeted root error = %v", err)
+	}
+}
 
 // The pane subcommands are internal — wrap supplies the ws argument when it
 // spawns them — so a missing one means a human ran the subcommand directly

@@ -263,3 +263,28 @@ func SessionOwnedBy(ws, name string) bool {
 	return name == ws || name == DiffSession(ws) ||
 		strings.HasPrefix(name, ws+"/") || IsTermSession(ws, name)
 }
+
+// SessionWorkspace returns the workspace that owns a wrap work-session name.
+// It is the reverse of SessionOwnedBy's exact delimiter grammar; wrap-home and
+// names with an invalid workspace component are not workspace sessions.
+func SessionWorkspace(name string) (string, bool) {
+	if name == HomeSession {
+		return "", false
+	}
+	cut := len(name)
+	for _, boundary := range []string{"/", termInfix} {
+		if i := strings.Index(name, boundary); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	if strings.HasSuffix(name, diffSuffix) {
+		if i := len(name) - len(diffSuffix); i < cut {
+			cut = i
+		}
+	}
+	owner := name[:cut]
+	if err := ValidateWorkspaceName(owner); err != nil || !SessionOwnedBy(owner, name) {
+		return "", false
+	}
+	return owner, true
+}

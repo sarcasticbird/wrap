@@ -159,6 +159,37 @@ wrap recreates the server, `wrap-home`, and required options on the next
 launch or new-terminal action. Processes from the killed server cannot be
 recovered by wrap; start replacement sessions after relaunch.
 
+## `wrap tui` reports workspace metadata or recovery errors
+
+The selector lists a workspace only when saved metadata supplies a trusted
+absolute root and live tmux state proves its chrome or work sessions still
+exist. A metadata warning means live tmux state exists but
+`$XDG_STATE_HOME/wrap/<workspace>/workspace.json` (or the fallback under
+`~/.local/state/wrap`) is missing, malformed, or invalid.
+
+Inspect the live state without changing it:
+
+```sh
+tmux -L wrap-ui ls
+tmux -L wrap ls
+```
+
+Do not invent or copy workspace metadata from another folder. If the saved
+root still exists, launch that exact folder normally so wrap can validate and
+publish current metadata:
+
+```sh
+wrap /absolute/path/to/workspace
+```
+
+Selecting a `recover` row performs that same normal launch automatically. If
+the root was moved or deleted, restore it at the recorded path or preserve and
+finish the surviving work through direct tmux access before stopping those
+sessions. A transient `rows stale` message retains the last good selector
+rows but disables Enter until a successful poll. If a workspace exits between
+display and selection, wrap returns to the selector with a launch error instead
+of starting a new workspace.
+
 ## Access sessions without wrap
 
 List and attach directly:

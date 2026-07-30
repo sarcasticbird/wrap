@@ -320,6 +320,60 @@ type Meta struct {
 	Root string `json:"root"` // folder workspaces only
 }
 
+// MetaRecord is one workspace directory discovered under wrap's state root.
+// Err is scoped to this workspace so one malformed record does not hide other
+// active workspaces from callers that reconcile state with live tmux state.
+type MetaRecord struct {
+	Name string
+	Meta Meta
+	Err  error
+}
+
+// ListMeta enumerates persisted workspace metadata without creating or
+// mutating state. Results are sorted by workspace directory name.
+func ListMeta() ([]MetaRecord, error) {
+	root, err := rootDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("state: list workspace metadata in %s: %w", root, err)
+	}
+	records := make([]MetaRecord, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		record := MetaRecord{Name: entry.Name()}
+		if err := config.ValidateWorkspaceName(record.Name); err != nil {
+			record.Err = fmt.Errorf("state: workspace metadata directory %q: %w", record.Name, err)
+			records = append(records, record)
+			continue
+		}
+		meta, ok, err := ReadMeta(record.Name)
+		switch {
+		case err != nil:
+			record.Err = err
+		case !ok:
+			record.Err = fmt.Errorf("state: workspace %q metadata is missing", record.Name)
+		case meta.Kind != "folder":
+			record.Err = fmt.Errorf("state: workspace %q metadata kind %q is not folder", record.Name, meta.Kind)
+		case meta.Root == "":
+			record.Err = fmt.Errorf("state: workspace %q metadata root is empty", record.Name)
+		case !filepath.IsAbs(meta.Root):
+			record.Err = fmt.Errorf("state: workspace %q metadata root %q is not absolute", record.Name, meta.Root)
+		default:
+			record.Meta = meta
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
 func metaPath(ws string) (string, error) {
 	d, err := dir(ws)
 	if err != nil {

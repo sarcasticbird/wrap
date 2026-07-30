@@ -70,12 +70,41 @@ The CLI is intentionally small:
 ```sh
 wrap
 wrap ~/Projects/my-projects
+wrap tui
 wrap version
 ```
 
 Select a repository in the tree, focus the terminals pane, and press `n` to
 bind or create its terminal. Press `q` when you are done watching; the
 sessions continue running. Launch the same folder again to reattach.
+
+### Switch between active workspaces
+
+Run `wrap tui` to list every active Wrap workspace:
+
+```text
+Active Wraps
+
+▸ apple-playlist  recover
+  /Users/alex/Projects/apple-playlist
+  coop  attached
+  /Users/alex/Projects/coop
+  wrap
+  /Users/alex/Projects/wrap
+
+enter attach · q quit
+```
+
+Use Up/Down or `j`/`k` to move, then press Enter to attach. Detaching from
+that workspace returns to a freshly updated selector; `q` exits. `attached`
+means a client is currently viewing the workspace. `recover` means work
+sessions survived without UI chrome; selecting it runs the normal launch
+validation and rebuilds the chrome automatically.
+
+The selector displays each workspace's full saved root and reconciles saved
+metadata with both live Wrap tmux servers, so stale metadata alone does not
+create a row. A directory literally named `tui` can still be opened as
+`wrap ./tui`.
 
 ## Layout and keys
 

@@ -121,6 +121,56 @@ func (m *Manager) GuardWorkspaceMeta(meta state.Meta) (func() error, error) {
 	return releaseLock, nil
 }
 
+// GuardActiveWorkspaceMeta locks an existing workspace for selector-driven
+// attach/recovery. Unlike GuardWorkspaceMeta, it never creates or takes over
+// identity: both persisted metadata and live tmux ownership must still match
+// what the selector displayed.
+func (m *Manager) GuardActiveWorkspaceMeta(meta state.Meta) (func() error, error) {
+	release, err := state.LockWorkspace(m.WS)
+	if err != nil {
+		return nil, fmt.Errorf("lock active workspace %q: %w", m.WS, err)
+	}
+	m.workspaceLockHeld = true
+	releaseLock := func() error {
+		m.workspaceLockHeld = false
+		return release()
+	}
+	fail := func(err error) (func() error, error) {
+		return nil, errors.Join(err, releaseLock())
+	}
+
+	existing, ok, err := state.ReadMeta(m.WS)
+	if err != nil {
+		return fail(err)
+	}
+	if !ok || existing != meta {
+		return fail(fmt.Errorf("workspace %q metadata changed since selector refresh", m.WS))
+	}
+	active, err := m.UI.HasSession(m.UISession())
+	if err != nil {
+		return fail(fmt.Errorf("check active UI for workspace %q: %w", m.WS, err))
+	}
+	if !active {
+		infos, err := m.Sess.Sessions()
+		if err != nil && !errors.Is(err, tmux.ErrNoServer) {
+			return fail(fmt.Errorf("check active sessions for workspace %q: %w", m.WS, err))
+		}
+		for _, info := range infos {
+			if config.SessionOwnedBy(m.WS, info.Name) {
+				active = true
+				break
+			}
+		}
+	}
+	if !active {
+		return fail(fmt.Errorf("workspace %q is no longer active; refresh the selector and retry", m.WS))
+	}
+	if err := state.ClearShutdown(m.WS); err != nil {
+		return fail(err)
+	}
+	return releaseLock, nil
+}
+
 func (m *Manager) beginWorkspaceMutation() (func() error, error) {
 	if m.workspaceLockHeld {
 		shuttingDown, err := state.IsShuttingDown(m.WS)

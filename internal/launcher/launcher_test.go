@@ -407,6 +407,14 @@ func guardWorkspaceMetaOnce(m *Manager, meta state.Meta) error {
 	return release()
 }
 
+func guardActiveWorkspaceMetaOnce(m *Manager, meta state.Meta) error {
+	release, err := m.GuardActiveWorkspaceMeta(meta)
+	if err != nil {
+		return err
+	}
+	return release()
+}
+
 func TestEnsureSessionServer(t *testing.T) {
 	f := &fakeRunner{hasSessions: map[string]bool{}}
 	m := newTestManagerWS(f, "vb")
@@ -2644,6 +2652,48 @@ func TestGuardWorkspaceMeta(t *testing.T) {
 	if got, _, _ := state.ReadMeta("api"); got != metaB {
 		t.Errorf("meta not taken over: %+v", got)
 	}
+}
+
+func TestGuardActiveWorkspaceMetaRequiresMatchingLiveWorkspace(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	meta := state.Meta{Kind: "folder", Root: "/real/service"}
+	if err := state.WriteMeta("alias", meta); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("matching UI session", func(t *testing.T) {
+		f := &fakeRunner{hasSessions: map[string]bool{"wrap-alias": true}}
+		if err := guardActiveWorkspaceMetaOnce(newTestManagerWS(f, "alias"), meta); err != nil {
+			t.Fatalf("live UI rejected: %v", err)
+		}
+	})
+
+	t.Run("matching work session", func(t *testing.T) {
+		f := &fakeRunner{
+			hasSessions: map[string]bool{},
+			listOut:     testSessionLine("alias/repo", "", "$1"),
+		}
+		if err := guardActiveWorkspaceMetaOnce(newTestManagerWS(f, "alias"), meta); err != nil {
+			t.Fatalf("live work session rejected: %v", err)
+		}
+	})
+
+	t.Run("inactive", func(t *testing.T) {
+		f := &fakeRunner{hasSessions: map[string]bool{}}
+		err := guardActiveWorkspaceMetaOnce(newTestManagerWS(f, "alias"), meta)
+		if err == nil || !strings.Contains(err.Error(), "no longer active") {
+			t.Fatalf("inactive workspace error = %v", err)
+		}
+	})
+
+	t.Run("metadata changed", func(t *testing.T) {
+		f := &fakeRunner{hasSessions: map[string]bool{"wrap-alias": true}}
+		changed := state.Meta{Kind: "folder", Root: "/other/service"}
+		err := guardActiveWorkspaceMetaOnce(newTestManagerWS(f, "alias"), changed)
+		if err == nil || !strings.Contains(err.Error(), "metadata changed") {
+			t.Fatalf("changed metadata error = %v", err)
+		}
+	})
 }
 
 func TestGuardWorkspaceMetaSerializesConcurrentBasenameOwners(t *testing.T) {
