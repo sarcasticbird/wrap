@@ -145,7 +145,7 @@ func TestClientDispatchDoesNotOverwriteImmediateViewerClose(t *testing.T) {
 	}
 }
 
-func TestClientDispatchCloseQueuesStatusAcknowledgement(t *testing.T) {
+func TestClientDispatchCloseAcknowledgementFollowsQueuedStatus(t *testing.T) {
 	sessions := []Session{{
 		ID: "$7", Generation: "generation-a", Name: "vb/api",
 	}}
@@ -154,6 +154,9 @@ func TestClientDispatchCloseQueuesStatusAcknowledgement(t *testing.T) {
 		queue:   newOutboundQueue(MaxClientQueueBytes),
 	}
 	client.viewerOpen.Store(true)
+	if err := client.SendControl(t.Context(), TagStatus, SessionList{Sessions: sessions}); err != nil {
+		t.Fatal(err)
+	}
 	if err := client.dispatch(t.Context(), TagClose, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -161,13 +164,13 @@ func TestClientDispatchCloseQueuesStatusAcknowledgement(t *testing.T) {
 	defer cancel()
 	frame, ok := client.queue.pop(ctx)
 	if !ok || frame.tag != TagStatus {
+		t.Fatalf("status before close acknowledgement = %+v, %v", frame, ok)
+	}
+	frame, ok = client.queue.pop(ctx)
+	if !ok || frame.tag != TagClose {
 		t.Fatalf("close acknowledgement = %+v, %v", frame, ok)
 	}
-	var list SessionList
-	if err := DecodeControl(frame.tag, frame.payload, &list); err != nil {
-		t.Fatal(err)
-	}
-	if len(list.Sessions) != 1 || list.Sessions[0].ID != "$7" {
-		t.Fatalf("close acknowledgement sessions = %+v", list.Sessions)
+	if len(frame.payload) != 0 {
+		t.Fatalf("close acknowledgement payload = %x", frame.payload)
 	}
 }

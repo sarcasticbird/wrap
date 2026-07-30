@@ -332,9 +332,7 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 			return err
 		}
 		c.viewerOpen.Store(false)
-		return c.SendControl(ctx, TagStatus, SessionList{
-			Sessions: c.handler.InitialSessions(),
-		})
+		return c.send(ctx, TagClose, nil)
 	case TagInput:
 		if !c.viewerOpen.Load() {
 			return errors.New("no terminal is open")

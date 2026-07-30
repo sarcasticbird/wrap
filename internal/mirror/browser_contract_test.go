@@ -94,6 +94,7 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 		`let closing = null`,
 		`if (closing)`,
 		`closing = null`,
+		`case TAG.close:`,
 		`function sendInput(data)`,
 		`payload.subarray(offset, offset + MAX_FRAME_PAYLOAD)`,
 		`const isCurrent = current?.id === revoked.id`,
@@ -102,5 +103,9 @@ func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *t
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client missing close/input guard %q", want)
 		}
+	}
+	if !strings.Contains(source, `if (closing) {
+          sessions = nextSessions;`) {
+		t.Error("browser status handling can clear a pending close acknowledgement")
 	}
 }

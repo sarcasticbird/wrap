@@ -279,8 +279,13 @@ func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
 	m.Width = 30
 	m.Height = 8
 	view := ansi.Strip(m.mirrorView("Terminals"))
-	if !strings.Contains(view, pairingURL) {
+	if !strings.Contains(strings.ReplaceAll(view, "\n", ""), pairingURL) {
 		t.Fatalf("narrow mirror overlay omitted or truncated pairing URL:\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if runewidth.StringWidth(line) > m.Width {
+			t.Fatalf("narrow mirror overlay emitted %d-cell line:\n%s", runewidth.StringWidth(line), view)
+		}
 	}
 	if strings.Contains(view, "QR-LINE") {
 		t.Fatalf("narrow mirror overlay rendered a partial QR:\n%s", view)

@@ -191,7 +191,10 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	}
 	writeEncryptedRaw(t, connection, sealer, TagClose, nil)
 	receiveWithin(t, viewer.done, "viewer close")
-	assertSessionFrame(t, connection, opener, TagStatus, "vb/api", "vb/web")
+	tag, payload = readEncryptedFrame(t, connection, opener)
+	if tag != TagClose || len(payload) != 0 {
+		t.Fatalf("close acknowledgement = 0x%02x %x", tag, payload)
+	}
 
 	writeEncryptedControl(t, connection, sealer, TagOpen, OpenRequest{
 		ID: secondSession.ID, Generation: secondSession.Generation, Columns: 90, Rows: 30,

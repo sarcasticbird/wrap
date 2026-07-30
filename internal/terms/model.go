@@ -1119,7 +1119,6 @@ func (m Model) footer() string {
 
 func (m Model) mirrorView(heading string) string {
 	lines := []string{heading}
-	pairingURLLine := -1
 	maxBody := 0
 	if m.Height > 0 {
 		maxBody = max(1, m.Height-1)
@@ -1128,15 +1127,14 @@ func (m Model) mirrorView(heading string) string {
 	case m.mirrorStarting || m.mirrorSnapshot.State == mirrorapi.StateStarting:
 		lines = append(lines, "", "Starting encrypted mirror…", "", m.mirrorTargetName)
 	case m.mirrorSnapshot.State == mirrorapi.StateReady:
+		lines = append(lines, "")
+		lines = append(lines, mirrorWrapLine(m.mirrorSnapshot.PairingURL, m.Width)...)
 		lines = append(lines,
-			"",
-			m.mirrorSnapshot.PairingURL,
 			"",
 			"Anyone with this URL can control mirrored terminals.",
 			"",
 			m.mirrorTargetName+" · "+strconv.Itoa(len(m.mirrorSnapshot.Sessions))+" mirrored",
 		)
-		pairingURLLine = 2
 		if m.mirrorSnapshot.QR != "" {
 			qrLines := strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")
 			qrFitsWidth := m.Width <= 0
@@ -1176,7 +1174,7 @@ func (m Model) mirrorView(heading string) string {
 		lines = lines[:maxBody]
 	}
 	for i := range lines {
-		if m.Width > 0 && i != pairingURLLine {
+		if m.Width > 0 {
 			lines[i] = runewidth.Truncate(lines[i], m.Width, "")
 		}
 	}
@@ -1190,6 +1188,29 @@ func (m Model) mirrorView(heading string) string {
 	}
 	lines = append(lines, pane.DimStyle.Render(footer))
 	return strings.Join(lines, "\n")
+}
+
+func mirrorWrapLine(line string, width int) []string {
+	if width <= 0 || runewidth.StringWidth(line) <= width {
+		return []string{line}
+	}
+	var lines []string
+	var chunk []rune
+	chunkWidth := 0
+	for _, r := range []rune(line) {
+		runeWidth := runewidth.RuneWidth(r)
+		if chunkWidth+runeWidth > width && len(chunk) != 0 {
+			lines = append(lines, string(chunk))
+			chunk = nil
+			chunkWidth = 0
+		}
+		chunk = append(chunk, r)
+		chunkWidth += runeWidth
+	}
+	if len(chunk) != 0 {
+		lines = append(lines, string(chunk))
+	}
+	return lines
 }
 
 func mirrorRenderedRows(lines []string, width int) int {

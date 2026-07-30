@@ -408,8 +408,7 @@ async function receiveMessage(target, data) {
       {
         const nextSessions = validateSessionList(parseJSON(frame.payload));
         if (closing) {
-          closing = null;
-          renderSessions(nextSessions);
+          sessions = nextSessions;
         } else if (current) {
           sessions = nextSessions;
           const stillMirrored = sessions.some(
@@ -424,6 +423,13 @@ async function receiveMessage(target, data) {
           renderSessions(nextSessions);
         }
       }
+      break;
+    case TAG.close:
+      if (!target.authenticated || !closing || frame.payload.length !== 0) {
+        throw new Error("unexpected close acknowledgement");
+      }
+      closing = null;
+      renderSessions(sessions);
       break;
     case TAG.output:
       if (!target.authenticated) {
@@ -441,8 +447,6 @@ async function receiveMessage(target, data) {
       const revoked = parseJSON(frame.payload);
       const isCurrent = current?.id === revoked.id &&
         current?.generation === revoked.generation;
-      const isClosing = closing?.id === revoked.id &&
-        closing?.generation === revoked.generation;
       sessions = sessions.filter(
         (session) => session.id !== revoked.id || session.generation !== revoked.generation,
       );
@@ -450,9 +454,6 @@ async function receiveMessage(target, data) {
         current = null;
         showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
         setTimeout(() => renderSessions(sessions), 700);
-      } else if (isClosing) {
-        closing = null;
-        renderSessions(sessions);
       }
       break;
     }
