@@ -1,7 +1,7 @@
 # wrap
 
 Supervise persistent coding-agent terminals from one tmux workspace and
-mirror any of them into an encrypted browser session.
+mirror any of them into an encrypted browser session visible from anywhere.
 
 > **Status:** `v0.1.0-beta.4` is a pre-1.0 release. CLI and configuration
 > behavior may change before 1.0.
@@ -9,11 +9,13 @@ mirror any of them into an encrypted browser session.
 wrap opens a folder, discovers its Git repositories and worktrees, and gives
 you three panes: a repository tree, a persistent terminal, and a monitor of
 every terminal in the workspace. When a program rings the terminal bell, its
-session is marked with a 🔔 without moving the list. Press `m` to pair a
-selected terminal with a phone or another browser through an ephemeral
+session is marked with a 🔔 without moving the list. 
+
+Press `m` to pair a selected terminal with a phone or another browser through an ephemeral
 Cloudflare tunnel with application-layer encryption.
 
-<img width="1638" height="1002" alt="Screenshot 2026-07-29 at 8 47 47 AM" src="https://github.com/user-attachments/assets/00f561a5-f4f8-4d4a-b1b8-6ed8c2fa7789" />
+<img width="1635" height="1079" alt="ghostty-desktop-wrap" src="https://github.com/user-attachments/assets/14d8489c-cb52-4437-8a02-742a341cd2d8" />
+<img width="603" height="1136" alt="mobile-mirror" src="https://github.com/user-attachments/assets/dcb87251-bd17-45cc-89c6-c5d815c42e97" />
 
 ## Why wrap
 
