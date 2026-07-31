@@ -9,10 +9,10 @@ mirror any of them into an encrypted browser session visible from anywhere.
 wrap opens a folder, discovers its Git repositories and worktrees, and gives
 you three panes: a repository tree, a persistent terminal, and a monitor of
 every terminal in the workspace. When a program rings the terminal bell, its
-session is marked with a 🔔 without moving the list. 
+session is marked with a 🔔 without moving the list.
 
-Press `m` to pair a selected terminal with a phone or another browser through an ephemeral
-Cloudflare tunnel with application-layer encryption.
+Press `m` to pair a selected terminal with a phone or another browser through
+an ephemeral Cloudflare tunnel with application-layer encryption.
 
 <img width="1635" height="1079" alt="ghostty-desktop-wrap" src="https://github.com/user-attachments/assets/14d8489c-cb52-4437-8a02-742a341cd2d8" />
 <img width="603" height="1136" alt="mobile-mirror" src="https://github.com/user-attachments/assets/dcb87251-bd17-45cc-89c6-c5d815c42e97" />
@@ -38,11 +38,12 @@ integration: any program that rings the terminal bell can request attention.
 - tmux 3.2 or newer
 - Git
 - `less` (for file diffs)
+- [`cloudflared`](https://developers.cloudflare.com/tunnel/downloads/) 2020.5.1
+  or newer (required for encrypted browser mirroring)
 - macOS or Linux
 
-Go is needed only when installing from source.
-Encrypted browser mirroring additionally requires `cloudflared` 2020.5.1 or
-newer on `PATH`; ordinary local use does not.
+Go is needed only when installing from source. Ordinary local use does not
+require `cloudflared`.
 
 ## Install
 
@@ -55,6 +56,17 @@ wrap version
 
 `go install` writes to `$(go env GOPATH)/bin`; make sure that directory is on
 your `PATH`.
+
+To use encrypted browser mirroring, install `cloudflared` and make sure it is
+also on `PATH`. On macOS:
+
+```sh
+brew install cloudflared
+cloudflared --version
+```
+
+For Linux packages and binaries, use Cloudflare's
+[official downloads](https://developers.cloudflare.com/tunnel/downloads/).
 
 Prebuilt archives for macOS and Linux are attached to the
 [`v0.1.0-beta.4` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.4).
