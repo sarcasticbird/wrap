@@ -11,6 +11,33 @@ import (
 	"github.com/sarcasticbird/wrap/internal/config"
 )
 
+func TestMirrorLogPathUsesXDGStateHome(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", root)
+	got, err := MirrorLogPath("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "wrap", "api", "mirror.log")
+	if got != want {
+		t.Fatalf("mirror log path = %q, want %q", got, want)
+	}
+}
+
+func TestMirrorLogPathFallsBackToUserStateDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", home)
+	got, err := MirrorLogPath("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".local", "state", "wrap", "api", "mirror.log")
+	if got != want {
+		t.Fatalf("mirror log path = %q, want %q", got, want)
+	}
+}
+
 func TestLockWorkspaceSerializesSameName(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	releaseFirst, err := LockWorkspace("api")

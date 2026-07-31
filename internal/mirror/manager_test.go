@@ -1,7 +1,9 @@
 package mirror
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -14,6 +16,25 @@ type fakeTunnelResource struct {
 	url    string
 	done   chan error
 	closed atomic.Int32
+}
+
+type cancelOrderTunnelResource struct {
+	ctx         context.Context
+	done        chan error
+	diagnostics *recordingDiagnosticSink
+}
+
+func (t *cancelOrderTunnelResource) URL() string        { return "https://quiet-river.trycloudflare.com" }
+func (t *cancelOrderTunnelResource) Done() <-chan error { return t.done }
+func (t *cancelOrderTunnelResource) Close() error {
+	select {
+	case <-t.ctx.Done():
+		_ = t.diagnostics.Write(DiagnosticRecord{
+			Level: "error", Component: "tunnel", Event: "process_exit", Code: "unexpected_exit",
+		})
+	default:
+	}
+	return nil
 }
 
 func (t *fakeTunnelResource) URL() string        { return t.url }
@@ -68,6 +89,23 @@ func (f viewerFactoryFunc) Open(
 type fakeViewer struct {
 	done chan error
 }
+
+type diagnosticViewer struct {
+	done chan error
+	once sync.Once
+}
+
+func newDiagnosticViewer() *diagnosticViewer {
+	return &diagnosticViewer{done: make(chan error)}
+}
+
+func (v *diagnosticViewer) Write([]byte) error          { return nil }
+func (v *diagnosticViewer) Resize(uint16, uint16) error { return nil }
+func (v *diagnosticViewer) Close() error {
+	v.once.Do(func() { close(v.done) })
+	return nil
+}
+func (v *diagnosticViewer) Done() <-chan error { return v.done }
 
 func (v *fakeViewer) Write([]byte) error          { return nil }
 func (v *fakeViewer) Resize(uint16, uint16) error { return nil }
@@ -125,6 +163,84 @@ func TestManagerSuccessfulStartOwnsRuntimeContext(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("shutdown did not cancel the mirror runtime context")
 		}
+	}
+}
+
+func TestManagerDefaultServerRecordsStartedOnce(t *testing.T) {
+	sink := &recordingDiagnosticSink{}
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace:   "vb",
+		Diagnostics: sink,
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Mirror(t.Context(), HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	started := 0
+	for _, record := range sink.snapshot() {
+		if record.Component == "server" && record.Event == "started" {
+			started++
+		}
+	}
+	if started != 1 {
+		t.Fatalf("server started diagnostics = %d, want 1: %+v", started, sink.snapshot())
+	}
+}
+
+func TestManagerCleanupClosesTunnelBeforeCancelingRuntime(t *testing.T) {
+	for _, operation := range []string{"shutdown", "revoke"} {
+		t.Run(operation, func(t *testing.T) {
+			sink := &recordingDiagnosticSink{}
+			server := &fakeServerResource{localURL: "http://127.0.0.1:43123"}
+			var tunnel *cancelOrderTunnelResource
+			manager, err := NewManager(ManagerOptions{
+				Workspace:   "vb",
+				Diagnostics: sink,
+				StartServer: func(context.Context, ServerOptions) (ServerResource, error) {
+					return server, nil
+				},
+				StartTunnel: func(ctx context.Context, _ string) (TunnelResource, error) {
+					tunnel = &cancelOrderTunnelResource{
+						ctx: ctx, done: make(chan error), diagnostics: sink,
+					}
+					return tunnel, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := HostSession{
+				ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+			}
+			if err := manager.Mirror(t.Context(), session); err != nil {
+				t.Fatal(err)
+			}
+			if operation == "shutdown" {
+				err = manager.Shutdown(t.Context())
+			} else {
+				err = manager.Revoke(t.Context(), Identity{ID: session.ID, Generation: session.Generation})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if containsDiagnostic(sink.snapshot(), "tunnel", "process_exit", "unexpected_exit") {
+				t.Fatalf("intentional %s recorded unexpected tunnel exit: %+v", operation, sink.snapshot())
+			}
+		})
 	}
 }
 
@@ -370,6 +486,244 @@ func TestManagerUnexpectedTunnelExitFailsClosed(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("manager did not fail after tunnel exit: %+v", manager.Snapshot())
+}
+
+func TestManagerDiagnosticFailureWarnsOnceWithoutStoppingMirror(t *testing.T) {
+	server := &fakeServerResource{localURL: "http://127.0.0.1:43123"}
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	var writes atomic.Int32
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		Diagnostics: DiagnosticSinkFunc(func(DiagnosticRecord) error {
+			writes.Add(1)
+			return errors.New("SENTINEL diagnostics filesystem failure")
+		}),
+		StartServer: func(context.Context, ServerOptions) (ServerResource, error) {
+			return server, nil
+		},
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+	if err := manager.Mirror(t.Context(), HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.State != StateReady || snapshot.DiagnosticsWarning != "diagnostics unavailable" {
+		t.Fatalf("mirror snapshot after diagnostic failure = %+v", snapshot)
+	}
+	if strings.Contains(snapshot.DiagnosticsWarning, "SENTINEL") {
+		t.Fatal("diagnostic warning exposed the raw sink error")
+	}
+	if got := writes.Load(); got != 1 {
+		t.Fatalf("diagnostic writes after failure = %d, want 1", got)
+	}
+	manager.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "server", Event: "stopped"})
+	if got := writes.Load(); got != 1 {
+		t.Fatalf("disabled diagnostic sink retried %d writes", got)
+	}
+}
+
+func TestManagerWiresDefaultViewerDiagnostics(t *testing.T) {
+	sink := &recordingDiagnosticSink{}
+	manager, err := NewManager(ManagerOptions{
+		Workspace:   "vb",
+		Diagnostics: sink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory, ok := manager.viewers.(*PTYViewerFactory)
+	if !ok {
+		t.Fatalf("default viewers = %T, want *PTYViewerFactory", manager.viewers)
+	}
+	if factory.Record == nil {
+		t.Fatal("default viewer factory has no diagnostic recorder")
+	}
+	factory.Record(DiagnosticRecord{
+		Level:     "info",
+		Component: "viewer",
+		Event:     "geometry_preparing",
+	})
+	if !containsDiagnostic(sink.snapshot(), "viewer", "geometry_preparing", "") {
+		t.Fatal("default viewer diagnostic did not reach manager sink")
+	}
+}
+
+func TestManagerRecordsSafeMirrorLifecycle(t *testing.T) {
+	sink := &recordingDiagnosticSink{}
+	server := &fakeServerResource{localURL: "http://127.0.0.1:43123"}
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	viewer := newDiagnosticViewer()
+	manager, err := NewManager(ManagerOptions{
+		Workspace:   "vb",
+		Diagnostics: sink,
+		Viewers: viewerFactoryFunc(func(
+			context.Context, Identity, uint16, uint16, func([]byte) error,
+		) (Viewer, error) {
+			return viewer, nil
+		}),
+		StartServer: func(context.Context, ServerOptions) (ServerResource, error) {
+			return server, nil
+		},
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef",
+		Name: "SENTINEL_PRIVATE_SESSION_NAME",
+	}
+	if err := manager.Mirror(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Rotate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive status")
+	}
+	if err := manager.Open(t.Context(), client, OpenRequest{
+		ID: session.ID, Generation: session.Generation, Columns: 80, Rows: 24,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(client); err != nil {
+		t.Fatal(err)
+	}
+	manager.Disconnected(client)
+	if err := manager.Revoke(t.Context(), Identity{ID: session.ID, Generation: session.Generation}); err != nil {
+		t.Fatal(err)
+	}
+
+	records := sink.snapshot()
+	for _, want := range []struct{ component, event string }{
+		{"server", "starting"},
+		{"tunnel", "starting"},
+		{"credential", "rotated"},
+		{"viewer", "preparing"},
+		{"viewer", "opened"},
+		{"viewer", "closed"},
+		{"credential", "revoked"},
+	} {
+		if !containsDiagnostic(records, want.component, want.event, "") {
+			t.Fatalf("missing manager diagnostic %s/%s in %+v", want.component, want.event, records)
+		}
+	}
+	encoded, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("SENTINEL")) {
+		t.Fatalf("manager diagnostics leaked session identity: %s", encoded)
+	}
+}
+
+func TestManagerDiagnosticFailureCategoryNeverLogsRawError(t *testing.T) {
+	sink := &recordingDiagnosticSink{}
+	server := &fakeServerResource{localURL: "http://127.0.0.1:43123"}
+	manager, err := NewManager(ManagerOptions{
+		Workspace:   "vb",
+		Diagnostics: sink,
+		StartServer: func(context.Context, ServerOptions) (ServerResource, error) {
+			return server, nil
+		},
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return nil, errors.New("SENTINEL raw tunnel error with credential and terminal output")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = manager.Mirror(t.Context(), HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "private-session",
+	})
+	if err == nil {
+		t.Fatal("mirror unexpectedly started")
+	}
+	records := sink.snapshot()
+	if !containsDiagnostic(records, "tunnel", "start_failed", "tunnel_unavailable") {
+		t.Fatalf("safe tunnel failure category missing: %+v", records)
+	}
+	encoded, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range [][]byte{[]byte("SENTINEL"), []byte("credential"), []byte("terminal output"), []byte("private-session")} {
+		if bytes.Contains(encoded, forbidden) {
+			t.Fatalf("diagnostic records leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestManagerRecordsSafeViewerFailureCategory(t *testing.T) {
+	sink := &recordingDiagnosticSink{}
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace:   "vb",
+		Diagnostics: sink,
+		Viewers: viewerFactoryFunc(func(
+			context.Context, Identity, uint16, uint16, func([]byte) error,
+		) (Viewer, error) {
+			return nil, errors.New("SENTINEL raw viewer error and terminal output")
+		}),
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+	session := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "private-session",
+	}
+	if err := manager.Mirror(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive status")
+	}
+	openErr := manager.Open(t.Context(), client, OpenRequest{
+		ID: session.ID, Generation: session.Generation, Columns: 80, Rows: 24,
+	})
+	manager.Disconnected(client)
+	if openErr == nil {
+		t.Fatal("viewer unexpectedly opened")
+	}
+	records := sink.snapshot()
+	if !containsDiagnostic(records, "viewer", "open_failed", "terminal_unavailable") {
+		t.Fatalf("safe viewer failure category missing: %+v", records)
+	}
+	encoded, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("SENTINEL")) || bytes.Contains(encoded, []byte("terminal output")) {
+		t.Fatalf("viewer failure diagnostic leaked raw error: %s", encoded)
+	}
 }
 
 func TestManagerCancelledStartCleansUpWithoutFailedState(t *testing.T) {

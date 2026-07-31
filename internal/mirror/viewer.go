@@ -41,6 +41,7 @@ type PTYViewerFactory struct {
 	SessionSocket string
 	TmuxPath      string
 	Environment   []string
+	Record        func(DiagnosticRecord)
 
 	pinMu sync.Mutex
 	pins  map[viewerWindowKey]*viewerWindowPin

@@ -32,12 +32,13 @@ type HostSession struct {
 }
 
 type Snapshot struct {
-	State      State
-	PublicURL  string
-	PairingURL string
-	QR         string
-	Sessions   []Session
-	Err        string
+	State              State
+	PublicURL          string
+	PairingURL         string
+	QR                 string
+	Sessions           []Session
+	Err                string
+	DiagnosticsWarning string
 }
 
 type ViewedEvent struct {
@@ -76,6 +77,7 @@ type ManagerOptions struct {
 	StartServer   func(context.Context, ServerOptions) (ServerResource, error)
 	StartTunnel   func(context.Context, string) (TunnelResource, error)
 	Random        io.Reader
+	Diagnostics   DiagnosticSink
 }
 
 type Manager struct {
@@ -90,23 +92,27 @@ type Manager struct {
 	random       io.Reader
 	events       chan Event
 	eventMu      sync.Mutex
+	diagnosticMu sync.Mutex
+	diagnostics  DiagnosticSink
 
-	state         State
-	publicURL     string
-	pairingURL    string
-	qr            string
-	errText       string
-	secret        Secret
-	generation    string
-	sessions      map[Identity]HostSession
-	server        ServerResource
-	tunnel        TunnelResource
-	runtimeCancel context.CancelFunc
-	startup       *managerStartup
-	clients       map[*Client]struct{}
-	active        map[*Client]activeViewer
-	shutdown      bool
-	shutdownAsked bool
+	state              State
+	publicURL          string
+	pairingURL         string
+	qr                 string
+	errText            string
+	secret             Secret
+	generation         string
+	sessions           map[Identity]HostSession
+	server             ServerResource
+	tunnel             TunnelResource
+	runtimeCancel      context.CancelFunc
+	startup            *managerStartup
+	clients            map[*Client]struct{}
+	active             map[*Client]activeViewer
+	shutdown           bool
+	shutdownAsked      bool
+	diagnosticsFailed  bool
+	diagnosticsWarning string
 }
 
 type activeViewer struct {
@@ -126,31 +132,39 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 	if options.Random == nil {
 		options.Random = rand.Reader
 	}
-	if options.Viewers == nil {
-		options.Viewers = &PTYViewerFactory{SessionSocket: options.SessionSocket}
-	}
-	if options.StartServer == nil {
-		options.StartServer = func(ctx context.Context, options ServerOptions) (ServerResource, error) {
-			return StartLocalServer(ctx, options)
-		}
-	}
-	if options.StartTunnel == nil {
-		options.StartTunnel = func(ctx context.Context, localURL string) (TunnelResource, error) {
-			return StartTunnel(ctx, localURL, TunnelOptions{})
-		}
-	}
-	return &Manager{
+	manager := &Manager{
 		workspace:    options.Workspace,
 		acknowledger: options.Acknowledger,
 		viewers:      options.Viewers,
-		startServer:  options.StartServer,
-		startTunnel:  options.StartTunnel,
 		random:       options.Random,
+		diagnostics:  options.Diagnostics,
 		events:       make(chan Event, 64),
 		sessions:     make(map[Identity]HostSession),
 		clients:      make(map[*Client]struct{}),
 		active:       make(map[*Client]activeViewer),
-	}, nil
+	}
+	if manager.viewers == nil {
+		manager.viewers = &PTYViewerFactory{
+			SessionSocket: options.SessionSocket,
+			Record:        manager.recordDiagnostic,
+		}
+	}
+	if options.StartServer != nil {
+		manager.startServer = options.StartServer
+	} else {
+		manager.startServer = func(ctx context.Context, options ServerOptions) (ServerResource, error) {
+			options.Record = manager.recordDiagnostic
+			return StartLocalServer(ctx, options)
+		}
+	}
+	if options.StartTunnel != nil {
+		manager.startTunnel = options.StartTunnel
+	} else {
+		manager.startTunnel = func(ctx context.Context, localURL string) (TunnelResource, error) {
+			return StartTunnel(ctx, localURL, TunnelOptions{Record: manager.recordDiagnostic})
+		}
+	}
+	return manager, nil
 }
 
 func (m *Manager) Events() <-chan Event {
@@ -228,16 +242,20 @@ func (m *Manager) Mirror(ctx context.Context, session HostSession) error {
 	if err != nil {
 		return m.failStart(err)
 	}
+	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "server", Event: "starting"})
 	server, err := m.startServer(runtimeCtx, ServerOptions{
 		Secret:  secret,
 		Handler: m,
 		Random:  m.random,
 	})
 	if err != nil {
+		m.recordDiagnostic(DiagnosticRecord{Level: "error", Component: "server", Event: "start_failed", Code: "server_unavailable"})
 		return m.failStart(err)
 	}
+	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "tunnel", Event: "starting"})
 	tunnel, err := m.startTunnel(runtimeCtx, server.LocalURL())
 	if err != nil {
+		m.recordDiagnostic(DiagnosticRecord{Level: "error", Component: "tunnel", Event: "start_failed", Code: "tunnel_unavailable"})
 		_ = closePartialServer(server)
 		return m.failStart(err)
 	}
@@ -300,6 +318,7 @@ func (m *Manager) Mirror(ctx context.Context, session HostSession) error {
 }
 
 func (m *Manager) Revoke(ctx context.Context, identity Identity) error {
+	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "credential", Event: "revoked"})
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
 	m.mu.Lock()
@@ -441,6 +460,7 @@ func (m *Manager) Rotate(ctx context.Context) error {
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 	m.publishSnapshot(snapshot)
+	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "credential", Event: "rotated"})
 	return err
 }
 
@@ -494,10 +514,12 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 	if !ok {
 		return errors.New("mirrored terminal ended")
 	}
+	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "preparing"})
 	viewer, err := m.viewers.Open(ctx, identity, request.Columns, request.Rows, func(output []byte) error {
 		return client.SendOutput(context.Background(), output)
 	})
 	if err != nil {
+		m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "open_failed", Code: "terminal_unavailable"})
 		return err
 	}
 	if m.acknowledger != nil {
@@ -528,6 +550,7 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 		ID: identity.ID, Generation: identity.Generation, Activity: session.Activity,
 	}}
 	if m.publishViewed(event) {
+		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "opened"})
 		go m.watchViewer(client, identity, viewer)
 		return nil
 	}
@@ -546,7 +569,9 @@ func (m *Manager) Close(client *Client) error {
 	}
 	m.mu.Unlock()
 	if ok {
-		return active.viewer.Close()
+		err := active.viewer.Close()
+		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "closed"})
+		return err
 	}
 	return nil
 }
@@ -581,6 +606,7 @@ func (m *Manager) Disconnected(client *Client) {
 	m.mu.Unlock()
 	if ok {
 		_ = active.viewer.Close()
+		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "closed"})
 	}
 }
 
@@ -620,6 +646,7 @@ func (m *Manager) watchTunnel(tunnel TunnelResource) {
 	cleanup := m.clearLocked(StateFailed, fmt.Sprintf("Quick Tunnel exited: %v", err))
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
+	m.recordDiagnostic(DiagnosticRecord{Level: "error", Component: "tunnel", Event: "exit", Code: "unexpected_exit"})
 	_ = cleanup.close(context.Background(), Shutdown{
 		Reason: "Quick Tunnel exited",
 		Retry:  false,
@@ -638,6 +665,7 @@ func (m *Manager) watchViewer(client *Client, identity Identity, viewer Viewer) 
 	delete(m.active, client)
 	client.markViewerClosed()
 	m.mu.Unlock()
+	m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "ended", Code: "terminal_ended"})
 	_ = client.SendControl(context.Background(), TagError, ProtocolError{
 		Code:    "terminal_ended",
 		Message: "The terminal viewer ended.",
@@ -712,13 +740,39 @@ func (m *Manager) snapshotLocked() Snapshot {
 		return sessions[i].ID < sessions[j].ID
 	})
 	return Snapshot{
-		State:      m.state,
-		PublicURL:  m.publicURL,
-		PairingURL: m.pairingURL,
-		QR:         m.qr,
-		Sessions:   sessions,
-		Err:        m.errText,
+		State:              m.state,
+		PublicURL:          m.publicURL,
+		PairingURL:         m.pairingURL,
+		QR:                 m.qr,
+		Sessions:           sessions,
+		Err:                m.errText,
+		DiagnosticsWarning: m.diagnosticsWarning,
 	}
+}
+
+func (m *Manager) recordDiagnostic(record DiagnosticRecord) {
+	m.diagnosticMu.Lock()
+	defer m.diagnosticMu.Unlock()
+	m.mu.RLock()
+	sink := m.diagnostics
+	failed := m.diagnosticsFailed
+	m.mu.RUnlock()
+	if sink == nil || failed {
+		return
+	}
+	if err := sink.Write(record); err == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.diagnosticsFailed {
+		m.mu.Unlock()
+		return
+	}
+	m.diagnosticsFailed = true
+	m.diagnosticsWarning = "diagnostics unavailable"
+	snapshot := m.snapshotLocked()
+	m.mu.Unlock()
+	m.publishSnapshot(snapshot)
 }
 
 func (m *Manager) publishSnapshot(snapshot Snapshot) {
@@ -796,15 +850,15 @@ func (c managerCleanup) close(ctx context.Context, shutdown Shutdown) error {
 	defer cancel()
 	viewerErr := closeViewers(c.viewers)
 	clientErr := closeClients(ctx, c.clients, shutdown)
-	if c.cancel != nil {
-		c.cancel()
-	}
 	var serverErr, tunnelErr error
+	if c.tunnel != nil {
+		tunnelErr = c.tunnel.Close()
+	}
 	if c.server != nil {
 		serverErr = c.server.Close(ctx)
 	}
-	if c.tunnel != nil {
-		tunnelErr = c.tunnel.Close()
+	if c.cancel != nil {
+		c.cancel()
 	}
 	return errors.Join(viewerErr, clientErr, serverErr, tunnelErr)
 }

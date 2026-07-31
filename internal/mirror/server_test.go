@@ -6,12 +6,281 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/coder/websocket"
 )
+
+func TestLocalServerRecordsSafeLifecycleHandshakeAndMissingAsset(t *testing.T) {
+	sink := &recordingDiagnosticSink{}
+	record := func(event DiagnosticRecord) { _ = sink.Write(event) }
+	server, err := StartLocalServer(t.Context(), ServerOptions{
+		PublicHost: "mirror.example",
+		Record:     record,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodGet, server.LocalURL()+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Origin", "https://attacker.invalid")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("wrong-origin handshake status = %d", response.StatusCode)
+	}
+
+	server.assetFS = fstest.MapFS{}
+	recorder := httptest.NewRecorder()
+	server.serveAsset(
+		recorder,
+		"assets/wrap-mirror.js",
+		"text/javascript; charset=utf-8",
+	)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("missing known asset status = %d", recorder.Code)
+	}
+	if err := server.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	records := sink.snapshot()
+	for _, want := range []struct{ component, event, code string }{
+		{"server", "started", ""},
+		{"handshake", "rejected", "origin_rejected"},
+		{"server", "asset_missing", "client_asset_unavailable"},
+		{"server", "stopped", ""},
+	} {
+		if !containsDiagnostic(records, want.component, want.event, want.code) {
+			t.Fatalf("missing diagnostic %s/%s/%s in %+v", want.component, want.event, want.code, records)
+		}
+	}
+	for _, record := range records {
+		if strings.Contains(record.Path, "SENTINEL") || strings.Contains(record.Path, "credential") {
+			t.Fatalf("missing asset diagnostic leaked request data: %+v", record)
+		}
+	}
+}
+
+func TestMissingAssetDiagnosticsRequireCanonicalAssetAndDoNotBlockResponses(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	var missing atomic.Int32
+	server, err := StartLocalServer(t.Context(), ServerOptions{
+		Record: func(record DiagnosticRecord) {
+			if record.Component != "server" || record.Event != "asset_missing" {
+				return
+			}
+			if missing.Add(1) == 1 {
+				close(entered)
+			}
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.assetFS = fstest.MapFS{}
+
+	responsesDone := make(chan struct{})
+	go func() {
+		defer close(responsesDone)
+		server.serveAsset(httptest.NewRecorder(), "assets/wrap-mirror.js?noise.js", "text/javascript")
+		for range 25 {
+			server.serveAsset(httptest.NewRecorder(), "assets/wrap-mirror.js", "text/javascript")
+		}
+	}()
+	select {
+	case <-responsesDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("missing asset responses blocked on diagnostic writes")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("canonical missing asset diagnostic was not queued")
+	}
+	if got := missing.Load(); got != 1 {
+		t.Fatalf("missing asset diagnostic writes = %d, want one canonical rate-limited write", got)
+	}
+}
+
+func TestHandshakeRejectionDiagnosticsAreRateLimitedAndNonBlocking(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	var rejected atomic.Int32
+	server, err := StartLocalServer(t.Context(), ServerOptions{
+		Record: func(record DiagnosticRecord) {
+			if record.Component == "handshake" && record.Event == "rejected" {
+				rejected.Add(1)
+				<-release
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	for range MaxHandshakes {
+		server.handshakes <- struct{}{}
+	}
+
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	for range 25 {
+		response, err := client.Get(server.LocalURL() + "/ws")
+		if err != nil {
+			t.Fatalf("overflow handshake blocked on diagnostics: %v", err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("overflow handshake status = %d", response.StatusCode)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for rejected.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := rejected.Load(); got != 1 {
+		t.Fatalf("rejection diagnostic writes = %d, want one rate-limited write", got)
+	}
+}
+
+func TestLocalServerCloseDrainsRemoteDiagnosticsBeforeStopped(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var events []string
+	server, err := StartLocalServer(t.Context(), ServerOptions{
+		Record: func(record DiagnosticRecord) {
+			if record.Component == "handshake" && record.Event == "rejected" {
+				close(entered)
+				<-release
+			}
+			mu.Lock()
+			events = append(events, record.Component+"/"+record.Event)
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.recordHandshakeRejection("server_busy")
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("remote diagnostic worker did not start queued write")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- server.Close(context.Background()) }()
+	returnedEarly := false
+	select {
+	case <-closed:
+		returnedEarly = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if !returnedEarly {
+		if err := <-closed; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if returnedEarly {
+		t.Fatal("server Close returned before the queued diagnostic completed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"server/started", "handshake/rejected", "server/stopped"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("diagnostic shutdown order = %v, want %v", events, want)
+	}
+}
+
+type blockingRandomReader struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingRandomReader) Read(data []byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	for i := range data {
+		data[i] = byte(i)
+	}
+	return len(data), nil
+}
+
+func TestLocalServerCloseWaitsForAcceptedHandshakeDiagnostics(t *testing.T) {
+	diagnostics := &recordingDiagnosticSink{}
+	random := &blockingRandomReader{entered: make(chan struct{}), release: make(chan struct{})}
+	server, err := StartLocalServer(t.Context(), ServerOptions{
+		Random: random,
+		Record: func(record DiagnosticRecord) {
+			_ = diagnostics.Write(record)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := strings.TrimPrefix(server.LocalURL(), "http://")
+	server.SetPublicHost(host)
+	connection, _, err := websocket.Dial(t.Context(), "ws://"+host+"/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"https://" + host}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = connection.CloseNow() }()
+	select {
+	case <-random.entered:
+	case <-time.After(time.Second):
+		t.Fatal("accepted handshake did not reach random source")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- server.Close(context.Background()) }()
+	returnedEarly := false
+	select {
+	case <-closed:
+		returnedEarly = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(random.release)
+	if !returnedEarly {
+		if err := <-closed; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if returnedEarly {
+		t.Fatal("server Close returned while an accepted handshake could still log")
+	}
+
+	records := diagnostics.snapshot()
+	rejected := -1
+	stopped := -1
+	for index, record := range records {
+		if record.Component == "handshake" && record.Event == "rejected" {
+			rejected = index
+		}
+		if record.Component == "server" && record.Event == "stopped" {
+			stopped = index
+		}
+	}
+	if rejected < 0 || stopped < 0 || rejected > stopped {
+		t.Fatalf("accepted-handshake shutdown diagnostics = %+v", records)
+	}
+}
 
 func TestLocalServerBindsLoopbackAndServesOnlyKnownRoutes(t *testing.T) {
 	server, err := StartLocalServer(t.Context(), ServerOptions{})
@@ -117,6 +386,7 @@ func (staticClientHandler) Resize(*Client, ResizeRequest) error { return nil }
 func (staticClientHandler) Disconnected(*Client)                {}
 
 func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
+	diagnostics := &recordingDiagnosticSink{}
 	var secret Secret
 	for i := range secret {
 		secret[i] = byte(i)
@@ -131,6 +401,9 @@ func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
 		Secret:  secret,
 		Handler: handler,
 		Random:  rand.Reader,
+		Record: func(record DiagnosticRecord) {
+			_ = diagnostics.Write(record)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -194,6 +467,9 @@ func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
 	}
 	if len(list.Sessions) != 1 || list.Sessions[0].Name != "vb/api" {
 		t.Fatalf("initial sessions = %+v", list.Sessions)
+	}
+	if !containsDiagnostic(diagnostics.snapshot(), "handshake", "authenticated", "") {
+		t.Fatalf("successful handshake diagnostic missing: %+v", diagnostics.snapshot())
 	}
 }
 

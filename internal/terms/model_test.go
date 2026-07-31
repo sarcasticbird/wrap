@@ -293,6 +293,26 @@ func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
 	}
 }
 
+func TestMirrorOverlayShowsDiagnosticsWarningWithoutHidingPairingURL(t *testing.T) {
+	pairingURL := "https://quiet-river.trycloudflare.com/#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	m := Model{
+		mirrorOpen:       true,
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:              mirrorapi.StateReady,
+			PairingURL:         pairingURL,
+			Sessions:           []mirrorapi.Session{{Name: "vb/api"}},
+			DiagnosticsWarning: "diagnostics unavailable",
+		},
+	}
+	m.Width = 90
+	m.Height = 24
+	view := ansi.Strip(m.mirrorView("Terminals"))
+	if !strings.Contains(view, pairingURL) || !strings.Contains(view, "diagnostics unavailable") {
+		t.Fatalf("mirror warning view omitted pairing URL or warning:\n%s", view)
+	}
+}
+
 func TestMirrorOverlayScrollsThroughCompletePairingURL(t *testing.T) {
 	const pairingURL = "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 	m := Model{

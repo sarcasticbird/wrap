@@ -1211,6 +1211,9 @@ func (m Model) mirrorContentLines() []string {
 			}
 		}
 	}
+	if m.mirrorSnapshot.DiagnosticsWarning != "" {
+		lines = append(lines, "", pane.SafeLabel(m.mirrorSnapshot.DiagnosticsWarning))
+	}
 	return lines
 }
 

@@ -11,9 +11,29 @@ import (
 
 	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/gitx"
+	"github.com/sarcasticbird/wrap/internal/mirror"
 	"github.com/sarcasticbird/wrap/internal/state"
 	"github.com/sarcasticbird/wrap/internal/workspaces"
 )
+
+func TestMirrorDiagnosticsUseWorkspaceStatePath(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	sink := mirrorDiagnostics("api")
+	if err := sink.Write(mirror.DiagnosticRecord{
+		Level: "info", Component: "server", Event: "started",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(stateHome, "wrap", "api", "mirror.log")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"event":"started"`) {
+		t.Fatalf("workspace mirror log = %q", data)
+	}
+}
 
 func TestRunArgsDispatchesTUICommand(t *testing.T) {
 	var tuiCalls int
