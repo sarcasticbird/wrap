@@ -60,29 +60,32 @@ for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
   )
   cp "$repo/LICENSE" "$repo/README.md" "$repo/SECURITY.md" "$stage/"
   cp "$repo/docs/architecture.md" "$repo/docs/configuration.md" \
-    "$repo/docs/troubleshooting.md" "$stage/docs/"
+    "$repo/docs/mobile-mirror-uat.md" "$repo/docs/troubleshooting.md" \
+    "$stage/docs/"
   cp "$repo/examples/wrap.toml" "$stage/examples/"
   chmod 0755 "$stage/wrap"
   chmod 0644 "$stage/LICENSE" "$stage/README.md" "$stage/SECURITY.md" \
     "$stage/docs/architecture.md" "$stage/docs/configuration.md" \
-    "$stage/docs/troubleshooting.md" "$stage/examples/wrap.toml"
+    "$stage/docs/mobile-mirror-uat.md" "$stage/docs/troubleshooting.md" \
+    "$stage/examples/wrap.toml"
   TZ=UTC touch -t 197001010000 "$stage/wrap" "$stage/LICENSE" \
     "$stage/README.md" "$stage/SECURITY.md" "$stage/docs/architecture.md" \
-    "$stage/docs/configuration.md" "$stage/docs/troubleshooting.md" \
-    "$stage/examples/wrap.toml"
+    "$stage/docs/configuration.md" "$stage/docs/mobile-mirror-uat.md" \
+    "$stage/docs/troubleshooting.md" "$stage/examples/wrap.toml"
   case "$(tar --version 2>/dev/null)" in
     *bsdtar*)
       COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --numeric-owner \
         --options gzip:!timestamp -C "$stage" \
         -czf "$output/${name}.tar.gz" wrap LICENSE README.md SECURITY.md \
-        docs/architecture.md docs/configuration.md docs/troubleshooting.md \
-        examples/wrap.toml
+        docs/architecture.md docs/configuration.md docs/mobile-mirror-uat.md \
+        docs/troubleshooting.md examples/wrap.toml
       ;;
     *)
       tar --sort=name --mtime="@0" --owner=0 --group=0 --numeric-owner \
         -C "$stage" -czf "$output/${name}.tar.gz" \
         wrap LICENSE README.md SECURITY.md docs/architecture.md \
-        docs/configuration.md docs/troubleshooting.md examples/wrap.toml
+        docs/configuration.md docs/mobile-mirror-uat.md \
+        docs/troubleshooting.md examples/wrap.toml
       ;;
   esac
 done

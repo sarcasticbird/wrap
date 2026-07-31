@@ -20,6 +20,7 @@ README.md
 SECURITY.md
 docs/architecture.md
 docs/configuration.md
+docs/mobile-mirror-uat.md
 docs/troubleshooting.md
 examples/wrap.toml'
 
