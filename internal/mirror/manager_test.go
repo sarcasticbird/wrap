@@ -72,18 +72,48 @@ func (s *fakeServerResource) Close(context.Context) error {
 type viewerFactoryFunc func(
 	context.Context,
 	Identity,
-	uint16,
-	uint16,
 	func([]byte) error,
-) (Viewer, error)
+) (PreparedViewer, error)
 
-func (f viewerFactoryFunc) Open(
+func (f viewerFactoryFunc) Prepare(
 	ctx context.Context,
 	identity Identity,
-	columns, rows uint16,
 	output func([]byte) error,
-) (Viewer, error) {
-	return f(ctx, identity, columns, rows, output)
+) (PreparedViewer, error) {
+	return f(ctx, identity, output)
+}
+
+type fakePreparedViewer struct {
+	geometry ViewerGeometry
+	viewer   Viewer
+	startErr error
+	closed   atomic.Int32
+	onStart  func()
+}
+
+type acknowledgerFunc func(id, generation string) error
+
+func (f acknowledgerFunc) AcknowledgeSession(id, generation string) error {
+	return f(id, generation)
+}
+
+func (p *fakePreparedViewer) Geometry() ViewerGeometry { return p.geometry }
+func (p *fakePreparedViewer) Start() (Viewer, error) {
+	if p.onStart != nil {
+		p.onStart()
+	}
+	return p.viewer, p.startErr
+}
+func (p *fakePreparedViewer) Close() error {
+	p.closed.Add(1)
+	return nil
+}
+
+func prepareFakeViewer(viewer Viewer) PreparedViewer {
+	return &fakePreparedViewer{
+		geometry: ViewerGeometry{Columns: 80, Rows: 24},
+		viewer:   viewer,
+	}
 }
 
 type fakeViewer struct {
@@ -99,18 +129,16 @@ func newDiagnosticViewer() *diagnosticViewer {
 	return &diagnosticViewer{done: make(chan error)}
 }
 
-func (v *diagnosticViewer) Write([]byte) error          { return nil }
-func (v *diagnosticViewer) Resize(uint16, uint16) error { return nil }
+func (v *diagnosticViewer) Write([]byte) error { return nil }
 func (v *diagnosticViewer) Close() error {
 	v.once.Do(func() { close(v.done) })
 	return nil
 }
 func (v *diagnosticViewer) Done() <-chan error { return v.done }
 
-func (v *fakeViewer) Write([]byte) error          { return nil }
-func (v *fakeViewer) Resize(uint16, uint16) error { return nil }
-func (v *fakeViewer) Close() error                { return nil }
-func (v *fakeViewer) Done() <-chan error          { return v.done }
+func (v *fakeViewer) Write([]byte) error { return nil }
+func (v *fakeViewer) Close() error       { return nil }
+func (v *fakeViewer) Done() <-chan error { return v.done }
 
 func TestManagerSuccessfulStartOwnsRuntimeContext(t *testing.T) {
 	server := &fakeServerResource{localURL: "http://127.0.0.1:43123"}
@@ -571,9 +599,9 @@ func TestManagerRecordsSafeMirrorLifecycle(t *testing.T) {
 		Workspace:   "vb",
 		Diagnostics: sink,
 		Viewers: viewerFactoryFunc(func(
-			context.Context, Identity, uint16, uint16, func([]byte) error,
-		) (Viewer, error) {
-			return viewer, nil
+			context.Context, Identity, func([]byte) error,
+		) (PreparedViewer, error) {
+			return prepareFakeViewer(viewer), nil
 		}),
 		StartServer: func(context.Context, ServerOptions) (ServerResource, error) {
 			return server, nil
@@ -601,7 +629,7 @@ func TestManagerRecordsSafeMirrorLifecycle(t *testing.T) {
 		t.Fatal("client did not receive status")
 	}
 	if err := manager.Open(t.Context(), client, OpenRequest{
-		ID: session.ID, Generation: session.Generation, Columns: 80, Rows: 24,
+		ID: session.ID, Generation: session.Generation,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -633,6 +661,388 @@ func TestManagerRecordsSafeMirrorLifecycle(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte("SENTINEL")) {
 		t.Fatalf("manager diagnostics leaked session identity: %s", encoded)
+	}
+}
+
+func TestManagerQueuesOpenedBeforeViewerOutput(t *testing.T) {
+	viewer := &fakeViewer{done: make(chan error, 1)}
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		Viewers: viewerFactoryFunc(func(
+			_ context.Context,
+			_ Identity,
+			output func([]byte) error,
+		) (PreparedViewer, error) {
+			return &fakePreparedViewer{
+				geometry: ViewerGeometry{Columns: 132, Rows: 41},
+				viewer:   viewer,
+				onStart:  func() { _ = output([]byte("first output")) },
+			}, nil
+		}),
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}
+	if err := manager.Mirror(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	t.Cleanup(func() {
+		manager.Disconnected(client)
+		_ = manager.Shutdown(context.Background())
+	})
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive initial status")
+	}
+	if err := manager.Open(t.Context(), client, OpenRequest{
+		ID: session.ID, Generation: session.Generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	openedFrame, ok := client.queue.pop(t.Context())
+	if !ok || openedFrame.tag != TagOpened {
+		t.Fatalf("first viewer frame = %+v, %v; want opened", openedFrame, ok)
+	}
+	var opened Opened
+	if err := DecodeControl(openedFrame.tag, openedFrame.payload, &opened); err != nil {
+		t.Fatal(err)
+	}
+	if opened != (Opened{
+		ID: session.ID, Generation: session.Generation, Columns: 132, Rows: 41,
+	}) {
+		t.Fatalf("opened geometry = %+v", opened)
+	}
+	outputFrame, ok := client.queue.pop(t.Context())
+	if !ok || outputFrame.tag != TagOutput || string(outputFrame.payload) != "first output" {
+		t.Fatalf("second viewer frame = %+v, %v; want first output", outputFrame, ok)
+	}
+}
+
+func TestManagerDoesNotAcknowledgeAttentionBeforeViewerStarts(t *testing.T) {
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	prepared := &fakePreparedViewer{
+		geometry: ViewerGeometry{Columns: 80, Rows: 24},
+		startErr: errors.New("viewer start failed"),
+	}
+	var acknowledgements atomic.Int32
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		Acknowledger: acknowledgerFunc(func(string, string) error {
+			acknowledgements.Add(1)
+			return nil
+		}),
+		Viewers: viewerFactoryFunc(func(
+			context.Context, Identity, func([]byte) error,
+		) (PreparedViewer, error) {
+			return prepared, nil
+		}),
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}
+	if err := manager.Mirror(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive initial status")
+	}
+	if err := manager.Open(t.Context(), client, OpenRequest{
+		ID: session.ID, Generation: session.Generation,
+	}); err == nil {
+		t.Fatal("viewer unexpectedly opened")
+	}
+	if got := acknowledgements.Load(); got != 0 {
+		t.Fatalf("attention acknowledgements = %d, want 0", got)
+	}
+	if got := prepared.closed.Load(); got != 1 {
+		t.Fatalf("prepared viewer closes = %d, want 1", got)
+	}
+	manager.Disconnected(client)
+	if err := manager.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerRevokeDoesNotWaitForPendingViewerStart(t *testing.T) {
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	viewer := newDiagnosticViewer()
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		Viewers: viewerFactoryFunc(func(
+			_ context.Context, _ Identity, output func([]byte) error,
+		) (PreparedViewer, error) {
+			return &fakePreparedViewer{
+				geometry: ViewerGeometry{Columns: 80, Rows: 24},
+				viewer:   viewer,
+				onStart: func() {
+					close(startEntered)
+					<-releaseStart
+					_ = output([]byte("late output"))
+				},
+			}, nil
+		}),
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}
+	second := HostSession{
+		ID: "$8", Generation: first.Generation, Name: "vb/web",
+	}
+	if err := manager.Mirror(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Mirror(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive initial status")
+	}
+	client.viewerOpen.Store(true)
+	openResult := make(chan error, 1)
+	go func() {
+		openResult <- manager.Open(t.Context(), client, OpenRequest{
+			ID: first.ID, Generation: first.Generation,
+		})
+	}()
+	<-startEntered
+	revokeResult := make(chan error, 1)
+	go func() {
+		revokeResult <- manager.Revoke(t.Context(), Identity{
+			ID: first.ID, Generation: first.Generation,
+		})
+	}()
+	revokeBlocked := false
+	select {
+	case err := <-revokeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		revokeBlocked = true
+	}
+	close(releaseStart)
+	if revokeBlocked {
+		if err := <-revokeResult; err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("revoke blocked on pending viewer startup")
+	}
+	if err := <-openResult; err == nil {
+		t.Fatal("revoked pending viewer unexpectedly opened")
+	}
+	select {
+	case <-viewer.done:
+	case <-time.After(time.Second):
+		t.Fatal("revoked pending viewer was not closed after startup returned")
+	}
+	if client.viewerOpen.Load() {
+		t.Fatal("revoke left pending client marked open")
+	}
+	for {
+		frame, ok := client.queue.pop(context.Background())
+		if !ok {
+			break
+		}
+		if frame.tag == TagOutput {
+			t.Fatal("canceled pending viewer queued terminal output")
+		}
+		client.queue.mu.Lock()
+		remaining := len(client.queue.frames)
+		client.queue.mu.Unlock()
+		if remaining == 0 {
+			break
+		}
+	}
+	manager.Disconnected(client)
+	if err := manager.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerSnapshotDoesNotWaitForViewerAcknowledgement(t *testing.T) {
+	ackEntered := make(chan struct{})
+	releaseAck := make(chan struct{})
+	viewer := newDiagnosticViewer()
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		Acknowledger: acknowledgerFunc(func(string, string) error {
+			close(ackEntered)
+			<-releaseAck
+			return nil
+		}),
+		Viewers: viewerFactoryFunc(func(
+			context.Context, Identity, func([]byte) error,
+		) (PreparedViewer, error) {
+			return prepareFakeViewer(viewer), nil
+		}),
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}
+	if err := manager.Mirror(t.Context(), session); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive initial status")
+	}
+	openResult := make(chan error, 1)
+	go func() {
+		openResult <- manager.Open(t.Context(), client, OpenRequest{
+			ID: session.ID, Generation: session.Generation,
+		})
+	}()
+	<-ackEntered
+	snapshotResult := make(chan Snapshot, 1)
+	go func() { snapshotResult <- manager.Snapshot() }()
+	snapshotBlocked := false
+	select {
+	case snapshot := <-snapshotResult:
+		if snapshot.State != StateReady {
+			t.Fatalf("snapshot during acknowledgement = %+v", snapshot)
+		}
+	case <-time.After(100 * time.Millisecond):
+		snapshotBlocked = true
+	}
+	close(releaseAck)
+	if err := <-openResult; err != nil {
+		t.Fatal(err)
+	}
+	if snapshotBlocked {
+		<-snapshotResult
+		t.Fatal("snapshot blocked on viewer acknowledgement")
+	}
+	manager.Disconnected(client)
+	if err := manager.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerQueuesOpenedBeforeConcurrentRevocation(t *testing.T) {
+	sendEntered := make(chan struct{})
+	releaseSend := make(chan struct{})
+	viewer := newDiagnosticViewer()
+	tunnel := &fakeTunnelResource{
+		url:  "https://quiet-river.trycloudflare.com",
+		done: make(chan error),
+	}
+	manager, err := NewManager(ManagerOptions{
+		Workspace: "vb",
+		Viewers: viewerFactoryFunc(func(
+			context.Context, Identity, func([]byte) error,
+		) (PreparedViewer, error) {
+			return prepareFakeViewer(viewer), nil
+		}),
+		StartTunnel: func(context.Context, string) (TunnelResource, error) {
+			return tunnel, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := HostSession{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
+	}
+	second := HostSession{ID: "$8", Generation: first.Generation, Name: "vb/web"}
+	if err := manager.Mirror(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Mirror(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{queue: newOutboundQueue(MaxClientQueueBytes)}
+	manager.Connected(client)
+	if _, ok := client.queue.pop(t.Context()); !ok {
+		t.Fatal("client did not receive initial status")
+	}
+	client.beforeSend = func(tag byte) {
+		if tag == TagOpened {
+			close(sendEntered)
+			<-releaseSend
+		}
+	}
+	openResult := make(chan error, 1)
+	go func() {
+		openResult <- manager.Open(t.Context(), client, OpenRequest{
+			ID: first.ID, Generation: first.Generation,
+		})
+	}()
+	<-sendEntered
+	revokeResult := make(chan error, 1)
+	go func() {
+		revokeResult <- manager.Revoke(t.Context(), Identity{
+			ID: first.ID, Generation: first.Generation,
+		})
+	}()
+	revokedBeforeOpened := false
+	select {
+	case err := <-revokeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+		revokedBeforeOpened = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseSend)
+	<-openResult
+	if !revokedBeforeOpened {
+		if err := <-revokeResult; err != nil {
+			t.Fatal(err)
+		}
+	}
+	frame, ok := client.queue.pop(t.Context())
+	if !ok || frame.tag != TagOpened {
+		t.Fatalf("first concurrent viewer frame = %+v, %v; want opened", frame, ok)
+	}
+	manager.Disconnected(client)
+	if err := manager.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -683,8 +1093,8 @@ func TestManagerRecordsSafeViewerFailureCategory(t *testing.T) {
 		Workspace:   "vb",
 		Diagnostics: sink,
 		Viewers: viewerFactoryFunc(func(
-			context.Context, Identity, uint16, uint16, func([]byte) error,
-		) (Viewer, error) {
+			context.Context, Identity, func([]byte) error,
+		) (PreparedViewer, error) {
 			return nil, errors.New("SENTINEL raw viewer error and terminal output")
 		}),
 		StartTunnel: func(context.Context, string) (TunnelResource, error) {
@@ -707,7 +1117,7 @@ func TestManagerRecordsSafeViewerFailureCategory(t *testing.T) {
 		t.Fatal("client did not receive status")
 	}
 	openErr := manager.Open(t.Context(), client, OpenRequest{
-		ID: session.ID, Generation: session.Generation, Columns: 80, Rows: 24,
+		ID: session.ID, Generation: session.Generation,
 	})
 	manager.Disconnected(client)
 	if openErr == nil {
@@ -932,11 +1342,9 @@ func TestManagerViewerExitClosesActiveSessionAndNotifiesClient(t *testing.T) {
 		Viewers: viewerFactoryFunc(func(
 			context.Context,
 			Identity,
-			uint16,
-			uint16,
 			func([]byte) error,
-		) (Viewer, error) {
-			return viewer, nil
+		) (PreparedViewer, error) {
+			return prepareFakeViewer(viewer), nil
 		}),
 		StartTunnel: func(context.Context, string) (TunnelResource, error) {
 			return tunnel, nil
@@ -958,9 +1366,12 @@ func TestManagerViewerExitClosesActiveSessionAndNotifiesClient(t *testing.T) {
 		t.Fatal("client did not receive initial status")
 	}
 	if err := manager.Open(t.Context(), client, OpenRequest{
-		ID: session.ID, Generation: session.Generation, Columns: 80, Rows: 24,
+		ID: session.ID, Generation: session.Generation,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if frame, ok := client.queue.pop(t.Context()); !ok || frame.tag != TagOpened {
+		t.Fatalf("client did not receive opened geometry: %+v, %v", frame, ok)
 	}
 	client.viewerOpen.Store(true)
 

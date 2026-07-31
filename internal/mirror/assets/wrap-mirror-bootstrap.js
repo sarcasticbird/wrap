@@ -1,5 +1,5 @@
 (() => {
-  const storageKey = "wrap.mirror.v1.secret";
+  const storageKey = "wrap.mirror.v2.secret";
   const fragment = new URLSearchParams(location.hash.slice(1));
   const fragmentKey = fragment.get("k");
   history.replaceState(null, "", location.pathname + location.search);

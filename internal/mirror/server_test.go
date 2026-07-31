@@ -51,10 +51,20 @@ func TestLocalServerRecordsSafeLifecycleHandshakeAndMissingAsset(t *testing.T) {
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("missing known asset status = %d", recorder.Code)
 	}
+	viewportRecorder := httptest.NewRecorder()
+	server.serveAsset(
+		viewportRecorder,
+		"assets/wrap-mirror-viewport.js",
+		"text/javascript; charset=utf-8",
+	)
+	if viewportRecorder.Code != http.StatusNotFound {
+		t.Fatalf("missing viewport asset status = %d", viewportRecorder.Code)
+	}
 	if err := server.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	records := sink.snapshot()
+	foundViewportDiagnostic := false
 	for _, want := range []struct{ component, event, code string }{
 		{"server", "started", ""},
 		{"handshake", "rejected", "origin_rejected"},
@@ -66,9 +76,16 @@ func TestLocalServerRecordsSafeLifecycleHandshakeAndMissingAsset(t *testing.T) {
 		}
 	}
 	for _, record := range records {
+		if record.Component == "server" && record.Event == "asset_missing" &&
+			record.Path == "assets/wrap-mirror-viewport.js" {
+			foundViewportDiagnostic = true
+		}
 		if strings.Contains(record.Path, "SENTINEL") || strings.Contains(record.Path, "credential") {
 			t.Fatalf("missing asset diagnostic leaked request data: %+v", record)
 		}
+	}
+	if !foundViewportDiagnostic {
+		t.Fatalf("missing viewport asset diagnostic in %+v", records)
 	}
 }
 
@@ -308,6 +325,7 @@ func TestLocalServerBindsLoopbackAndServesOnlyKnownRoutes(t *testing.T) {
 		{"/assets/wrap-mirror-bootstrap.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/wrap-mirror.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/wrap-mirror-state.js", http.StatusOK, "text/javascript; charset=utf-8"},
+		{"/assets/wrap-mirror-viewport.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/third_party/xterm/xterm.mjs", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/missing", http.StatusNotFound, "text/plain; charset=utf-8"},
 		{"/assets/", http.StatusNotFound, "text/plain; charset=utf-8"},
@@ -380,10 +398,9 @@ func (staticClientHandler) Connected(*Client)            {}
 func (staticClientHandler) Open(context.Context, *Client, OpenRequest) error {
 	return nil
 }
-func (staticClientHandler) Close(*Client) error                 { return nil }
-func (staticClientHandler) Input(*Client, []byte) error         { return nil }
-func (staticClientHandler) Resize(*Client, ResizeRequest) error { return nil }
-func (staticClientHandler) Disconnected(*Client)                {}
+func (staticClientHandler) Close(*Client) error         { return nil }
+func (staticClientHandler) Input(*Client, []byte) error { return nil }
+func (staticClientHandler) Disconnected(*Client)        {}
 
 func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
 	diagnostics := &recordingDiagnosticSink{}

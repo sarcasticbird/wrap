@@ -22,6 +22,7 @@ const testGeneration = "0123456789abcdef0123456789abcdef"
 
 type fakeRunner struct {
 	calls [][]string
+	input []byte
 	// hasSessions controls has-session responses by exact target.
 	hasSessions map[string]bool
 	// hasSessionResults, when non-empty, overrides hasSessions in call
@@ -32,6 +33,8 @@ type fakeRunner struct {
 	listOut           string
 	displayOut        string // returned for display-message (ClientSession) calls
 	displayID         string // stable ID paired with displayOut
+	paneHeight        int    // current Terms pane height for resize lifecycle tests
+	minPaneHeight     int    // clamps resize-pane like a temporarily constrained tmux window
 	// displayAfterKill, when set, is what display-message returns once a
 	// kill-session has been issued. Real tmux with detach-on-destroy off
 	// moves the client the instant a session dies, so a canned answer that
@@ -52,6 +55,96 @@ type fakeRunner struct {
 	releaseList          chan struct{}
 	listBlocked          bool
 	sessionNameMismatch  bool
+}
+
+func (f *fakeRunner) RunWithInput(input []byte, args ...string) (string, error) {
+	f.calls = append(f.calls, args)
+	f.input = append([]byte(nil), input...)
+	joined := strings.Join(args, " ")
+	if f.failContains != "" && strings.Contains(joined, f.failContains) {
+		if f.failErr != nil {
+			return "", f.failErr
+		}
+		return "", errFake
+	}
+	return "", nil
+}
+
+func TestCopyMirrorPairingURLUsesSystemClipboardWithoutTmuxOrArgvSecret(t *testing.T) {
+	const pairingURL = "https://mirror.example/#k=TEST_ONLY_PAIRING_CREDENTIAL"
+	runner := &fakeRunner{}
+	var copied string
+	manager := &Manager{
+		UI: &tmux.Server{Socket: tmux.SocketUI, R: runner},
+		clipboardWrite: func(value string) error {
+			copied = value
+			return nil
+		},
+	}
+
+	if err := manager.CopyMirrorPairingURL(pairingURL); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 0 || runner.input != nil {
+		t.Fatalf("clipboard copy invoked tmux: calls=%q input=%q", runner.calls, runner.input)
+	}
+	if copied != pairingURL {
+		t.Fatalf("system clipboard value = %q", copied)
+	}
+}
+
+func TestCopyMirrorPairingURLRejectsInvalidLengthsBeforeWriting(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("x", 4097)} {
+		called := false
+		manager := &Manager{clipboardWrite: func(string) error { called = true; return nil }}
+		if err := manager.CopyMirrorPairingURL(value); err == nil {
+			t.Fatalf("CopyMirrorPairingURL accepted value length %d", len(value))
+		}
+		if called {
+			t.Fatalf("invalid value length %d reached clipboard helper", len(value))
+		}
+	}
+}
+
+func TestClipboardCommandUsesPlatformHelperWithoutSecretArgument(t *testing.T) {
+	const secret = "TEST_ONLY_PAIRING_CREDENTIAL"
+	available := map[string]string{
+		"pbcopy":  "/usr/bin/pbcopy",
+		"wl-copy": "/usr/bin/wl-copy",
+		"xclip":   "/usr/bin/xclip",
+	}
+	lookPath := func(name string) (string, error) {
+		if path := available[name]; path != "" {
+			return path, nil
+		}
+		return "", exec.ErrNotFound
+	}
+	for _, test := range []struct {
+		goos     string
+		display  string
+		wayland  string
+		wantPath string
+	}{
+		{goos: "darwin", wantPath: "/usr/bin/pbcopy"},
+		{goos: "linux", wayland: "wayland-0", wantPath: "/usr/bin/wl-copy"},
+		{goos: "linux", display: ":0", wantPath: "/usr/bin/xclip"},
+	} {
+		t.Setenv("DISPLAY", test.display)
+		t.Setenv("WAYLAND_DISPLAY", test.wayland)
+		path, args, err := clipboardCommand(test.goos, lookPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path != test.wantPath {
+			t.Fatalf("%s clipboard path = %q, want %q", test.goos, path, test.wantPath)
+		}
+		if strings.Contains(strings.Join(args, " "), secret) {
+			t.Fatalf("%s clipboard args contain pairing credential: %q", test.goos, args)
+		}
+	}
+	if _, _, err := clipboardCommand("plan9", lookPath); err == nil {
+		t.Fatal("unsupported platform received clipboard command")
+	}
 }
 
 func (f *fakeRunner) Run(args ...string) (string, error) {
@@ -178,6 +271,17 @@ func (f *fakeRunner) Run(args ...string) (string, error) {
 		}
 		return f.listOut, nil
 	}
+	if strings.Contains(joined, "resize-pane") {
+		height, err := strconv.Atoi(argAfter(args, "-y"))
+		if err != nil {
+			return "", err
+		}
+		if height < f.minPaneHeight {
+			height = f.minPaneHeight
+		}
+		f.paneHeight = height
+		return "", nil
+	}
 	if strings.Contains(joined, "display-message") {
 		if strings.Contains(joined, "#{pid}") {
 			if f.uiSessionKilled && f.uiServerPIDAfterKill != "" {
@@ -198,6 +302,9 @@ func (f *fakeRunner) Run(args ...string) (string, error) {
 		}
 		if f.displayErr {
 			return "", errFake
+		}
+		if strings.Contains(joined, "#{pane_height}") && f.paneHeight > 0 {
+			return strconv.Itoa(f.paneHeight), nil
 		}
 		if strings.Contains(joined, "#{client_session}\t#{session_id}") {
 			id := f.displayID
@@ -344,6 +451,133 @@ func newTestManagerWS(f *fakeRunner, ws string) *Manager {
 		Sess: &tmux.Server{Socket: tmux.SocketSessions, R: f},
 		Exe:  "/bin/wrap",
 		WS:   ws,
+	}
+}
+
+func TestMirrorPaneHeightGrowsIdempotentlyAndRestoresOriginalHeight(t *testing.T) {
+	runner := &fakeRunner{paneHeight: 18}
+	manager := newTestManagerWS(runner, "vb")
+	manager.currentPane = "%3"
+
+	if err := manager.EnsureMirrorPaneHeight(42); err != nil {
+		t.Fatal(err)
+	}
+	if runner.paneHeight != 42 {
+		t.Fatalf("pane height = %d, want 42", runner.paneHeight)
+	}
+	if err := manager.EnsureMirrorPaneHeight(42); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(runner.all(), "resize-pane"); got != 1 {
+		t.Fatalf("same required height issued %d resizes, want 1:\n%s", got, runner.all())
+	}
+
+	if err := manager.EnsureMirrorPaneHeight(48); err != nil {
+		t.Fatal(err)
+	}
+	if runner.paneHeight != 48 {
+		t.Fatalf("pane height = %d, want 48", runner.paneHeight)
+	}
+	if err := manager.RestoreMirrorPaneHeight(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.paneHeight != 18 {
+		t.Fatalf("restored pane height = %d, want exact original 18", runner.paneHeight)
+	}
+	if got := strings.Count(runner.all(), "resize-pane"); got != 3 {
+		t.Fatalf("resize calls = %d, want grow, regrow, restore:\n%s", got, runner.all())
+	}
+}
+
+func TestMirrorPaneHeightDoesNotShrinkAnAlreadyLargePane(t *testing.T) {
+	runner := &fakeRunner{paneHeight: 50}
+	manager := newTestManagerWS(runner, "vb")
+	manager.currentPane = "%3"
+
+	if err := manager.EnsureMirrorPaneHeight(42); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RestoreMirrorPaneHeight(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.paneHeight != 50 || strings.Contains(runner.all(), "resize-pane") {
+		t.Fatalf("already-large pane was resized:\n%s", runner.all())
+	}
+}
+
+func TestMirrorPaneHeightPreservesRestoreStateAfterResizeFailure(t *testing.T) {
+	runner := &fakeRunner{paneHeight: 18}
+	manager := newTestManagerWS(runner, "vb")
+	manager.currentPane = "%3"
+
+	if err := manager.EnsureMirrorPaneHeight(42); err != nil {
+		t.Fatal(err)
+	}
+	runner.failContains = "resize-pane"
+	if err := manager.RestoreMirrorPaneHeight(); err == nil {
+		t.Fatal("RestoreMirrorPaneHeight error = nil, want resize failure")
+	}
+	runner.failContains = ""
+	if err := manager.RestoreMirrorPaneHeight(); err != nil {
+		t.Fatalf("retry restore: %v", err)
+	}
+	if runner.paneHeight != 18 {
+		t.Fatalf("retried restore height = %d, want 18", runner.paneHeight)
+	}
+}
+
+func TestMirrorPaneHeightRetriesRestoreAfterTmuxClampsResize(t *testing.T) {
+	runner := &fakeRunner{paneHeight: 18}
+	manager := newTestManagerWS(runner, "vb")
+	manager.currentPane = "%3"
+
+	if err := manager.EnsureMirrorPaneHeight(42); err != nil {
+		t.Fatal(err)
+	}
+	runner.minPaneHeight = 20
+	if err := manager.RestoreMirrorPaneHeight(); err == nil {
+		t.Fatal("clamped restore error = nil, want retryable mismatch")
+	}
+	if runner.paneHeight != 20 {
+		t.Fatalf("clamped pane height = %d, want 20", runner.paneHeight)
+	}
+	runner.minPaneHeight = 0
+	if err := manager.RestoreMirrorPaneHeight(); err != nil {
+		t.Fatalf("retry restore after window growth: %v", err)
+	}
+	if runner.paneHeight != 18 {
+		t.Fatalf("retried restore height = %d, want 18", runner.paneHeight)
+	}
+}
+
+func TestMirrorPaneHeightReportsPaneLookupAndInitialResizeFailures(t *testing.T) {
+	for _, pane := range []string{"", "3"} {
+		manager := newTestManagerWS(&fakeRunner{paneHeight: 18}, "vb")
+		manager.currentPane = pane
+		if err := manager.EnsureMirrorPaneHeight(42); err == nil || !strings.Contains(err.Error(), "read Terms pane height") {
+			t.Errorf("EnsureMirrorPaneHeight pane %q error = %v", pane, err)
+		}
+	}
+
+	runner := &fakeRunner{paneHeight: 18, failContains: "display-message"}
+	manager := newTestManagerWS(runner, "vb")
+	manager.currentPane = "%3"
+	if err := manager.EnsureMirrorPaneHeight(42); err == nil || !strings.Contains(err.Error(), "read Terms pane height") {
+		t.Fatalf("height query error = %v", err)
+	}
+
+	runner = &fakeRunner{paneHeight: 18, failContains: "resize-pane"}
+	manager = newTestManagerWS(runner, "vb")
+	manager.currentPane = "%3"
+	if err := manager.EnsureMirrorPaneHeight(42); err == nil || !strings.Contains(err.Error(), "grow Terms pane") {
+		t.Fatalf("initial resize error = %v", err)
+	}
+	runner.failContains = ""
+	if err := manager.EnsureMirrorPaneHeight(42); err != nil {
+		t.Fatalf("retry initial resize: %v", err)
+	}
+	if err := manager.RestoreMirrorPaneHeight(); err != nil || runner.paneHeight != 18 {
+		t.Fatalf("restore after retry = %v, height %d", err, runner.paneHeight)
 	}
 }
 

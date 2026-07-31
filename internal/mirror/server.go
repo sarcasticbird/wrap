@@ -36,7 +36,6 @@ type ClientHandler interface {
 	Open(context.Context, *Client, OpenRequest) error
 	Close(*Client) error
 	Input(*Client, []byte) error
-	Resize(*Client, ResizeRequest) error
 	Disconnected(*Client)
 }
 
@@ -368,7 +367,6 @@ func (noOpClientHandler) Connected(*Client)                                {}
 func (noOpClientHandler) Open(context.Context, *Client, OpenRequest) error { return nil }
 func (noOpClientHandler) Close(*Client) error                              { return nil }
 func (noOpClientHandler) Input(*Client, []byte) error                      { return nil }
-func (noOpClientHandler) Resize(*Client, ResizeRequest) error              { return nil }
 func (noOpClientHandler) Disconnected(*Client)                             {}
 
 func (s *LocalServer) serveAsset(response http.ResponseWriter, name, contentType string) {
@@ -394,6 +392,7 @@ func requiredMirrorAsset(name string) bool {
 		"assets/wrap-mirror-bootstrap.js",
 		"assets/wrap-mirror.js",
 		"assets/wrap-mirror-state.js",
+		"assets/wrap-mirror-viewport.js",
 		"assets/third_party/xterm/xterm.mjs",
 		"assets/third_party/xterm/xterm.css",
 		"assets/third_party/xterm/addon-fit.mjs":

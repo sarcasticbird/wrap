@@ -24,16 +24,24 @@ messages, and a 1 MiB outbound queue per client.
 
 Each device opens an independent PTY-backed tmux client with
 `attach-session -f ignore-size`, guarded by the same `(session ID, tmux server
-generation)` identity used elsewhere in wrap. While any remote viewer is
-attached, wrap pins that exact tmux window's current dimensions with its
-per-window `window-size=manual` mode; the last viewer restores the prior mode.
-The pin is keyed by the stable tmux window ID, shared across linked sessions,
-and remembers whether the prior mode was local or inherited. Attach refuses if
-the session's current window changes between pin and attach, and the last
-viewer either restores the local value or removes wrap's override. These
-operations are generation-guarded, so phone-sized PTYs cannot resize a
-detached shared window and a restarted server cannot redirect restoration to
-a reused identity. Browser resize affects the remote PTY only.
+generation)` identity used elsewhere in wrap. For an inherited `window-size`
+option, wrap atomically installs a temporary per-window `manual` override only
+if the option is still inherited; the last viewer removes it only while it
+still has the pinned `manual` value and wrap's random ownership marker. Scoped
+tmux hooks invalidate that marker on later `window-size` writes or window
+resizes, so even a same-valued `manual` assignment is preserved without
+letting unrelated option changes strand wrap's temporary override.
+Explicit window-local sizing remains host-owned and is never overwritten or
+restored by a mirror viewer. Viewer state is keyed by the stable tmux window
+ID and shared across linked sessions. Attach refuses if the session's current
+window or captured geometry changes, and an inherited-to-local transition is
+retried without replacing the new local value. These operations are
+generation-guarded, so phone-sized PTYs cannot resize a detached shared window
+and a restarted server cannot redirect cleanup to a reused identity. Protocol
+v2 reports the captured host window's columns and
+full viewer rows (including effective tmux status lines) before PTY output
+starts; browser viewport and keyboard changes only scale or pan that fixed
+terminal surface and never resize the remote PTY.
 Opening remotely acknowledges the exact session activity baseline but does not
 switch the desktop middle pane.
 

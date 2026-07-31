@@ -17,6 +17,7 @@ func TestEmbeddedMirrorAssets(t *testing.T) {
 		"assets/third_party/xterm/xterm.css",
 		"assets/third_party/xterm/addon-fit.mjs",
 		"assets/wrap-mirror-bootstrap.js",
+		"assets/wrap-mirror-viewport.js",
 		"assets/licenses/xterm-LICENSE",
 		"assets/PROVENANCE.md",
 	}

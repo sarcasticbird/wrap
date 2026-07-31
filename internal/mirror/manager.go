@@ -109,6 +109,7 @@ type Manager struct {
 	startup            *managerStartup
 	clients            map[*Client]struct{}
 	active             map[*Client]activeViewer
+	opening            map[*Client]*openingViewer
 	shutdown           bool
 	shutdownAsked      bool
 	diagnosticsFailed  bool
@@ -116,6 +117,12 @@ type Manager struct {
 }
 
 type activeViewer struct {
+	identity Identity
+	viewer   Viewer
+	opening  *openingViewer
+}
+
+type openingViewer struct {
 	identity Identity
 	viewer   Viewer
 }
@@ -142,6 +149,7 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 		sessions:     make(map[Identity]HostSession),
 		clients:      make(map[*Client]struct{}),
 		active:       make(map[*Client]activeViewer),
+		opening:      make(map[*Client]*openingViewer),
 	}
 	if manager.viewers == nil {
 		manager.viewers = &PTYViewerFactory{
@@ -331,6 +339,15 @@ func (m *Manager) Revoke(ctx context.Context, identity Identity) error {
 			client.markViewerClosed()
 		}
 	}
+	for client, opening := range m.opening {
+		if opening.identity == identity {
+			if opening.viewer != nil {
+				viewers = append(viewers, opening.viewer)
+			}
+			delete(m.opening, client)
+			client.markViewerClosed()
+		}
+	}
 	clients := m.clientsLocked()
 	if len(m.sessions) != 0 {
 		snapshot := m.snapshotLocked()
@@ -388,6 +405,15 @@ func (m *Manager) Reconcile(ctx context.Context, sessions []HostSession) error {
 				if active.identity == identity {
 					viewers = append(viewers, active.viewer)
 					delete(m.active, client)
+					client.markViewerClosed()
+				}
+			}
+			for client, opening := range m.opening {
+				if opening.identity == identity {
+					if opening.viewer != nil {
+						viewers = append(viewers, opening.viewer)
+					}
+					delete(m.opening, client)
 					client.markViewerClosed()
 				}
 			}
@@ -507,7 +533,7 @@ func (m *Manager) Connected(client *Client) {
 }
 
 func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest) error {
-	identity := Identity{ID: request.ID, Generation: request.Generation}
+	identity := Identity(request)
 	m.mu.RLock()
 	session, ok := m.sessions[identity]
 	m.mu.RUnlock()
@@ -515,36 +541,100 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 		return errors.New("mirrored terminal ended")
 	}
 	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "preparing"})
-	viewer, err := m.viewers.Open(ctx, identity, request.Columns, request.Rows, func(output []byte) error {
-		return client.SendOutput(context.Background(), output)
+	var opening *openingViewer
+	prepared, err := m.viewers.Prepare(ctx, identity, func(output []byte) error {
+		return m.sendViewerOutput(client, opening, output)
 	})
 	if err != nil {
 		m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "open_failed", Code: "terminal_unavailable"})
 		return err
 	}
-	if m.acknowledger != nil {
-		if err := m.acknowledger.AcknowledgeSession(identity.ID, identity.Generation); err != nil {
-			_ = viewer.Close()
-			return err
-		}
+	geometry := prepared.Geometry()
+	opened := Opened{
+		ID:         identity.ID,
+		Generation: identity.Generation,
+		Columns:    geometry.Columns,
+		Rows:       geometry.Rows,
+	}
+	if err := ValidateServerFrame(TagOpened, opened); err != nil {
+		_ = prepared.Close()
+		m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "open_failed", Code: "terminal_unavailable"})
+		return err
 	}
 	m.mu.Lock()
 	_, connected := m.clients[client]
 	_, exists := m.active[client]
-	if !connected || exists {
+	_, alreadyOpening := m.opening[client]
+	if !connected || exists || alreadyOpening {
 		m.mu.Unlock()
-		_ = viewer.Close()
+		_ = prepared.Close()
 		if !connected {
 			return errors.New("mirror client disconnected")
+		}
+		if alreadyOpening {
+			return errors.New("a terminal is already opening")
 		}
 		return errors.New("a terminal is already open")
 	}
 	if _, stillMirrored := m.sessions[identity]; !stillMirrored {
 		m.mu.Unlock()
-		_ = viewer.Close()
+		_ = prepared.Close()
 		return errors.New("mirrored terminal ended")
 	}
-	m.active[client] = activeViewer{identity: identity, viewer: viewer}
+	opening = &openingViewer{identity: identity}
+	m.opening[client] = opening
+	if err := client.SendControl(ctx, TagOpened, opened); err != nil {
+		delete(m.opening, client)
+		m.mu.Unlock()
+		_ = prepared.Close()
+		return err
+	}
+	m.mu.Unlock()
+	viewer, err := prepared.Start()
+	if err != nil {
+		m.removeOpening(client, opening)
+		_ = prepared.Close()
+		m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "open_failed", Code: "terminal_unavailable"})
+		return err
+	}
+	m.mu.Lock()
+	if m.opening[client] != opening {
+		m.mu.Unlock()
+		_ = viewer.Close()
+		return errors.New("viewer opening was canceled")
+	}
+	opening.viewer = viewer
+	m.mu.Unlock()
+	if m.acknowledger != nil {
+		if err := m.acknowledger.AcknowledgeSession(identity.ID, identity.Generation); err != nil {
+			m.removeOpening(client, opening)
+			_ = viewer.Close()
+			return err
+		}
+	}
+	m.mu.Lock()
+	reserved := m.opening[client] == opening
+	if reserved {
+		delete(m.opening, client)
+	}
+	_, connected = m.clients[client]
+	_, exists = m.active[client]
+	_, stillMirrored := m.sessions[identity]
+	if !reserved || !connected || exists || !stillMirrored {
+		m.mu.Unlock()
+		_ = viewer.Close()
+		switch {
+		case !connected:
+			return errors.New("mirror client disconnected")
+		case exists:
+			return errors.New("a terminal is already open")
+		case !stillMirrored:
+			return errors.New("mirrored terminal ended")
+		default:
+			return errors.New("viewer opening was canceled")
+		}
+	}
+	m.active[client] = activeViewer{identity: identity, viewer: viewer, opening: opening}
 	m.mu.Unlock()
 	event := Event{Viewed: &ViewedEvent{
 		ID: identity.ID, Generation: identity.Generation, Activity: session.Activity,
@@ -567,11 +657,16 @@ func (m *Manager) Close(client *Client) error {
 	if ok {
 		delete(m.active, client)
 	}
+	opening := m.opening[client]
+	delete(m.opening, client)
 	m.mu.Unlock()
 	if ok {
 		err := active.viewer.Close()
 		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "closed"})
 		return err
+	}
+	if opening != nil && opening.viewer != nil {
+		return opening.viewer.Close()
 	}
 	return nil
 }
@@ -586,14 +681,19 @@ func (m *Manager) Input(client *Client, data []byte) error {
 	return active.viewer.Write(data)
 }
 
-func (m *Manager) Resize(client *Client, request ResizeRequest) error {
+func (m *Manager) sendViewerOutput(
+	client *Client,
+	opening *openingViewer,
+	output []byte,
+) error {
 	m.mu.RLock()
-	active, ok := m.active[client]
-	m.mu.RUnlock()
-	if !ok {
-		return errors.New("no terminal is open")
+	defer m.mu.RUnlock()
+	active := m.active[client]
+	if opening == nil ||
+		(m.opening[client] != opening && active.opening != opening) {
+		return nil
 	}
-	return active.viewer.Resize(request.Columns, request.Rows)
+	return client.SendOutput(context.Background(), output)
 }
 
 func (m *Manager) Disconnected(client *Client) {
@@ -603,11 +703,24 @@ func (m *Manager) Disconnected(client *Client) {
 	if ok {
 		delete(m.active, client)
 	}
+	opening := m.opening[client]
+	delete(m.opening, client)
 	m.mu.Unlock()
 	if ok {
 		_ = active.viewer.Close()
 		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "closed"})
 	}
+	if opening != nil && opening.viewer != nil {
+		_ = opening.viewer.Close()
+	}
+}
+
+func (m *Manager) removeOpening(client *Client, opening *openingViewer) {
+	m.mu.Lock()
+	if m.opening[client] == opening {
+		delete(m.opening, client)
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) failStart(err error) error {
@@ -712,10 +825,17 @@ func (m *Manager) clientsLocked() []*Client {
 }
 
 func (m *Manager) detachClientsLocked() []Viewer {
-	viewers := make([]Viewer, 0, len(m.active))
+	viewers := make([]Viewer, 0, len(m.active)+len(m.opening))
 	for client, active := range m.active {
 		viewers = append(viewers, active.viewer)
 		delete(m.active, client)
+	}
+	for client, opening := range m.opening {
+		if opening.viewer != nil {
+			viewers = append(viewers, opening.viewer)
+		}
+		delete(m.opening, client)
+		client.markViewerClosed()
 	}
 	clear(m.clients)
 	return viewers

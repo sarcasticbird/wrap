@@ -10,8 +10,6 @@ func TestControlPayloadRoundTripAndStrictDecode(t *testing.T) {
 	encoded, err := EncodeControl(TagOpen, OpenRequest{
 		ID:         "$7",
 		Generation: "0123456789abcdef0123456789abcdef",
-		Columns:    80,
-		Rows:       24,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -20,13 +18,13 @@ func TestControlPayloadRoundTripAndStrictDecode(t *testing.T) {
 	if err := DecodeControl(TagOpen, encoded, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "$7" || got.Columns != 80 || got.Rows != 24 {
+	if got.ID != "$7" || got.Generation != "0123456789abcdef0123456789abcdef" {
 		t.Fatalf("decoded open = %+v", got)
 	}
 
 	for _, malformed := range [][]byte{
-		[]byte(`{"id":"$7","generation":"0123456789abcdef0123456789abcdef","columns":80,"rows":24,"extra":true}`),
-		[]byte(`{"id":"$7","generation":"0123456789abcdef0123456789abcdef","columns":80,"rows":24}{}`),
+		[]byte(`{"id":"$7","generation":"0123456789abcdef0123456789abcdef","columns":80,"rows":24}`),
+		[]byte(`{"id":"$7","generation":"0123456789abcdef0123456789abcdef"}{}`),
 	} {
 		if err := DecodeControl(TagOpen, malformed, &got); err == nil {
 			t.Fatalf("accepted malformed payload %s", malformed)
@@ -38,19 +36,13 @@ func TestProtocolValidatesDirectionIdentityAndDimensions(t *testing.T) {
 	valid := OpenRequest{
 		ID:         "$7",
 		Generation: "0123456789abcdef0123456789abcdef",
-		Columns:    80,
-		Rows:       24,
 	}
 	if err := ValidateClientFrame(TagOpen, valid); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []OpenRequest{
-		{Generation: valid.Generation, Columns: 80, Rows: 24},
-		{ID: valid.ID, Columns: 80, Rows: 24},
-		{ID: valid.ID, Generation: valid.Generation, Columns: 1, Rows: 24},
-		{ID: valid.ID, Generation: valid.Generation, Columns: 501, Rows: 24},
-		{ID: valid.ID, Generation: valid.Generation, Columns: 80, Rows: 1},
-		{ID: valid.ID, Generation: valid.Generation, Columns: 80, Rows: 301},
+		{Generation: valid.Generation},
+		{ID: valid.ID},
 	} {
 		if err := ValidateClientFrame(TagOpen, bad); err == nil {
 			t.Fatalf("accepted invalid open %+v", bad)
@@ -61,6 +53,24 @@ func TestProtocolValidatesDirectionIdentityAndDimensions(t *testing.T) {
 	}
 	if err := ValidateServerFrame(TagInput, []byte("client only")); err == nil {
 		t.Fatal("accepted client-only input tag from a server")
+	}
+	opened := Opened{
+		ID: valid.ID, Generation: valid.Generation, Columns: 80, Rows: 24,
+	}
+	if err := ValidateServerFrame(TagOpened, opened); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []Opened{
+		{Generation: opened.Generation, Columns: 80, Rows: 24},
+		{ID: opened.ID, Columns: 80, Rows: 24},
+		{ID: opened.ID, Generation: opened.Generation, Columns: 1, Rows: 24},
+		{ID: opened.ID, Generation: opened.Generation, Columns: 501, Rows: 24},
+		{ID: opened.ID, Generation: opened.Generation, Columns: 80, Rows: 1},
+		{ID: opened.ID, Generation: opened.Generation, Columns: 80, Rows: 301},
+	} {
+		if err := ValidateServerFrame(TagOpened, bad); err == nil {
+			t.Fatalf("accepted invalid opened payload %+v", bad)
+		}
 	}
 }
 
@@ -93,8 +103,11 @@ func TestChunkOutputKeepsCiphertextWithinWireLimit(t *testing.T) {
 	}
 }
 
-func TestClientHelloRequiresVersionOne(t *testing.T) {
-	for _, version := range []int{0, 2} {
+func TestClientHelloRequiresVersionTwo(t *testing.T) {
+	if ProtocolVersion != 2 {
+		t.Fatalf("protocol version = %d, want 2", ProtocolVersion)
+	}
+	for _, version := range []int{0, 1, 3} {
 		payload, err := EncodeControl(TagClientHello, ClientHello{Version: version})
 		if err != nil {
 			t.Fatal(err)

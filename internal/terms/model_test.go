@@ -51,38 +51,59 @@ func (m *fakeMirror) Reconcile(_ context.Context, sessions []mirrorapi.HostSessi
 }
 
 type fakeBackend struct {
-	sessionsErr      error
-	displayed        string
-	displayErr       error
-	alerts           []bool
-	alertErr         error
-	rings            int
-	ringErr          error
-	killSuccessor    string
-	killID           string
-	killGeneration   string
-	switched, killed []string
-	newTermCalls     []string
-	newTermName      string
-	newTermErr       error
-	renameCalls      []string
-	renameName       string
-	renameErr        error
-	ensureCalls      []string
-	ensureErr        error
-	detached         bool
-	sessions         []tmux.SessionInfo
-	shutdownCalls    int
-	shutdownErr      error
-	pathByIdentity   map[string]string
-	pathErrIdentity  map[string]error
-	pathCalls        []string
-	scratchKillCalls int
+	sessionsErr          error
+	displayed            string
+	displayErr           error
+	alerts               []bool
+	alertErr             error
+	rings                int
+	ringErr              error
+	killSuccessor        string
+	killID               string
+	killGeneration       string
+	switched, killed     []string
+	newTermCalls         []string
+	newTermName          string
+	newTermErr           error
+	renameCalls          []string
+	renameName           string
+	renameErr            error
+	ensureCalls          []string
+	ensureErr            error
+	detached             bool
+	sessions             []tmux.SessionInfo
+	shutdownCalls        int
+	shutdownErr          error
+	pathByIdentity       map[string]string
+	pathErrIdentity      map[string]error
+	pathCalls            []string
+	scratchKillCalls     int
+	mirrorPaneEnsures    []int
+	mirrorPaneRestores   int
+	mirrorPaneEnsureErr  error
+	mirrorPaneRestoreErr error
+	mirrorCopies         []string
+	mirrorCopyErr        error
 }
 
 func (f *fakeBackend) ShutdownWorkspace() error {
 	f.shutdownCalls++
 	return f.shutdownErr
+}
+
+func (f *fakeBackend) EnsureMirrorPaneHeight(required int) error {
+	f.mirrorPaneEnsures = append(f.mirrorPaneEnsures, required)
+	return f.mirrorPaneEnsureErr
+}
+
+func (f *fakeBackend) RestoreMirrorPaneHeight() error {
+	f.mirrorPaneRestores++
+	return f.mirrorPaneRestoreErr
+}
+
+func (f *fakeBackend) CopyMirrorPairingURL(value string) error {
+	f.mirrorCopies = append(f.mirrorCopies, value)
+	return f.mirrorCopyErr
 }
 
 func (f *fakeBackend) Sessions() ([]tmux.SessionInfo, error) {
@@ -205,6 +226,7 @@ func TestMirrorEligibilityAndRowMarker(t *testing.T) {
 func TestMirrorKeyStartsEligibleRowAndOverlayBlocksOrdinaryKeys(t *testing.T) {
 	mirrors := newFakeMirror()
 	m := NewModel(&fakeBackend{}, Options{WS: "vb", Root: "/workspace", Mirrors: mirrors})
+	m.mirrorHelpOpen = true
 	var mod tea.Model = m
 	mod, _ = mod.Update(rowsMsg{sessions: []tmux.SessionInfo{{
 		ID: "$7", Generation: "generation-a", Name: "vb/api", Kind: tmux.SessionKindEntry,
@@ -213,6 +235,9 @@ func TestMirrorKeyStartsEligibleRowAndOverlayBlocksOrdinaryKeys(t *testing.T) {
 	got := mod.(Model)
 	if !got.mirrorOpen || cmd == nil {
 		t.Fatalf("mirror overlay/cmd = %v/%v", got.mirrorOpen, cmd)
+	}
+	if got.mirrorHelpOpen {
+		t.Fatal("new mirror overlay retained stale help state")
 	}
 	if msg := cmd(); msg == nil {
 		t.Fatal("mirror command returned no result message")
@@ -224,6 +249,180 @@ func TestMirrorKeyStartsEligibleRowAndOverlayBlocksOrdinaryKeys(t *testing.T) {
 	mod, _ = got.Update(key("j"))
 	if mod.(Model).Cursor != before {
 		t.Fatal("navigation escaped the mirror overlay")
+	}
+}
+
+func TestMirrorOverlayCopiesReadyPairingURLWithPrivacySafeStatus(t *testing.T) {
+	const pairingURL = "https://mirror.example/#k=TEST_ONLY_PAIRING_CREDENTIAL"
+	backend := &fakeBackend{}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorOpen = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{State: mirrorapi.StateReady, PairingURL: pairingURL}
+
+	mod, cmd := m.Update(key("c"))
+	if cmd == nil {
+		t.Fatal("ready mirror copy did not return a command")
+	}
+	if len(backend.mirrorCopies) != 0 {
+		t.Fatal("mirror copy ran synchronously")
+	}
+	result := cmd()
+	if len(backend.mirrorCopies) != 1 || backend.mirrorCopies[0] != pairingURL {
+		t.Fatalf("mirror copy calls = %q", backend.mirrorCopies)
+	}
+	mod, _ = mod.Update(result)
+	view := ansi.Strip(mod.(Model).mirrorView("Terminals"))
+	if !strings.Contains(view, "pairing URL copied") {
+		t.Fatalf("successful copy status missing:\n%s", view)
+	}
+	if strings.Count(view, "TEST_ONLY_PAIRING_CREDENTIAL") != 1 {
+		t.Fatalf("copy status duplicated pairing credential:\n%s", view)
+	}
+}
+
+func TestMirrorOverlayCopyFailureDoesNotExposeBackendError(t *testing.T) {
+	const pairingURL = "https://mirror.example/#k=TEST_ONLY_PAIRING_CREDENTIAL"
+	backend := &fakeBackend{mirrorCopyErr: errors.New("clipboard rejected TEST_ONLY_PRIVATE_ERROR")}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorOpen = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{State: mirrorapi.StateReady, PairingURL: pairingURL}
+
+	mod, cmd := m.Update(key("c"))
+	if cmd == nil {
+		t.Fatal("ready mirror copy did not return a command")
+	}
+	mod, _ = mod.Update(cmd())
+	view := ansi.Strip(mod.(Model).mirrorView("Terminals"))
+	if !strings.Contains(view, "pairing URL copy failed") {
+		t.Fatalf("failed copy status missing:\n%s", view)
+	}
+	if strings.Contains(view, "TEST_ONLY_PRIVATE_ERROR") {
+		t.Fatalf("copy status exposed backend error:\n%s", view)
+	}
+}
+
+func TestMirrorOverlayDoesNotCopyUnavailablePairingURL(t *testing.T) {
+	backend := &fakeBackend{}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorOpen = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{State: mirrorapi.StateStarting}
+
+	_, cmd := m.Update(key("c"))
+	if cmd != nil || len(backend.mirrorCopies) != 0 {
+		t.Fatalf("unavailable mirror copy command/calls = %v/%q", cmd, backend.mirrorCopies)
+	}
+}
+
+func TestMirrorOverlayCopyDoesNotInvalidatePendingRevoke(t *testing.T) {
+	const pairingURL = "https://mirror.example/#k=TEST_ONLY_PAIRING_CREDENTIAL"
+	backend := &fakeBackend{}
+	mirrors := newFakeMirror()
+	m := NewModel(backend, Options{WS: "vb", Mirrors: mirrors})
+	m.mirrorOpen = true
+	m.mirrorTarget = mirrorapi.Identity{ID: "$7", Generation: "generation-a"}
+	m.mirrorSnapshot = mirrorapi.Snapshot{
+		State:      mirrorapi.StateReady,
+		PairingURL: pairingURL,
+		Sessions: []mirrorapi.Session{{
+			ID: "$7", Generation: "generation-a", Name: "vb/api",
+		}},
+	}
+
+	mod, revokeCmd := m.Update(key("x"))
+	if revokeCmd == nil {
+		t.Fatal("ready mirror revoke did not return a command")
+	}
+	mod, copyCmd := mod.Update(key("c"))
+	if copyCmd == nil {
+		t.Fatal("ready mirror copy did not return a command while revoke was pending")
+	}
+	revokeResult := revokeCmd()
+	mod, _ = mod.Update(copyCmd())
+	mod, _ = mod.Update(revokeResult)
+	got := mod.(Model)
+	if got.mirrorOpen {
+		t.Fatal("copy completion invalidated the pending revoke result")
+	}
+}
+
+func TestMirrorOverlayIgnoresCopyCompletionAfterClose(t *testing.T) {
+	backend := &fakeBackend{}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorOpen = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{
+		State: mirrorapi.StateReady, PairingURL: "https://mirror.example/#k=old",
+	}
+
+	mod, copyCmd := m.Update(key("c"))
+	if copyCmd == nil {
+		t.Fatal("ready mirror copy did not return a command")
+	}
+	mod, _ = mod.Update(key("esc"))
+	mod, _ = mod.Update(copyCmd())
+	if got := mod.(Model).mirrorCopyStatus; got != "" {
+		t.Fatalf("late copy status after close = %q, want empty", got)
+	}
+}
+
+func TestMirrorOverlayIgnoresCopyCompletionAfterCredentialRotation(t *testing.T) {
+	backend := &fakeBackend{}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorOpen = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{
+		State: mirrorapi.StateReady, PairingURL: "https://mirror.example/#k=old",
+	}
+
+	mod, copyCmd := m.Update(key("c"))
+	if copyCmd == nil {
+		t.Fatal("ready mirror copy did not return a command")
+	}
+	rotated := mirrorapi.Snapshot{
+		State: mirrorapi.StateReady, PairingURL: "https://mirror.example/#k=new",
+	}
+	mod, _ = mod.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &rotated}, ok: true})
+	mod, _ = mod.Update(copyCmd())
+	if got := mod.(Model).mirrorCopyStatus; got != "" {
+		t.Fatalf("late copy status after rotation = %q, want empty", got)
+	}
+}
+
+func TestMirrorOverlayHelpShowsSafeDiagnosticsCommandAndClosesBeforeOverlay(t *testing.T) {
+	const pairingURL = "https://mirror.example/#k=TEST_ONLY_PAIRING_CREDENTIAL"
+	m := NewModel(&fakeBackend{}, Options{WS: "client's coop", Mirrors: newFakeMirror()})
+	m.Width = 90
+	m.mirrorOpen = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{State: mirrorapi.StateReady, PairingURL: pairingURL}
+
+	mod, _ := m.Update(key("h"))
+	got := mod.(Model)
+	view := ansi.Strip(got.mirrorView("Terminals"))
+	for _, want := range []string{
+		"Mirror help",
+		`workspace='client'\''s coop'`,
+		`state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}`,
+		`tail -n 40 "$state_home/wrap/$workspace/mirror.log"`,
+		"Credentials and terminal contents are omitted",
+		"h / esc close help",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("mirror help missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, pairingURL) {
+		t.Fatalf("mirror help retained pairing URL:\n%s", view)
+	}
+
+	mod, _ = got.Update(key("esc"))
+	got = mod.(Model)
+	if !got.mirrorOpen {
+		t.Fatal("first escape closed mirror overlay instead of help")
+	}
+	if view := ansi.Strip(got.mirrorView("Terminals")); !strings.Contains(view, pairingURL) {
+		t.Fatalf("closing mirror help did not restore pairing view:\n%s", view)
+	}
+	mod, _ = got.Update(key("esc"))
+	if mod.(Model).mirrorOpen {
+		t.Fatal("second escape did not close mirror overlay")
 	}
 }
 
@@ -290,6 +489,295 @@ func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
 	}
 	if strings.Contains(view, "QR-LINE") {
 		t.Fatalf("narrow mirror overlay rendered a partial QR:\n%s", view)
+	}
+	if !strings.Contains(view, "Enlarge pane to show QR") {
+		t.Fatalf("narrow mirror overlay omitted QR fallback hint:\n%s", view)
+	}
+}
+
+func TestMirrorOverlayNeverRendersPartialQR(t *testing.T) {
+	m := Model{
+		mirrorOpen:       true,
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: "https://q.example/#k=abc",
+			QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+			Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+		},
+	}
+	m.Width = 30
+	m.Height = 10
+	view := ansi.Strip(m.mirrorView("Terminals"))
+	if strings.Contains(view, "QR-LINE") {
+		t.Fatalf("medium mirror overlay rendered a partial QR:\n%s", view)
+	}
+	if !strings.Contains(view, "Enlarge pane to show QR") {
+		t.Fatalf("medium mirror overlay omitted QR fallback hint:\n%s", view)
+	}
+}
+
+func TestMirrorOverlayRendersCompleteQRAtExactCompositionHeight(t *testing.T) {
+	m := Model{
+		mirrorOpen:       true,
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: "https://q.example/#k=abc",
+			QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+			Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+		},
+	}
+	m.Width = 30
+	m.Height = 13
+	view := ansi.Strip(m.mirrorView("Terminals"))
+	for _, line := range []string{"QR-LINE-ONE", "QR-LINE-TWO", "QR-LINE-THREE", "QR-LINE-FOUR"} {
+		if strings.Count(view, line) != 1 {
+			t.Fatalf("exact-fit mirror overlay omitted or duplicated %q:\n%s", line, view)
+		}
+	}
+	lines := strings.Split(view, "\n")
+	if len(lines) != m.Height {
+		t.Fatalf("exact-fit mirror overlay lines = %d, want %d:\n%s", len(lines), m.Height, view)
+	}
+	if got := lines[len(lines)-1]; !strings.Contains(got, "x revoke") {
+		t.Fatalf("exact-fit mirror overlay footer = %q", got)
+	}
+}
+
+func TestMirrorReadySnapshotGrowsPaneOnceAndCloseRestoresIt(t *testing.T) {
+	backend := &fakeBackend{}
+	mirrors := newFakeMirror()
+	m := NewModel(backend, Options{WS: "vb", Mirrors: mirrors})
+	m.Width = 30
+	m.Height = 8
+	m.mirrorOpen = true
+	m.mirrorTargetName = "vb/api"
+	ready := mirrorapi.Snapshot{
+		State:      mirrorapi.StateReady,
+		PairingURL: "https://q.example/#k=abc",
+		QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+		Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+	}
+
+	mod, _ := m.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &ready}, ok: true})
+	got := mod.(Model)
+	if len(backend.mirrorPaneEnsures) != 1 || backend.mirrorPaneEnsures[0] != 13 {
+		t.Fatalf("pane growth requests = %v, want [13]", backend.mirrorPaneEnsures)
+	}
+	mod, _ = got.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &ready}, ok: true})
+	got = mod.(Model)
+	if len(backend.mirrorPaneEnsures) != 1 {
+		t.Fatalf("duplicate snapshot issued growth requests = %v", backend.mirrorPaneEnsures)
+	}
+	mod, _ = got.Update(tea.WindowSizeMsg{Width: 30, Height: 10})
+	got = mod.(Model)
+	if len(backend.mirrorPaneEnsures) != 2 || backend.mirrorPaneEnsures[1] != 13 {
+		t.Fatalf("confirmed short pane did not retry growth: %v", backend.mirrorPaneEnsures)
+	}
+
+	mod, _ = got.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got = mod.(Model)
+	if got.mirrorOpen || backend.mirrorPaneRestores != 1 {
+		t.Fatalf("close state/restores = %v/%d, want false/1", got.mirrorOpen, backend.mirrorPaneRestores)
+	}
+}
+
+func TestMirrorPaneRestoresWhenReadyQRDisappears(t *testing.T) {
+	backend := &fakeBackend{}
+	mirrors := newFakeMirror()
+	m := NewModel(backend, Options{WS: "vb", Mirrors: mirrors})
+	m.Width = 30
+	m.Height = 8
+	m.mirrorOpen = true
+	m.mirrorTargetName = "vb/api"
+	ready := mirrorapi.Snapshot{
+		State:      mirrorapi.StateReady,
+		PairingURL: "https://q.example/#k=abc",
+		QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+	}
+	mod, _ := m.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &ready}, ok: true})
+	stopped := mirrorapi.Snapshot{State: mirrorapi.StateStopped}
+	mod, _ = mod.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &stopped}, ok: true})
+	got := mod.(Model)
+	if backend.mirrorPaneRestores != 1 || got.mirrorPaneRestorePending {
+		t.Fatalf("QR loss restores/pending = %d/%v, want 1/false", backend.mirrorPaneRestores, got.mirrorPaneRestorePending)
+	}
+}
+
+func TestOpeningAlreadyReadyMirrorGrowsPane(t *testing.T) {
+	backend := &fakeBackend{}
+	mirrors := newFakeMirror()
+	mirrors.snapshot = mirrorapi.Snapshot{
+		State:      mirrorapi.StateReady,
+		PairingURL: "https://q.example/#k=abc",
+		QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+		Sessions: []mirrorapi.Session{{
+			ID: "$7", Generation: "generation-a", Name: "vb/api",
+		}},
+	}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: mirrors})
+	m.Width = 30
+	m.Height = 8
+	mod, _ := m.Update(rowsMsg{sessions: []tmux.SessionInfo{{
+		ID: "$7", Generation: "generation-a", Name: "vb/api", Kind: tmux.SessionKindEntry,
+	}}})
+	mod, cmd := mod.Update(key("m"))
+	if cmd != nil {
+		t.Fatal("opening an already mirrored row started another mirror operation")
+	}
+	if !mod.(Model).mirrorOpen {
+		t.Fatal("opening an already mirrored row did not open the pairing overlay")
+	}
+	if got := backend.mirrorPaneEnsures; len(got) != 1 || got[0] != 13 {
+		t.Fatalf("already-ready pane growth requests = %v, want [13]", got)
+	}
+}
+
+func TestMirrorRevokeRestoresPaneAndKeepsPrimaryErrorOnRestoreFailure(t *testing.T) {
+	backend := &fakeBackend{mirrorPaneRestoreErr: errors.New("restore unavailable")}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorOpen = true
+	m.mirrorHelpOpen = true
+	m.mirrorOperationID = 3
+	m.mirrorPaneResizeRequested = 13
+	m.mirrorPaneRestorePending = true
+	m.mirrorSnapshot = mirrorapi.Snapshot{State: mirrorapi.StateReady}
+
+	mod, _ := m.Update(mirrorOperationMsg{
+		operation: "revoke",
+		token:     3,
+		err:       errors.New("revoke failed"),
+	})
+	got := mod.(Model)
+	if got.mirrorOpen || got.mirrorHelpOpen || backend.mirrorPaneRestores != 1 {
+		t.Fatalf(
+			"revoke close/help/restores = %v/%v/%d, want false/false/1",
+			got.mirrorOpen,
+			got.mirrorHelpOpen,
+			backend.mirrorPaneRestores,
+		)
+	}
+	if got.mirrorSyncErr != "encrypted mirror operation failed; retry" {
+		t.Fatalf("primary mirror error = %q", got.mirrorSyncErr)
+	}
+	if got.mirrorLayoutErr != "pairing layout restore failed" || !got.mirrorPaneRestorePending {
+		t.Fatalf("restore failure state = %q pending=%v", got.mirrorLayoutErr, got.mirrorPaneRestorePending)
+	}
+}
+
+func TestMirrorPaneRestoreFailureAppearsInNormalView(t *testing.T) {
+	m := NewModel(&fakeBackend{}, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.Width = 80
+	m.Height = 8
+	m.mirrorSyncErr = "encrypted mirror operation failed; retry"
+	m.mirrorLayoutErr = "pairing layout restore failed"
+	m.mirrorPaneRestorePending = true
+
+	view := ansi.Strip(m.View())
+	for _, want := range []string{
+		"encrypted mirror operation failed; retry",
+		"pairing layout restore failed",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("normal view omitted pending mirror error %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestMirrorFooterClipsConcurrentErrorsToPaneWidth(t *testing.T) {
+	m := NewModel(&fakeBackend{}, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.Width = 55
+	m.Height = 8
+	m.mirrorSyncErr = "encrypted mirror operation failed; retry"
+	m.mirrorLayoutErr = "pairing layout restore failed"
+	m.mirrorPaneRestorePending = true
+
+	view := ansi.Strip(m.View())
+	for _, line := range strings.Split(view, "\n") {
+		if width := runewidth.StringWidth(line); width > m.Width {
+			t.Fatalf("normal view emitted %d-cell line in %d-cell pane:\n%s", width, m.Width, view)
+		}
+	}
+	if !strings.Contains(view, "pairing layout restore failed") {
+		t.Fatalf("clipped footer hid pending pane restoration failure:\n%s", view)
+	}
+}
+
+func TestMirrorPaneRestoreRetriesOnTick(t *testing.T) {
+	backend := &fakeBackend{}
+	m := NewModel(backend, Options{WS: "vb", Mirrors: newFakeMirror()})
+	m.mirrorPaneResizeRequested = 13
+	m.mirrorPaneRestorePending = true
+	m.mirrorLayoutErr = "pairing layout restore failed"
+
+	mod, _ := m.Update(tickMsg{})
+	got := mod.(Model)
+	if backend.mirrorPaneRestores != 1 {
+		t.Fatalf("periodic restore attempts = %d, want 1", backend.mirrorPaneRestores)
+	}
+	if got.mirrorPaneRestorePending || got.mirrorLayoutErr != "" || got.mirrorPaneResizeRequested != 0 {
+		t.Fatalf("successful restore state = pending:%v error:%q requested:%d",
+			got.mirrorPaneRestorePending, got.mirrorLayoutErr, got.mirrorPaneResizeRequested)
+	}
+}
+
+func TestMirrorPaneResizeFailureKeepsPrimaryMirrorError(t *testing.T) {
+	backend := &fakeBackend{mirrorPaneEnsureErr: errors.New("resize unavailable")}
+	mirrors := newFakeMirror()
+	m := NewModel(backend, Options{WS: "vb", Mirrors: mirrors})
+	m.Width = 30
+	m.Height = 8
+	m.mirrorOpen = true
+	m.mirrorTargetName = "vb/api"
+	m.mirrorSyncErr = "encrypted mirror session sync failed"
+	ready := mirrorapi.Snapshot{
+		State:      mirrorapi.StateReady,
+		PairingURL: "https://q.example/#k=abc",
+		QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+	}
+
+	mod, _ := m.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &ready}, ok: true})
+	got := mod.(Model)
+	if got.mirrorSyncErr != "encrypted mirror session sync failed" {
+		t.Fatalf("primary mirror error = %q", got.mirrorSyncErr)
+	}
+	if got.mirrorLayoutErr == "" {
+		t.Fatal("pane resize failure was not retained as a layout error")
+	}
+	if !strings.Contains(ansi.Strip(got.mirrorView("Terminals")), "Enlarge pane to show QR") {
+		t.Fatal("pane resize failure removed the manual QR fallback")
+	}
+}
+
+func TestMirrorPaneGrowthErrorClearsAfterManualEnlargement(t *testing.T) {
+	backend := &fakeBackend{}
+	mirrors := newFakeMirror()
+	m := NewModel(backend, Options{WS: "vb", Mirrors: mirrors})
+	m.Width = 30
+	m.Height = 8
+	m.mirrorOpen = true
+	m.mirrorTargetName = "vb/api"
+	ready := mirrorapi.Snapshot{
+		State:      mirrorapi.StateReady,
+		PairingURL: "https://q.example/#k=abc",
+		QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+	}
+	mod, _ := m.Update(mirrorEventMsg{event: mirrorapi.Event{Snapshot: &ready}, ok: true})
+	backend.mirrorPaneEnsureErr = errors.New("retry unavailable")
+	mod, _ = mod.Update(tea.WindowSizeMsg{Width: 30, Height: 10})
+	got := mod.(Model)
+	if got.mirrorLayoutErr == "" || !got.mirrorPaneRestorePending {
+		t.Fatalf("retry failure state = %q pending=%v", got.mirrorLayoutErr, got.mirrorPaneRestorePending)
+	}
+
+	mod, _ = got.Update(tea.WindowSizeMsg{Width: 30, Height: 13})
+	got = mod.(Model)
+	if got.mirrorLayoutErr != "" {
+		t.Fatalf("manual fit retained stale growth error %q", got.mirrorLayoutErr)
+	}
+	if !got.mirrorPaneRestorePending {
+		t.Fatal("manual fit lost the original-height restore obligation")
 	}
 }
 
@@ -369,8 +857,12 @@ func TestMirrorOverlayOmitsQRThatCannotFitScrollViewport(t *testing.T) {
 	}
 	m.Width = 30
 	m.Height = 4
-	if content := strings.Join(m.mirrorContentLines(), "\n"); strings.Contains(content, "QR-LINE") {
+	content := strings.Join(m.mirrorContentLines(), "\n")
+	if strings.Contains(content, "QR-LINE") {
 		t.Fatalf("scroll content included an unusable partial QR:\n%s", content)
+	}
+	if !strings.Contains(content, "Enlarge pane to show QR") {
+		t.Fatalf("short mirror content omitted QR fallback hint:\n%s", content)
 	}
 }
 

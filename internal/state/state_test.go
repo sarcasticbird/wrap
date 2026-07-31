@@ -322,6 +322,12 @@ func TestChromeBuildIncludesMirrorManager(t *testing.T) {
 	}
 }
 
+func TestChromeBuildIncludesMobileMirrorAndPairingLayout(t *testing.T) {
+	if ChromeBuild < 15 {
+		t.Fatalf("ChromeBuild = %d, want at least 15 so existing terms panes restart with mobile mirror assets and pairing layout management", ChromeBuild)
+	}
+}
+
 func TestChromeParamsRoundTrip(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	p := ChromeParams{

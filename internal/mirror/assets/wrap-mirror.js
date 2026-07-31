@@ -1,8 +1,8 @@
 import { Terminal } from "/assets/third_party/xterm/xterm.mjs";
-import { FitAddon } from "/assets/third_party/xterm/addon-fit.mjs";
 import "/assets/wrap-mirror-state.js";
+import "/assets/wrap-mirror-viewport.js";
 
-const STORAGE_KEY = "wrap.mirror.v1.secret";
+const STORAGE_KEY = "wrap.mirror.v2.secret";
 const MAX_WIRE_MESSAGE = 128 * 1024;
 const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17;
 const TAG = Object.freeze({
@@ -13,7 +13,7 @@ const TAG = Object.freeze({
   close: 0x05,
   input: 0x06,
   output: 0x07,
-  resize: 0x08,
+  opened: 0x08,
   revoked: 0x09,
   shutdown: 0x0a,
   error: 0x0b,
@@ -114,7 +114,7 @@ async function cryptoSelfTest() {
     secretBytes,
     serverNonce,
     clientNonce,
-    "wrap-mirror/v1/c2s",
+    "wrap-mirror/v2/c2s",
   );
   const raw = new Uint8Array(await crypto.subtle.exportKey(
     "raw",
@@ -123,7 +123,7 @@ async function cryptoSelfTest() {
         name: "HKDF",
         hash: "SHA-256",
         salt: concat(serverNonce, clientNonce),
-        info: encoder.encode("wrap-mirror/v1/s2c"),
+        info: encoder.encode("wrap-mirror/v2/s2c"),
       },
       await crypto.subtle.importKey("raw", secretBytes, "HKDF", false, ["deriveKey"]),
       { name: "AES-GCM", length: 256 },
@@ -131,11 +131,11 @@ async function cryptoSelfTest() {
       ["encrypt", "decrypt"],
     ),
   ));
-  if (toHex(raw) !== "7d0a505e5c8410cd4e19fa87368ef82168f2533c4757b57c56a1d6ae5b3b3120") {
+  if (toHex(raw) !== "a7574bd01ad71ecf2d2339aa9a417029f860d957836d8883a2307599d9f51161") {
     throw new Error("key derivation self-test failed");
   }
-  const hello = await encryptFrame(key, 0n, TAG.hello, encoder.encode('{"version":1}'));
-  if (toHex(hello) !== "b93c018983645fd740b104f3de1f1f2b17c8b24b171062cc1c7845c4f47c") {
+  const hello = await encryptFrame(key, 0n, TAG.hello, encoder.encode('{"version":2}'));
+  if (toHex(hello) !== "49ac75e8504742f9e9aef44d69fefb855a3694abe34934356b6b0b8d8ffb") {
     throw new Error("encryption self-test failed");
   }
   secretBytes.fill(0);
@@ -186,17 +186,26 @@ const elements = {
   sessionCount: document.querySelector("#session-count"),
   terminalView: document.querySelector("#terminal-view"),
   terminalTitle: document.querySelector("#terminal-title"),
+  terminalViewport: document.querySelector("#terminal-viewport"),
+  terminalLoading: document.querySelector("#terminal-loading"),
+  terminalSpacer: document.querySelector("#terminal-spacer"),
+  terminalSurface: document.querySelector("#terminal-surface"),
   terminal: document.querySelector("#terminal"),
+  pinchScale: document.querySelector("#pinch-scale"),
   back: document.querySelector("#back-button"),
   close: document.querySelector("#close-button"),
   toolbar: document.querySelector("#toolbar"),
+  keyboardToggle: document.querySelector("#keyboard-toggle"),
+  fit: document.querySelector("#fit-button"),
 };
 
+const BASE_TERMINAL_FONT_SIZE = 14;
+const MAX_VIEWPORT_MEASURE_ATTEMPTS = 60;
 const terminal = new Terminal({
   convertEol: false,
   cursorBlink: true,
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-  fontSize: 14,
+  fontSize: BASE_TERMINAL_FONT_SIZE,
   scrollback: 5000,
   theme: {
     background: "#080a09",
@@ -205,20 +214,72 @@ const terminal = new Terminal({
     selectionBackground: "#34402f",
   },
 });
-const fitAddon = new FitAddon();
-terminal.loadAddon(fitAddon);
-terminal.open(elements.terminal);
 
 let connection = null;
 const closeState = globalThis.WrapMirrorCloseState;
 const viewerState = closeState.create();
+const viewportReducer = globalThis.WrapMirrorViewportState;
+const terminalViewportState = viewportReducer.create();
 let reconnectAttempt = 0;
 let reconnectTimer = 0;
 let stopped = false;
 let controlSticky = false;
-let resizeTimer = 0;
+let geometryAccepted = false;
+let viewportMeasureFrame = 0;
+let viewportMeasureAttempts = 0;
+let pendingTerminalFit = false;
+let typingMode = false;
+const viewportPointers = new Map();
+let pinchGesture = null;
+let pinchPreview = null;
+let pinchPreviewFrame = 0;
+let pendingPinchInput = null;
+let pinchPreviewTarget = null;
+let pinchScaleTimer = 0;
+let terminalMounted = false;
+
+function ensureTerminalMounted() {
+  if (terminalMounted) {
+    return;
+  }
+  terminal.open(elements.terminal);
+  terminalMounted = true;
+  terminal.textarea?.setAttribute("inputmode", typingMode ? "text" : "none");
+}
+
+function cancelTerminalMeasurement() {
+  if (viewportMeasureFrame) {
+    cancelAnimationFrame(viewportMeasureFrame);
+    viewportMeasureFrame = 0;
+  }
+}
+
+function setTerminalDisplayPending(message) {
+  elements.terminalLoading.textContent = message;
+  elements.terminalView.classList.add("display-pending");
+  elements.terminalView.classList.remove("display-error");
+}
+
+function revealTerminalDisplay() {
+  elements.terminalView.classList.remove("display-pending", "display-error");
+}
+
+function showTerminalDisplayError() {
+  setTerminalDisplayPending(
+    "Terminal display unavailable — press Fit to retry or return to Terminals. " +
+    "Code: terminal_display_unavailable",
+  );
+  elements.terminalView.classList.add("display-error");
+}
 
 function showOnly(view) {
+  if (view !== "terminal") {
+    setTypingMode(false);
+    clearViewportGestures();
+    cancelTerminalMeasurement();
+    revealTerminalDisplay();
+  }
+  document.body.classList.toggle("terminal-active", view === "terminal");
   elements.message.classList.toggle("hidden", view !== "message");
   elements.list.classList.toggle("hidden", view !== "list");
   elements.terminalView.classList.toggle("hidden", view !== "terminal");
@@ -235,6 +296,332 @@ function showMessage(title, detail, status = "Offline") {
 function setOnline() {
   elements.connection.textContent = "Encrypted";
   elements.connection.classList.add("online");
+}
+
+function resetTerminalViewport() {
+  cancelTerminalMeasurement();
+  viewportMeasureAttempts = 0;
+  pendingTerminalFit = false;
+  viewportReducer.reset(terminalViewportState);
+  elements.terminalSpacer.removeAttribute("style");
+  elements.terminalSurface.removeAttribute("style");
+  elements.terminal.removeAttribute("style");
+  elements.terminalViewport.scrollLeft = 0;
+  elements.terminalViewport.scrollTop = 0;
+  updateViewportControls();
+}
+
+function restoreBaseTerminalMetrics() {
+  terminal.options.fontSize = BASE_TERMINAL_FONT_SIZE;
+  terminal.refresh(0, terminal.rows - 1);
+}
+
+function resizeTerminalToHostGeometry(opened) {
+  const probeRows = opened.rows === 2 ? 3 : opened.rows - 1;
+  terminal.resize(opened.columns, probeRows);
+  terminal.resize(opened.columns, opened.rows);
+}
+
+function applyTerminalBox(layout) {
+  elements.terminalSurface.style.width = `${layout.width}px`;
+  elements.terminalSurface.style.height = `${layout.height}px`;
+  elements.terminal.style.width = `${layout.width}px`;
+  elements.terminal.style.height = `${layout.height}px`;
+  elements.terminalSpacer.style.width = `${layout.width}px`;
+  elements.terminalSpacer.style.height = `${layout.height}px`;
+}
+
+function applyTerminalViewport() {
+  const layout = viewportReducer.layout(terminalViewportState);
+  if (!layout) {
+    return;
+  }
+  terminal.options.fontSize = viewportReducer.fontSize(
+    terminalViewportState,
+    BASE_TERMINAL_FONT_SIZE,
+  );
+  applyTerminalBox(layout);
+  terminal.refresh(0, terminal.rows - 1);
+  updateViewportControls();
+}
+
+function updateViewportControls() {
+  elements.fit.setAttribute("aria-pressed", String(terminalViewportState.mode === "fit"));
+}
+
+function hidePinchScale() {
+  if (pinchScaleTimer) {
+    clearTimeout(pinchScaleTimer);
+    pinchScaleTimer = 0;
+  }
+  elements.pinchScale.classList.add("hidden");
+}
+
+function showPinchScale(scale) {
+  if (pinchScaleTimer) {
+    clearTimeout(pinchScaleTimer);
+    pinchScaleTimer = 0;
+  }
+  elements.pinchScale.textContent = `${Math.round(scale * 100)}%`;
+  elements.pinchScale.classList.remove("hidden");
+}
+
+function finishPinchScale() {
+  if (pinchScaleTimer) {
+    clearTimeout(pinchScaleTimer);
+  }
+  pinchScaleTimer = setTimeout(hidePinchScale, 500);
+}
+
+function clearPinchPreviewStyles() {
+  pinchPreviewTarget?.style.removeProperty("transform");
+  pinchPreviewTarget?.style.removeProperty("transform-origin");
+  pinchPreviewTarget?.style.removeProperty("will-change");
+  pinchPreviewTarget = null;
+}
+
+function restoreCommittedPinchPreview() {
+  pinchPreview = null;
+  clearPinchPreviewStyles();
+  const layout = viewportReducer.layout(terminalViewportState);
+  if (layout) {
+    applyTerminalBox(layout);
+  }
+  if (pinchGesture) {
+    elements.terminalViewport.scrollLeft = pinchGesture.scrollLeft;
+    elements.terminalViewport.scrollTop = pinchGesture.scrollTop;
+    showPinchScale(terminalViewportState.scale);
+  }
+}
+
+function discardPinchPreview() {
+  if (pinchPreviewFrame) {
+    cancelAnimationFrame(pinchPreviewFrame);
+    pinchPreviewFrame = 0;
+  }
+  pendingPinchInput = null;
+  restoreCommittedPinchPreview();
+}
+
+function applyPinchPreview(preview) {
+  if (!pinchGesture) {
+    return;
+  }
+  if (!preview) {
+    restoreCommittedPinchPreview();
+    return;
+  }
+  const terminalScreen = terminal.element?.querySelector(".xterm-screen");
+  if (!terminalScreen) {
+    return;
+  }
+  pinchPreview = preview;
+  pinchPreviewTarget = terminalScreen;
+  const ratio = preview.scale / pinchGesture.scale;
+  terminalScreen.style.transformOrigin = "top left";
+  terminalScreen.style.willChange = "transform";
+  terminalScreen.style.transform = `scale(${ratio})`;
+  applyTerminalBox(preview);
+  elements.terminalViewport.scrollLeft = preview.scrollLeft;
+  elements.terminalViewport.scrollTop = preview.scrollTop;
+  showPinchScale(preview.scale);
+}
+
+function calculatePinchPreview(input) {
+  if (!pinchGesture || !input) {
+    return null;
+  }
+  return viewportReducer.previewPinch(terminalViewportState, pinchGesture, input);
+}
+
+function schedulePinchPreview(input) {
+  pendingPinchInput = input;
+  if (pinchPreviewFrame) {
+    return;
+  }
+  pinchPreviewFrame = requestAnimationFrame(() => {
+    pinchPreviewFrame = 0;
+    const latestInput = pendingPinchInput;
+    pendingPinchInput = null;
+    const preview = calculatePinchPreview(latestInput);
+    applyPinchPreview(preview);
+  });
+}
+
+function flushPinchPreview() {
+  if (pinchPreviewFrame) {
+    cancelAnimationFrame(pinchPreviewFrame);
+    pinchPreviewFrame = 0;
+  }
+  const latestInput = pendingPinchInput;
+  pendingPinchInput = null;
+  if (latestInput) {
+    const preview = calculatePinchPreview(latestInput);
+    applyPinchPreview(preview);
+  }
+}
+
+function commitPinchPreview() {
+  flushPinchPreview();
+  if (!pinchPreview) {
+    discardPinchPreview();
+    return;
+  }
+  const scrollLeft = pinchPreview.scrollLeft;
+  const scrollTop = pinchPreview.scrollTop;
+  const committed = viewportReducer.commitPinch(terminalViewportState, pinchPreview);
+  if (!committed) {
+    discardPinchPreview();
+    return;
+  }
+  pinchPreview = null;
+  clearPinchPreviewStyles();
+  applyTerminalViewport();
+  elements.terminalViewport.scrollLeft = scrollLeft;
+  elements.terminalViewport.scrollTop = scrollTop;
+}
+
+function clearViewportGestures() {
+  discardPinchPreview();
+  viewportPointers.clear();
+  pinchGesture = null;
+  hidePinchScale();
+}
+
+function fitTerminalViewport() {
+  clearViewportGestures();
+  if (!viewportReducer.layout(terminalViewportState)) {
+    pendingTerminalFit = true;
+    if (geometryAccepted) {
+      viewportMeasureAttempts = 0;
+      setTerminalDisplayPending("Opening terminal…");
+      scheduleTerminalMeasurement();
+    }
+    return;
+  }
+  pendingTerminalFit = false;
+  viewportReducer.fit(terminalViewportState);
+  applyTerminalViewport();
+}
+
+function isCoarsePointer() {
+  return Boolean(globalThis.matchMedia?.("(any-pointer: coarse)").matches);
+}
+
+function isCoarsePointerEvent(event) {
+  if (event.pointerType) {
+    return event.pointerType === "touch" || event.pointerType === "pen";
+  }
+  return isCoarsePointer();
+}
+
+function setTypingMode(value) {
+  typingMode = Boolean(value);
+  elements.terminalView.classList.toggle("typing", typingMode);
+  elements.keyboardToggle.textContent = typingMode ? "Hide keyboard" : "Keyboard";
+  elements.keyboardToggle.setAttribute("aria-pressed", String(typingMode));
+  terminal.textarea?.setAttribute("inputmode", typingMode ? "text" : "none");
+  if (!terminalMounted) {
+    return;
+  }
+  if (typingMode) {
+    terminal.blur();
+    terminal.focus();
+  } else {
+    terminal.blur();
+    terminal.textarea?.blur();
+  }
+}
+
+function updateVisualViewport() {
+  const height = globalThis.visualViewport?.height || globalThis.innerHeight;
+  const width = globalThis.visualViewport?.width || globalThis.innerWidth;
+  const offsetTop = globalThis.visualViewport?.offsetTop || 0;
+  const offsetLeft = globalThis.visualViewport?.offsetLeft || 0;
+  document.documentElement.style.setProperty("--mirror-viewport-height", `${height}px`);
+  document.documentElement.style.setProperty("--mirror-viewport-width", `${width}px`);
+  document.documentElement.style.setProperty("--mirror-viewport-top", `${offsetTop}px`);
+  document.documentElement.style.setProperty("--mirror-viewport-left", `${offsetLeft}px`);
+  elements.terminalView.classList.toggle("compact", height < 360);
+  refitTerminalViewport();
+}
+
+function scheduleTerminalMeasurement() {
+  cancelTerminalMeasurement();
+  viewportMeasureFrame = requestAnimationFrame(() => {
+    viewportMeasureFrame = 0;
+    if (
+      !geometryAccepted ||
+      elements.terminalView.classList.contains("hidden")
+    ) {
+      return;
+    }
+    const screen = terminal.element?.querySelector(".xterm-screen");
+    const rectangle = screen?.getBoundingClientRect();
+    if (
+      !rectangle ||
+      rectangle.width <= 0 ||
+      rectangle.height <= 0 ||
+      elements.terminalViewport.clientWidth <= 0
+    ) {
+      viewportMeasureAttempts += 1;
+      if (viewportMeasureAttempts >= MAX_VIEWPORT_MEASURE_ATTEMPTS) {
+        showTerminalDisplayError();
+        return;
+      }
+      scheduleTerminalMeasurement();
+      return;
+    }
+    const style = getComputedStyle(elements.terminal);
+    const scrollbar = terminal.element?.querySelector(".xterm-viewport");
+    const scrollbarWidth = scrollbar
+      ? Math.max(0, scrollbar.offsetWidth - scrollbar.clientWidth)
+      : 0;
+    const horizontalPadding = (Number.parseFloat(style.paddingLeft) || 0) +
+      (Number.parseFloat(style.paddingRight) || 0);
+    const verticalPadding = (Number.parseFloat(style.paddingTop) || 0) +
+      (Number.parseFloat(style.paddingBottom) || 0);
+    const surface = {
+      width: Math.ceil(rectangle.width),
+      height: Math.ceil(rectangle.height),
+      fixedWidth: Math.ceil(horizontalPadding + scrollbarWidth),
+      fixedHeight: Math.ceil(verticalPadding),
+      fixedLeft: Number.parseFloat(style.paddingLeft) || 0,
+      fixedTop: Number.parseFloat(style.paddingTop) || 0,
+    };
+    viewportReducer.measure(
+      terminalViewportState,
+      surface,
+      elements.terminalViewport.clientWidth,
+    );
+    if (pendingTerminalFit) {
+      pendingTerminalFit = false;
+      viewportReducer.fit(terminalViewportState);
+    } else {
+      viewportReducer.readable(terminalViewportState);
+    }
+    applyTerminalViewport();
+    revealTerminalDisplay();
+  });
+}
+
+function refitTerminalViewport() {
+  if (pinchGesture) {
+    clearViewportGestures();
+  }
+  const viewportWidth = elements.terminalViewport.clientWidth;
+  if (
+    elements.terminalView.classList.contains("hidden") ||
+    viewportWidth <= 0 ||
+    !viewportReducer.layout(terminalViewportState)
+  ) {
+    return;
+  }
+  viewportReducer.resize(
+    terminalViewportState,
+    viewportWidth,
+  );
+  applyTerminalViewport();
 }
 
 function renderSessions(nextSessions) {
@@ -271,6 +658,8 @@ function renderSessions(nextSessions) {
     elements.sessionList.append(button);
   }
   viewerState.current = null;
+  geometryAccepted = false;
+  resetTerminalViewport();
   setOnline();
   showOnly("list");
 }
@@ -281,10 +670,14 @@ const viewerEffects = Object.freeze({
   validateSessionList,
   render: (nextSessions) => renderSessions(nextSessions),
   ended: () => {
+    geometryAccepted = false;
+    resetTerminalViewport();
     showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
     setTimeout(() => renderSessions(viewerState.sessions), 700);
   },
   error: (problem, target) => {
+    geometryAccepted = false;
+    resetTerminalViewport();
     if (problem.retry === false) {
       stopped = true;
     }
@@ -328,34 +721,66 @@ function validateSessionList(value) {
   return value.sessions;
 }
 
-function dimensions() {
-  fitAddon.fit();
-  return {
-    columns: Math.max(2, Math.min(500, terminal.cols)),
-    rows: Math.max(2, Math.min(300, terminal.rows)),
-  };
+function validateOpened(value) {
+  if (
+    !value ||
+    typeof value.id !== "string" ||
+    typeof value.generation !== "string" ||
+    !Number.isInteger(value.columns) ||
+    value.columns < 2 ||
+    value.columns > 500 ||
+    !Number.isInteger(value.rows) ||
+    value.rows < 2 ||
+    value.rows > 300
+  ) {
+    throw new Error("invalid opened terminal");
+  }
+  return value;
+}
+
+function focusTerminalForPhysicalKeyboard() {
+  if (
+    viewerState.current &&
+    globalThis.matchMedia?.("(pointer: fine)").matches
+  ) {
+    setTypingMode(true);
+  }
 }
 
 function openSession(session) {
   if (!connection?.authenticated || !closeState.open(viewerState, session)) {
     return;
   }
-  terminal.reset();
+  geometryAccepted = false;
+  resetTerminalViewport();
+  setTypingMode(false);
   elements.terminalTitle.textContent = session.name;
+  setTerminalDisplayPending("Opening terminal…");
   showOnly("terminal");
-  requestAnimationFrame(() => {
-    const size = dimensions();
-    sendJSON(TAG.open, {
-      id: session.id,
-      generation: session.generation,
-      ...size,
-    });
-    terminal.focus();
+  try {
+    ensureTerminalMounted();
+    terminal.reset();
+    restoreBaseTerminalMetrics();
+  } catch {
+    closeState.reset(viewerState);
+    showMessage(
+      "Terminal display unavailable",
+      "Reload this page to retry. Code: terminal_display_unavailable",
+      "Encrypted",
+    );
+    setTimeout(() => renderSessions(viewerState.sessions), 1200);
+    return;
+  }
+  sendJSON(TAG.open, {
+    id: session.id,
+    generation: session.generation,
   });
 }
 
 function closeSession() {
   if (connection?.authenticated && closeState.beginClose(viewerState)) {
+    geometryAccepted = false;
+    cancelTerminalMeasurement();
     queueFrame(TAG.close, new Uint8Array());
     showMessage("Closing terminal…", "Waiting for the encrypted host acknowledgement.", "Encrypted");
   }
@@ -395,17 +820,17 @@ async function receiveMessage(target, data) {
       secret,
       serverNonce,
       clientNonce,
-      "wrap-mirror/v1/c2s",
+      "wrap-mirror/v2/c2s",
     );
     target.receiveKey = await deriveDirectionalKey(
       secret,
       serverNonce,
       clientNonce,
-      "wrap-mirror/v1/s2c",
+      "wrap-mirror/v2/s2c",
     );
     target.socket.send(clientNonce);
     await target.sendChain;
-    queueFrame(TAG.hello, encoder.encode('{"version":1}'));
+    queueFrame(TAG.hello, encoder.encode('{"version":2}'));
     serverNonce.fill(0);
     clientNonce.fill(0);
     return;
@@ -424,6 +849,31 @@ async function receiveMessage(target, data) {
       reconnectAttempt = 0;
       renderSessions(validateSessionList(parseJSON(frame.payload)));
       break;
+    case TAG.opened: {
+      if (!target.authenticated || geometryAccepted) {
+        throw new Error("unexpected opened terminal");
+      }
+      const opened = validateOpened(parseJSON(frame.payload));
+      const requested = viewerState.current || viewerState.closing;
+      if (
+        !requested ||
+        opened.id !== requested.id ||
+        opened.generation !== requested.generation
+      ) {
+        throw new Error("opened terminal identity mismatch");
+      }
+      if (viewerState.closing) {
+        geometryAccepted = false;
+        cancelTerminalMeasurement();
+        break;
+      }
+      resizeTerminalToHostGeometry(opened);
+      viewportReducer.open(terminalViewportState, opened);
+      geometryAccepted = true;
+      scheduleTerminalMeasurement();
+      focusTerminalForPhysicalKeyboard();
+      break;
+    }
     case TAG.output:
       if (!target.authenticated) {
         throw new Error("output without open terminal");
@@ -431,7 +881,7 @@ async function receiveMessage(target, data) {
       if (viewerState.closing) {
         break;
       }
-      if (!viewerState.current) {
+      if (!viewerState.current || !geometryAccepted) {
         throw new Error("output without open terminal");
       }
       terminal.write(frame.payload);
@@ -515,6 +965,8 @@ function connect() {
     }
     connection = null;
     closeState.reset(viewerState);
+    geometryAccepted = false;
+    resetTerminalViewport();
     if (event.code === 1008) {
       stopped = true;
       sessionStorage.removeItem(STORAGE_KEY);
@@ -598,21 +1050,182 @@ elements.toolbar.addEventListener("click", (event) => {
     terminal.focus();
   }
 });
-elements.back.addEventListener("click", closeSession);
-elements.close.addEventListener("click", closeSession);
+elements.keyboardToggle.addEventListener("pointerdown", (event) => event.preventDefault());
+elements.keyboardToggle.addEventListener("click", () => {
+  if (viewerState.current) {
+    setTypingMode(!typingMode);
+  }
+});
+elements.fit.addEventListener("pointerdown", (event) => event.preventDefault());
+elements.fit.addEventListener("click", fitTerminalViewport);
 
-function scheduleResize() {
-  window.clearTimeout(resizeTimer);
-  resizeTimer = window.setTimeout(() => {
-    if (!viewerState.current || !connection?.authenticated) {
-      return;
-    }
-    sendJSON(TAG.resize, dimensions());
-  }, 100);
+function currentPinchInput() {
+  if (viewportPointers.size !== 2) {
+    return null;
+  }
+  const [first, second] = [...viewportPointers.values()];
+  const rectangle = elements.terminalViewport.getBoundingClientRect();
+  return {
+    distance: Math.hypot(second.x - first.x, second.y - first.y),
+    midpointX: (first.x + second.x) / 2 - rectangle.left,
+    midpointY: (first.y + second.y) / 2 - rectangle.top,
+  };
 }
 
-window.addEventListener("resize", scheduleResize);
-globalThis.visualViewport?.addEventListener("resize", scheduleResize);
+function beginPinchGesture() {
+  const input = currentPinchInput();
+  if (!input) {
+    return;
+  }
+  pinchGesture = viewportReducer.beginPinch(terminalViewportState, {
+    ...input,
+    scrollLeft: elements.terminalViewport.scrollLeft,
+    scrollTop: elements.terminalViewport.scrollTop,
+  });
+  if (pinchGesture) {
+    for (const pointer of viewportPointers.values()) {
+      pointer.moved = true;
+    }
+    showPinchScale(terminalViewportState.scale);
+  }
+}
+
+elements.terminalViewport.addEventListener("pointerdown", (event) => {
+  if (!isCoarsePointerEvent(event) || viewportPointers.size >= 2) {
+    return;
+  }
+  if (event.cancelable) {
+    event.preventDefault();
+  }
+  viewportPointers.set(event.pointerId, {
+    x: event.clientX,
+    y: event.clientY,
+    startX: event.clientX,
+    startY: event.clientY,
+    scrollLeft: elements.terminalViewport.scrollLeft,
+    scrollTop: elements.terminalViewport.scrollTop,
+    scrollLineOffset: 0,
+    scrollTargetViewportY: terminal.buffer.active.viewportY,
+    moved: false,
+  });
+  if (viewportPointers.size === 2) {
+    beginPinchGesture();
+  }
+});
+elements.terminalViewport.addEventListener("pointermove", (event) => {
+  const pointer = viewportPointers.get(event.pointerId);
+  if (!pointer) {
+    return;
+  }
+  pointer.x = event.clientX;
+  pointer.y = event.clientY;
+  if (Math.hypot(pointer.x - pointer.startX, pointer.y - pointer.startY) > 10) {
+    pointer.moved = true;
+  }
+  if (viewportPointers.size === 1) {
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    if (pointer.moved) {
+      elements.terminalViewport.scrollLeft =
+        pointer.scrollLeft - (pointer.x - pointer.startX);
+      const vertical = viewportReducer.panVertical(terminalViewportState, {
+        scrollTop: pointer.scrollTop,
+        scrollHeight: elements.terminalViewport.scrollHeight,
+        clientHeight: elements.terminalViewport.clientHeight,
+        deltaY: pointer.y - pointer.startY,
+      });
+      if (vertical) {
+        elements.terminalViewport.scrollTop = vertical.scrollTop;
+        const lineDelta = vertical.lineOffset - pointer.scrollLineOffset;
+        if (lineDelta !== 0) {
+          const activeBuffer = terminal.buffer.active;
+          const tracked = viewportReducer.trackLineOffset(
+            pointer.scrollLineOffset,
+            pointer.scrollTargetViewportY,
+            activeBuffer.baseY,
+            lineDelta,
+          );
+          terminal.scrollLines(lineDelta);
+          pointer.scrollLineOffset = tracked.lineOffset;
+          pointer.scrollTargetViewportY = tracked.viewportY;
+        }
+      }
+    }
+    return;
+  }
+  if (viewportPointers.size !== 2) {
+    return;
+  }
+  if (!pinchGesture) {
+    beginPinchGesture();
+  }
+  const input = currentPinchInput();
+  if (!pinchGesture || !input) {
+    return;
+  }
+  if (event.cancelable) {
+    event.preventDefault();
+  }
+  for (const activePointer of viewportPointers.values()) {
+    activePointer.moved = true;
+  }
+  schedulePinchPreview(input);
+});
+elements.terminalViewport.addEventListener("pointerup", (event) => {
+  const pointer = viewportPointers.get(event.pointerId);
+  if (!pointer) {
+    return;
+  }
+  const wasPinching = Boolean(pinchGesture) || viewportPointers.size > 1;
+  viewportPointers.delete(event.pointerId);
+  if (wasPinching) {
+    commitPinchPreview();
+    pinchGesture = null;
+    for (const activePointer of viewportPointers.values()) {
+      activePointer.startX = activePointer.x;
+      activePointer.startY = activePointer.y;
+      activePointer.scrollLeft = elements.terminalViewport.scrollLeft;
+      activePointer.scrollTop = elements.terminalViewport.scrollTop;
+      activePointer.scrollLineOffset = 0;
+      activePointer.scrollTargetViewportY = terminal.buffer.active.viewportY;
+      activePointer.moved = true;
+    }
+    finishPinchScale();
+  }
+  const enterTyping = !wasPinching && !pointer.moved && !typingMode && viewerState.current;
+  if (enterTyping) {
+    setTypingMode(true);
+  }
+});
+elements.terminalViewport.addEventListener("pointercancel", (event) => {
+  if (!viewportPointers.has(event.pointerId)) {
+    return;
+  }
+  const wasPinching = Boolean(pinchGesture) || viewportPointers.size > 1;
+  viewportPointers.delete(event.pointerId);
+  if (wasPinching) {
+    commitPinchPreview();
+    pinchGesture = null;
+    for (const activePointer of viewportPointers.values()) {
+      activePointer.startX = activePointer.x;
+      activePointer.startY = activePointer.y;
+      activePointer.scrollLeft = elements.terminalViewport.scrollLeft;
+      activePointer.scrollTop = elements.terminalViewport.scrollTop;
+      activePointer.scrollLineOffset = 0;
+      activePointer.scrollTargetViewportY = terminal.buffer.active.viewportY;
+      activePointer.moved = true;
+    }
+    finishPinchScale();
+  }
+});
+elements.back.addEventListener("click", closeSession);
+elements.close.addEventListener("click", closeSession);
+window.addEventListener("resize", updateVisualViewport);
+globalThis.visualViewport?.addEventListener("resize", updateVisualViewport);
+globalThis.visualViewport?.addEventListener("scroll", updateVisualViewport);
+setTypingMode(false);
+updateVisualViewport();
 
 if (!secret) {
   if (incompatibleBrowser) {

@@ -113,6 +113,7 @@ type Client struct {
 	closeOnce  sync.Once
 	writerDone chan struct{}
 	viewerOpen atomic.Bool
+	beforeSend func(byte)
 }
 
 func authenticateClient(
@@ -213,6 +214,9 @@ func (c *Client) send(ctx context.Context, tag byte, payload []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+	}
+	if c.beforeSend != nil {
+		c.beforeSend(tag)
 	}
 	if err := c.queue.push(outboundFrame{tag: tag, payload: payload}); err != nil {
 		c.closeNow(err)
@@ -328,7 +332,9 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 			return errors.New("a terminal is already open")
 		}
 		if err := c.handler.Open(ctx, c, request); err != nil {
-			c.viewerOpen.Store(false)
+			if !c.viewerOpen.CompareAndSwap(true, false) {
+				return nil
+			}
 			return c.SendControl(ctx, TagError, ProtocolError{
 				Code:    "terminal_unavailable",
 				Message: "The terminal is no longer available.",
@@ -361,22 +367,6 @@ func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 			return nil
 		}
 		err := c.handler.Input(c, payload)
-		if err != nil && !c.viewerOpen.Load() {
-			return nil
-		}
-		return err
-	case TagResize:
-		var request ResizeRequest
-		if err := DecodeControl(tag, payload, &request); err != nil {
-			return err
-		}
-		if err := ValidateClientFrame(tag, request); err != nil {
-			return err
-		}
-		if !c.viewerOpen.Load() {
-			return nil
-		}
-		err := c.handler.Resize(c, request)
 		if err != nil && !c.viewerOpen.Load() {
 			return nil
 		}

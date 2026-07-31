@@ -129,6 +129,51 @@ func TestServerCommands(t *testing.T) {
 	}
 }
 
+func TestPaneHeightAndResizeUseStablePaneID(t *testing.T) {
+	f := &fakeRunner{out: "31"}
+	s := &Server{Socket: "wrap-ui", R: f}
+	height, err := s.PaneHeight("%3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if height != 31 {
+		t.Fatalf("pane height = %d, want 31", height)
+	}
+	if got := f.last(); got != "-L wrap-ui display-message -p -t %3 #{pane_height}" {
+		t.Fatalf("pane height command = %q", got)
+	}
+	if err := s.ResizePaneHeight("%3", 42); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.last(); got != "-L wrap-ui resize-pane -t %3 -y 42" {
+		t.Fatalf("resize pane command = %q", got)
+	}
+}
+
+func TestPaneHeightAndResizeRejectInvalidArguments(t *testing.T) {
+	for _, pane := range []string{"", "3", "%x", "%3;kill-server"} {
+		s := &Server{Socket: "wrap-ui", R: &fakeRunner{out: "31"}}
+		if _, err := s.PaneHeight(pane); err == nil {
+			t.Errorf("PaneHeight accepted pane %q", pane)
+		}
+		if err := s.ResizePaneHeight(pane, 42); err == nil {
+			t.Errorf("ResizePaneHeight accepted pane %q", pane)
+		}
+	}
+	for _, height := range []int{0, -1, 301} {
+		s := &Server{Socket: "wrap-ui", R: &fakeRunner{}}
+		if err := s.ResizePaneHeight("%3", height); err == nil {
+			t.Errorf("ResizePaneHeight accepted height %d", height)
+		}
+	}
+	for _, output := range []string{"", "zero", "0", "301"} {
+		s := &Server{Socket: "wrap-ui", R: &fakeRunner{out: output}}
+		if _, err := s.PaneHeight("%3"); err == nil {
+			t.Errorf("PaneHeight accepted output %q", output)
+		}
+	}
+}
+
 func TestEnsureServerGeneration(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
 	f := &fakeRunner{outByContains: map[string]string{
@@ -358,24 +403,86 @@ func TestWindowSizePinAndRestoreArgsAreGenerationGuarded(t *testing.T) {
 		t.Fatal("nil error classified as a missing tmux target")
 	}
 	const generation = "0123456789abcdef0123456789abcdef"
-	pin, err := PinWindowSizeIfGenerationArgs("$7", generation)
+	const owner = "00112233445566778899aabbccddeeff"
+	const hookIndex = 424242
+	capture, err := CaptureWindowSizeIfGenerationArgs("$7", generation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Join(pin, " ")
+	got := strings.Join(capture, " ")
 	for _, want := range []string{
 		"if-shell -F #{==:#{@wrap_server_generation}," + generation + "}",
 		"display-message -p -t $7",
 		"#{window_id}",
+		"#{window_width}",
+		"#{window_height}",
 		"show-options -w -A -t $7 window-size",
-		"set-option -w -t $7 window-size manual",
+		"show-options -v -A -t $7 status",
 		generationMismatchMessage,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("window-size capture args %q missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "set-option") {
+		t.Fatalf("window-size capture mutates tmux state: %q", got)
+	}
+	pin, err := PinWindowSizeIfGenerationArgs(
+		"$7", generation, "@4", 132, 41, "latest", true, "on", owner, hookIndex,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = strings.Join(pin, " ")
+	for _, want := range []string{
+		"#{==:#{@wrap_server_generation}," + generation + "}",
+		"#{==:#{window_id},@4}",
+		"#{==:#{window_width},132}",
+		"#{==:#{window_height},41}",
+		"#{==:#{window-size},latest}",
+		"#{==:#{status},on}",
+		"set-option -w -o -t @4 window-size manual",
+		"resize-window -t @4 -x 132 -y 41",
+		"set-option -w -t @4 " + windowPinOwnerOption + " " + owner,
+		"set-hook -w -t @4",
+		"after-set-option[424242]",
+		"#{==:#{hook_argument_0},window-size}",
+		"after-resize-window[424242]",
+		windowPinMismatchMessage,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("window-size pin args %q missing %q", got, want)
 		}
 	}
-	restore, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "latest", false)
+	claimAt := strings.Index(got, "set-option -w -o -t @4 window-size manual")
+	markAt := strings.Index(got, "set-option -w -t @4 "+windowPinOwnerOption+" "+owner)
+	resizeAt := strings.Index(got, "resize-window -t @4 -x 132 -y 41")
+	hookAt := strings.Index(got, "set-hook -w -t @4")
+	if claimAt < 0 || markAt <= claimAt || resizeAt <= markAt || hookAt <= resizeAt {
+		t.Fatalf("window-size pin does not restore captured geometry before arming hooks: %q", got)
+	}
+	if _, err := PinWindowSizeIfGenerationArgs(
+		"$7", generation, "@4", 132, 41, "unsafe", true, "on", owner, hookIndex,
+	); err == nil {
+		t.Fatal("accepted invalid captured window-size mode")
+	}
+	localPin, err := PinWindowSizeIfGenerationArgs(
+		"$7", generation, "@4", 132, 41, "latest", false, "on", "", 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(localPin, " "); strings.Contains(got, "set-option") ||
+		strings.Contains(got, "show-options") || strings.Contains(got, "tmux") {
+		t.Fatalf("local window-size pin mutates or shells out: %q", got)
+	}
+	if !IsWindowPinConflictError(errors.New("already set: window-size: exit status 1")) {
+		t.Fatal("atomic inherited-window conflict was not classified for retry")
+	}
+	if IsWindowPinConflictError(errors.New("already set: status: exit status 1")) {
+		t.Fatal("unrelated tmux option conflict was classified as a pin retry")
+	}
+	restore, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "latest", false, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,17 +491,138 @@ func TestWindowSizePinAndRestoreArgsAreGenerationGuarded(t *testing.T) {
 		!strings.Contains(got, generationMismatchMessage) {
 		t.Fatalf("window-size restore args = %q", got)
 	}
-	inherited, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "latest", true)
+	inherited, err := RestoreWindowSizeIfGenerationArgs(
+		generation, "@4", "latest", true, owner, hookIndex,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(inherited, " "); !strings.Contains(
-		got, "set-option -w -u -t @4 window-size",
-	) {
-		t.Fatalf("inherited window-size restore args = %q", got)
+		got, "#{==:#{window-size},manual}",
+	) || !strings.Contains(got, "#{==:#{"+windowPinOwnerOption+"},"+owner+"}") ||
+		!strings.Contains(got, "set-hook -w -u -t @4") ||
+		!strings.Contains(got, "after-set-option[424242]") ||
+		!strings.Contains(got, "after-resize-window[424242]") ||
+		!strings.Contains(got, "set-option -w -u -t @4 window-size") ||
+		!strings.Contains(got, "#{==:#{"+windowPinOwnerOption+"},"+owner+"}") {
+		t.Fatalf("inherited window-size restore is not pinned-state guarded: %q", got)
 	}
-	if _, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "unsafe", false); err == nil {
+	if _, err := RestoreWindowSizeIfGenerationArgs(
+		generation, "@4", "unsafe", false, "", 0,
+	); err == nil {
 		t.Fatal("accepted invalid window-size mode")
+	}
+}
+
+func TestWindowSizePinPreservesSameValuedProvenanceTransitions(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not on PATH")
+	}
+	socket := fmt.Sprintf("wrap-pin-provenance-%d-%d", os.Getpid(), tmuxTestCounter.Add(1))
+	server := NewServer(socket)
+	server.ConfigFile = os.DevNull
+	t.Cleanup(func() { _, _ = server.Run("kill-server") })
+	if err := server.NewSession("target", t.TempDir(), ""); err != nil {
+		t.Fatal(err)
+	}
+	const generation = "0123456789abcdef0123456789abcdef"
+	if _, err := server.EnsureServerGeneration(generation); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := server.Sessions()
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, %v", sessions, err)
+	}
+	id := sessions[0].ID
+	geometry, err := server.Run(
+		"display-message", "-p", "-t", id,
+		"#{window_id}\t#{window_width}\t#{window_height}\t#{status}",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var windowID, status string
+	var columns, rows uint16
+	if _, err := fmt.Sscanf(
+		strings.TrimSpace(geometry), "%s\t%d\t%d\t%s", &windowID, &columns, &rows, &status,
+	); err != nil {
+		t.Fatalf("parse geometry %q: %v", geometry, err)
+	}
+
+	inheritedPin, err := PinWindowSizeIfGenerationArgs(
+		id, generation, windowID, columns, rows, "latest", true, status,
+		"00112233445566778899aabbccddeeff", 424242,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	{
+		if output, err := server.Run(inheritedPin...); err != nil || strings.TrimSpace(output) != "" {
+			t.Fatalf("inherited pin = %q, %v", output, err)
+		}
+		if _, err := server.Run("set-option", "-w", "-t", windowID, "window-size", "manual"); err != nil {
+			t.Fatal(err)
+		}
+		owner, err := server.Run(
+			"show-options", "-wqv", "-t", windowID, windowPinOwnerOption,
+		)
+		if err != nil || strings.TrimSpace(owner) != "" {
+			t.Fatalf("same-valued host window-size change retained owner marker %q: %v", owner, err)
+		}
+		restore, err := RestoreWindowSizeIfGenerationArgs(
+			generation, windowID, "latest", true,
+			"00112233445566778899aabbccddeeff", 424242,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := server.Run(restore...); err != nil {
+			t.Fatal(err)
+		}
+		localValue, err := server.Run("show-options", "-wqv", "-t", windowID, "window-size")
+		if err != nil || strings.TrimSpace(localValue) != "manual" {
+			t.Fatalf("same-valued host window-size change was restored away: value=%q err=%v", localValue, err)
+		}
+		if _, err := server.Run("set-option", "-wu", "-t", windowID, "window-size"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := server.Run("set-option", "-w", "-t", windowID, "window-size", "latest"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Run(inheritedPin...); !IsWindowPinConflictError(err) {
+		t.Fatalf("inherited-to-local pin = %v, want atomic conflict", err)
+	}
+	localValue, err := server.Run("show-options", "-wqv", "-t", windowID, "window-size")
+	if err != nil || strings.TrimSpace(localValue) != "latest" {
+		t.Fatalf("inherited-to-local transition overwritten: value=%q err=%v", localValue, err)
+	}
+	owner, err := server.Run(
+		"show-options", "-wqv", "-t", windowID, windowPinOwnerOption,
+	)
+	if err != nil || strings.TrimSpace(owner) != "" {
+		t.Fatalf("failed inherited pin left owner marker %q: %v", owner, err)
+	}
+	hooks, err := server.Run("show-hooks", "-w", "-t", windowID)
+	if err != nil || strings.Contains(hooks, windowPinOwnerOption) {
+		t.Fatalf("failed inherited pin left ownership hook: hooks=%q err=%v", hooks, err)
+	}
+
+	localPin, err := PinWindowSizeIfGenerationArgs(
+		id, generation, windowID, columns, rows, "latest", false, status, "", 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Run("set-option", "-wu", "-t", windowID, "window-size"); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := server.Run(localPin...); err != nil || strings.TrimSpace(output) != "" {
+		t.Fatalf("local-to-inherited validation = %q, %v", output, err)
+	}
+	localValue, err = server.Run("show-options", "-wqv", "-t", windowID, "window-size")
+	if err != nil || strings.TrimSpace(localValue) != "" {
+		t.Fatalf("local-to-inherited transition recreated: value=%q err=%v", localValue, err)
 	}
 }
 

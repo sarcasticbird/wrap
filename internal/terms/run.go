@@ -1,6 +1,8 @@
 package terms
 
 import (
+	"errors"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -13,6 +15,15 @@ import (
 func Run(b Backend, o Options) error {
 	m := NewModel(b, o)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	_, err := p.Run()
-	return err
+	return runWithMirrorPaneCleanup(b, func() error {
+		_, err := p.Run()
+		return err
+	})
+}
+
+func runWithMirrorPaneCleanup(b Backend, run func() error) (err error) {
+	defer func() {
+		err = errors.Join(err, b.RestoreMirrorPaneHeight())
+	}()
+	return run()
 }

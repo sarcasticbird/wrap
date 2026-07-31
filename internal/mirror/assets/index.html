@@ -37,11 +37,25 @@
 
     <section id="terminal-view" class="terminal-shell hidden" aria-labelledby="terminal-title">
       <div class="terminal-heading">
-        <button id="back-button" class="text-button" type="button">← Terminals</button>
+        <button id="back-button" class="text-button terminal-back" type="button" aria-label="Terminals">
+          <span aria-hidden="true">←</span><span class="back-label"> Terminals</span>
+        </button>
         <strong id="terminal-title">Terminal</strong>
-        <button id="close-button" class="text-button danger" type="button">Close</button>
+        <div class="terminal-actions" role="group" aria-label="Terminal view controls">
+          <button id="keyboard-toggle" type="button" aria-pressed="false">Keyboard</button>
+          <button id="fit-button" type="button" aria-pressed="true">Fit</button>
+          <button id="close-button" class="danger" type="button">Close</button>
+        </div>
       </div>
-      <div id="terminal" aria-label="Interactive remote terminal"></div>
+      <div id="terminal-viewport" class="terminal-viewport">
+        <div id="terminal-loading" class="terminal-loading" role="status">Opening terminal…</div>
+        <output id="pinch-scale" class="pinch-scale hidden">100%</output>
+        <div id="terminal-spacer" class="terminal-spacer">
+          <div id="terminal-surface" class="terminal-surface">
+            <div id="terminal" aria-label="Interactive remote terminal"></div>
+          </div>
+        </div>
+      </div>
       <nav id="toolbar" class="toolbar" aria-label="Terminal keys">
         <button type="button" data-key="escape">Esc</button>
         <button type="button" data-key="tab">Tab</button>

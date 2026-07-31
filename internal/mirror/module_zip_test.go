@@ -40,6 +40,7 @@ func TestModuleZipContainsMirrorRuntimeAssets(t *testing.T) {
 		"internal/mirror/assets/third_party/xterm/xterm.mjs",
 		"internal/mirror/assets/third_party/xterm/xterm.css",
 		"internal/mirror/assets/third_party/xterm/addon-fit.mjs",
+		"internal/mirror/assets/wrap-mirror-viewport.js",
 	} {
 		if _, err := os.Stat(filepath.Join(extractedRoot, name)); err != nil {
 			t.Errorf("published module is missing %s: %v", name, err)

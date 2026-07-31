@@ -18,6 +18,8 @@ const (
 	SocketSessions = "wrap"
 	// SocketUI hosts the single 3-pane chrome session.
 	SocketUI = "wrap-ui"
+
+	windowPinOwnerOption = "@wrap_mirror_pin_owner"
 )
 
 var (
@@ -40,6 +42,10 @@ type Runner interface {
 type execRunner struct{}
 
 func (execRunner) Run(args ...string) (string, error) {
+	return runExec(args...)
+}
+
+func runExec(args ...string) (string, error) {
 	cmd := exec.Command("tmux", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -430,29 +436,134 @@ func AttachWindowIgnoringSizeIfGenerationArgs(
 	return sessionWindowCommandIfGenerationArgs(id, generation, windowID, attach)
 }
 
-// PinWindowSizeIfGenerationArgs returns one tmux command queue operation that
-// prints the stable current window ID and its effective window-size option
-// (including whether the value is inherited), then switches that exact
-// generation's window to manual sizing.
-func PinWindowSizeIfGenerationArgs(id, generation string) ([]string, error) {
-	pin := tmuxCommand(
-		"display-message", "-p", "-t", id, "#{window_id}",
+// CaptureWindowSizeIfGenerationArgs returns one tmux command queue operation that
+// prints the stable current window ID, width, height, effective window-size
+// option (including whether the value is inherited), and effective status-line
+// count without mutating tmux state.
+func CaptureWindowSizeIfGenerationArgs(id, generation string) ([]string, error) {
+	capture := tmuxCommand(
+		"display-message", "-p", "-t", id,
+		"#{window_id}\t#{window_width}\t#{window_height}",
 	) + " ; " + tmuxCommand(
 		"show-options", "-w", "-A", "-t", id, "window-size",
 	) + " ; " + tmuxCommand(
-		"set-option", "-w", "-t", id, "window-size", "manual",
+		"show-options", "-v", "-A", "-t", id, "status",
 	)
-	return sessionCommandIfGenerationArgs(id, generation, pin)
+	return sessionCommandIfGenerationArgs(id, generation, capture)
+}
+
+// PinWindowSizeIfGenerationArgs switches the previously captured window to
+// manual sizing only while the session still selects that exact window on the
+// expected server generation.
+func PinWindowSizeIfGenerationArgs(
+	id, generation, windowID string,
+	columns, rows uint16,
+	mode string,
+	inherited bool,
+	status string,
+	owner string,
+	hookIndex uint32,
+) ([]string, error) {
+	if !isSessionID(id) {
+		return nil, fmt.Errorf("invalid tmux session id %q", id)
+	}
+	if !isWindowID(windowID) {
+		return nil, fmt.Errorf("invalid tmux window id %q", windowID)
+	}
+	if !isGeneration(generation) {
+		return nil, fmt.Errorf("invalid tmux server generation %q", generation)
+	}
+	if columns == 0 || rows == 0 {
+		return nil, fmt.Errorf("invalid captured tmux window geometry %dx%d", columns, rows)
+	}
+	switch mode {
+	case "largest", "smallest", "manual", "latest":
+	default:
+		return nil, fmt.Errorf("invalid captured tmux window-size mode %q", mode)
+	}
+	if status != "on" && status != "off" {
+		statusRows, err := strconv.ParseUint(status, 10, 16)
+		if err != nil || statusRows > 5 {
+			return nil, fmt.Errorf("invalid captured tmux status value %q", status)
+		}
+	}
+	if inherited {
+		if !isGeneration(owner) || hookIndex == 0 {
+			return nil, errors.New("invalid inherited tmux window pin owner")
+		}
+	} else if owner != "" || hookIndex != 0 {
+		return nil, errors.New("local tmux window pin must not claim ownership")
+	}
+	conditions := []string{
+		"#{==:#{" + ServerGenerationOption + "}," + generation + "}",
+		"#{==:#{window_id}," + windowID + "}",
+		"#{==:#{window_width}," + strconv.FormatUint(uint64(columns), 10) + "}",
+		"#{==:#{window_height}," + strconv.FormatUint(uint64(rows), 10) + "}",
+		"#{==:#{window-size}," + escapeFormatLiteral(mode) + "}",
+		"#{==:#{status}," + escapeFormatLiteral(status) + "}",
+	}
+	condition := conditions[0]
+	for _, next := range conditions[1:] {
+		condition = "#{&&:" + condition + "," + next + "}"
+	}
+	pin := tmuxCommand("display-message", "-p", "")
+	if inherited {
+		// -o makes claiming an inherited option atomic: tmux refuses to set
+		// manual mode if another client installed a window-local value after
+		// capture. Explicit local sizing remains host-owned and is never
+		// overwritten by a mirror viewer.
+		claim := tmuxCommand(
+			"set-option", "-w", "-o", "-t", windowID, "window-size", "manual",
+		)
+		// tmux restores the window's remembered manual dimensions when the
+		// mode changes. Explicitly resize back to the geometry captured by
+		// the guard before an ignored-size mirror client can attach.
+		resize := tmuxCommand(
+			"resize-window", "-t", windowID,
+			"-x", strconv.FormatUint(uint64(columns), 10),
+			"-y", strconv.FormatUint(uint64(rows), 10),
+		)
+		mark := tmuxCommand(
+			"set-option", "-w", "-t", windowID, windowPinOwnerOption, owner,
+		)
+		invalidate := tmuxCommand(
+			"set-option", "-w", "-u", "-t", windowID, windowPinOwnerOption,
+		)
+		noOp := tmuxCommand("display-message", "-p", "")
+		watch := make([]string, 0, len(windowPinHookNames(hookIndex)))
+		for _, hookName := range windowPinHookNames(hookIndex) {
+			hookCommand := invalidate
+			if strings.HasPrefix(hookName, "after-set-option[") {
+				// hook_argument_0 was added in tmux 3.2, Wrap's documented
+				// minimum. Filtering preserves ownership across unrelated host
+				// option changes while invalidating same-valued window-size sets.
+				hookCommand = tmuxCommand(
+					"if-shell", "-F",
+					"#{==:#{hook_argument_0},window-size}", invalidate, noOp,
+				)
+			}
+			watch = append(watch, tmuxCommand(
+				"set-hook", "-w", "-t", windowID, hookName, hookCommand,
+			))
+		}
+		pin = claim + " ; " + mark + " ; " + resize + " ; " + strings.Join(watch, " ; ")
+	}
+	reject := tmuxCommand("display-message", "-p", windowPinMismatchMessage)
+	return []string{
+		"if-shell", "-F", "-t", id, condition, pin, reject,
+	}, nil
 }
 
 // RestoreWindowSizeIfGenerationArgs returns one generation-guarded tmux
 // command queue operation that restores the stable window captured by
-// PinWindowSizeIfGenerationArgs. Inherited values are restored by removing the
+// CaptureWindowSizeIfGenerationArgs. Inherited values are restored by removing the
 // temporary window-local override rather than freezing the old effective
 // value.
 func RestoreWindowSizeIfGenerationArgs(
 	generation, windowID, mode string,
 	inherited bool,
+	owner string,
+	hookIndex uint32,
 ) ([]string, error) {
 	if !isWindowID(windowID) {
 		return nil, fmt.Errorf("invalid tmux window id %q", windowID)
@@ -462,13 +573,46 @@ func RestoreWindowSizeIfGenerationArgs(
 	default:
 		return nil, fmt.Errorf("invalid tmux window-size mode %q", mode)
 	}
+	if inherited {
+		if !isGeneration(owner) || hookIndex == 0 {
+			return nil, errors.New("invalid inherited tmux window pin owner")
+		}
+	} else if owner != "" || hookIndex != 0 {
+		return nil, errors.New("local tmux window pin must not claim ownership")
+	}
 	var restore string
 	if inherited {
-		restore = tmuxCommand("set-option", "-w", "-u", "-t", windowID, "window-size")
+		unwatch := make([]string, 0, len(windowPinHookNames(hookIndex)))
+		for _, hookName := range windowPinHookNames(hookIndex) {
+			unwatch = append(unwatch, tmuxCommand(
+				"set-hook", "-w", "-u", "-t", windowID, hookName,
+			))
+		}
+		unset := tmuxCommand("set-option", "-w", "-u", "-t", windowID, "window-size")
+		noOp := tmuxCommand("display-message", "-p", "")
+		ownedCondition := "#{&&:#{==:#{window-size},manual},#{==:#{" +
+			windowPinOwnerOption + "}," + owner + "}}"
+		unsetIfOwned := tmuxCommand(
+			"if-shell", "-F", "-t", windowID,
+			ownedCondition, unset, noOp,
+		)
+		clearOwner := tmuxCommand(
+			"set-option", "-w", "-u", "-t", windowID, windowPinOwnerOption,
+		)
+		clearOwnerIfOwned := tmuxCommand(
+			"if-shell", "-F", "-t", windowID,
+			"#{==:#{"+windowPinOwnerOption+"},"+owner+"}", clearOwner, noOp,
+		)
+		restore = strings.Join(unwatch, " ; ") + " ; " + unsetIfOwned + " ; " + clearOwnerIfOwned
 	} else {
 		restore = tmuxCommand("set-option", "-w", "-t", windowID, "window-size", mode)
 	}
 	return serverCommandIfGenerationArgs(generation, restore)
+}
+
+func windowPinHookNames(index uint32) []string {
+	suffix := "[" + strconv.FormatUint(uint64(index), 10) + "]"
+	return []string{"after-set-option" + suffix, "after-resize-window" + suffix}
 }
 
 func attachSessionIfGenerationArgs(id, generation string, ignoreSize bool) ([]string, error) {
@@ -498,11 +642,28 @@ func (s *Server) runSessionCommandIfGeneration(id, generation, command string) e
 
 const generationMismatchMessage = "wrap-server-generation-mismatch"
 const sessionIdentityMismatchMessage = "wrap-session-identity-mismatch"
+const windowPinMismatchMessage = "wrap-window-pin-mismatch"
 
 // IsGenerationMismatchOutput reports whether tmux emitted the sentinel used by
 // generation-guarded commands when their server identity no longer matches.
 func IsGenerationMismatchOutput(out string) bool {
 	return strings.TrimSpace(out) == generationMismatchMessage
+}
+
+// IsWindowPinMismatchOutput reports whether a capture became stale before its
+// guarded manual-size mutation could run.
+func IsWindowPinMismatchOutput(out string) bool {
+	return strings.TrimSpace(out) == windowPinMismatchMessage
+}
+
+// IsWindowPinConflictError reports the atomic set-only-if-unset failure that
+// occurs when an inherited window-size option becomes local after capture.
+// Callers retry the capture instead of overwriting the new local value.
+func IsWindowPinConflictError(err error) bool {
+	return err != nil && strings.Contains(
+		strings.ToLower(err.Error()),
+		"already set: window-size",
+	)
 }
 
 func escapeFormatLiteral(value string) string {
@@ -828,6 +989,18 @@ func isWindowID(target string) bool {
 	return true
 }
 
+func isPaneID(target string) bool {
+	if len(target) < 2 || target[0] != '%' {
+		return false
+	}
+	for _, r := range target[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func isGeneration(generation string) bool {
 	if len(generation) != 32 {
 		return false
@@ -910,6 +1083,32 @@ func (s *Server) ClientTTYs(session string) ([]string, error) {
 
 func (s *Server) SelectPane(target string) error {
 	_, err := s.Run("select-pane", "-t", target)
+	return err
+}
+
+func (s *Server) PaneHeight(target string) (int, error) {
+	if !isPaneID(target) {
+		return 0, fmt.Errorf("invalid tmux pane id %q", target)
+	}
+	out, err := s.Run("display-message", "-p", "-t", target, "#{pane_height}")
+	if err != nil {
+		return 0, err
+	}
+	height, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || height < 1 || height > 300 {
+		return 0, fmt.Errorf("unexpected tmux pane height %q", out)
+	}
+	return height, nil
+}
+
+func (s *Server) ResizePaneHeight(target string, height int) error {
+	if !isPaneID(target) {
+		return fmt.Errorf("invalid tmux pane id %q", target)
+	}
+	if height < 1 || height > 300 {
+		return fmt.Errorf("invalid tmux pane height %d", height)
+	}
+	_, err := s.Run("resize-pane", "-t", target, "-y", strconv.Itoa(height))
 	return err
 }
 
