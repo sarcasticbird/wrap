@@ -102,12 +102,21 @@ h2 {
   color: var(--acid);
 }
 
+.status.failure {
+  border-color: rgb(255 116 108 / 55%);
+  color: var(--danger);
+}
+
 .panel {
   border: 1px solid var(--line);
   border-radius: 1.25rem;
   background: rgb(18 22 19 / 92%);
   padding: clamp(1.25rem, 5vw, 2.5rem);
   box-shadow: 0 1.5rem 5rem rgb(0 0 0 / 22%);
+}
+
+.panel.load-failure {
+  border-color: rgb(255 116 108 / 35%);
 }
 
 #message-view h2 {

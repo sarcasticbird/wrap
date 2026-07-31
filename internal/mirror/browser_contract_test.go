@@ -87,6 +87,38 @@ func TestBrowserContractIncludesTerminalAndMobileControls(t *testing.T) {
 	}
 }
 
+func TestBrowserContractLoadsDependencyFreeBootstrap(t *testing.T) {
+	htmlBytes, err := fs.ReadFile(assets, "assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapBytes, err := fs.ReadFile(assets, "assets/wrap-mirror-bootstrap.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+	bootstrap := string(bootstrapBytes)
+	if !strings.Contains(html, `src="/assets/wrap-mirror-bootstrap.js"`) {
+		t.Fatal("browser HTML does not load the dependency-free bootstrap")
+	}
+	if strings.Contains(html, `src="/assets/wrap-mirror.js"`) {
+		t.Fatal("browser HTML bypasses the bootstrap and loads the client directly")
+	}
+	if !strings.Contains(bootstrap, `() => import("/assets/wrap-mirror.js")`) {
+		t.Fatal("bootstrap does not dynamically import the main client")
+	}
+	for _, forbidden := range []string{
+		`import {`,
+		`import *`,
+		`import "/`,
+		`import '/`,
+	} {
+		if strings.Contains(bootstrap, forbidden) {
+			t.Fatalf("bootstrap has a static dependency %q", forbidden)
+		}
+	}
+}
+
 func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *testing.T) {
 	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
 	if err != nil {

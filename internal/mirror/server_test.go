@@ -36,6 +36,7 @@ func TestLocalServerBindsLoopbackAndServesOnlyKnownRoutes(t *testing.T) {
 	}{
 		{"/", http.StatusOK, "text/html; charset=utf-8"},
 		{"/assets/wrap-mirror.css", http.StatusOK, "text/css; charset=utf-8"},
+		{"/assets/wrap-mirror-bootstrap.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/wrap-mirror.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/wrap-mirror-state.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/third_party/xterm/xterm.mjs", http.StatusOK, "text/javascript; charset=utf-8"},
