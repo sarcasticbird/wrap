@@ -12,6 +12,8 @@ session is marked with a 🔔 without moving the list.
 
 <img width="1638" height="1002" alt="Screenshot 2026-07-29 at 8 47 47 AM" src="https://github.com/user-attachments/assets/00f561a5-f4f8-4d4a-b1b8-6ed8c2fa7789" />
 
+<img width="687" height="1144" alt="A766918D-478B-4775-9B76-05A74D83460E_1_105_c" src="https://github.com/user-attachments/assets/d2ed91a8-ff75-46ba-a649-10901c4f7e93" />
+
 ## Why wrap
 
 - See which agent needs attention without cycling through terminal tabs.
