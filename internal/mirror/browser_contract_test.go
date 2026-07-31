@@ -17,8 +17,8 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 	}
 	source := string(sourceBytes) + "\n" + string(stateBytes)
 	for _, want := range []string{
-		`from "/assets/vendor/xterm/xterm.mjs"`,
-		`from "/assets/vendor/xterm/addon-fit.mjs"`,
+		`from "/assets/third_party/xterm/xterm.mjs"`,
+		`from "/assets/third_party/xterm/addon-fit.mjs"`,
 		`new URLSearchParams(location.hash.slice(1))`,
 		`history.replaceState(null, "", location.pathname + location.search)`,
 		`sessionStorage`,

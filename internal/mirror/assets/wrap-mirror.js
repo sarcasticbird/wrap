@@ -1,5 +1,5 @@
-import { Terminal } from "/assets/vendor/xterm/xterm.mjs";
-import { FitAddon } from "/assets/vendor/xterm/addon-fit.mjs";
+import { Terminal } from "/assets/third_party/xterm/xterm.mjs";
+import { FitAddon } from "/assets/third_party/xterm/addon-fit.mjs";
 import "/assets/wrap-mirror-state.js";
 
 const STORAGE_KEY = "wrap.mirror.v1.secret";
