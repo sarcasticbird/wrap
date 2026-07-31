@@ -233,12 +233,7 @@ func (t *Tunnel) wait() {
 	err := t.command.Wait()
 	t.mu.Lock()
 	closing := t.closing
-	if closing {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			err = nil
-		}
-	}
+	err = tunnelWaitError(err, closing)
 	t.waitErr = err
 	t.mu.Unlock()
 	if !closing {
@@ -246,6 +241,17 @@ func (t *Tunnel) wait() {
 	}
 	close(t.done)
 	close(t.waited)
+}
+
+func tunnelWaitError(err error, closing bool) error {
+	if !closing {
+		return err
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func (t *Tunnel) waitError() error {

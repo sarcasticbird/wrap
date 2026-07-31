@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,5 +119,35 @@ func TestStartTunnelRejectsNonLoopbackOrigin(t *testing.T) {
 	_, err := StartTunnel(t.Context(), "http://0.0.0.0:43210", TunnelOptions{})
 	if err == nil {
 		t.Fatal("accepted non-loopback tunnel origin")
+	}
+}
+
+func TestTunnelWaitErrorSuppressesOnlyIntentionalShutdown(t *testing.T) {
+	command := exec.Command("sh", "-c", "exit 7")
+	exitErr := command.Run()
+	if exitErr == nil {
+		t.Fatal("fixture command unexpectedly succeeded")
+	}
+	otherErr := errors.New("wait failed")
+
+	for _, test := range []struct {
+		name    string
+		err     error
+		closing bool
+		want    error
+	}{
+		{"intentional context cancellation", context.Canceled, true, nil},
+		{"unexpected context cancellation", context.Canceled, false, context.Canceled},
+		{"intentional process exit", exitErr, true, nil},
+		{"unexpected process exit", exitErr, false, exitErr},
+		{"intentional unrelated error", otherErr, true, otherErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := tunnelWaitError(test.err, test.closing)
+			if !errors.Is(got, test.want) {
+				t.Fatalf("tunnelWaitError(%v, %v) = %v, want %v",
+					test.err, test.closing, got, test.want)
+			}
+		})
 	}
 }
