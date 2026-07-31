@@ -7,9 +7,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var tmuxTestCounter atomic.Uint64
 
 type fakeRunner struct {
 	calls         [][]string
@@ -333,6 +336,135 @@ func TestAttachSessionIfGenerationArgs(t *testing.T) {
 		!strings.Contains(got, "attach-session -t $7") ||
 		!strings.Contains(got, generationMismatchMessage) {
 		t.Fatalf("generation-guarded attach args = %q", got)
+	}
+}
+
+func TestAttachSessionIgnoringSizeIfGenerationArgs(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	args, err := AttachSessionIgnoringSizeIfGenerationArgs("$7", generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(args, " ")
+	if !strings.Contains(got, "if-shell -F #{==:#{@wrap_server_generation},"+generation+"}") ||
+		!strings.Contains(got, "attach-session -f ignore-size -t $7") ||
+		!strings.Contains(got, generationMismatchMessage) {
+		t.Fatalf("generation-guarded ignore-size attach args = %q", got)
+	}
+}
+
+func TestWindowSizePinAndRestoreArgsAreGenerationGuarded(t *testing.T) {
+	if IsMissingTargetError(nil) {
+		t.Fatal("nil error classified as a missing tmux target")
+	}
+	const generation = "0123456789abcdef0123456789abcdef"
+	pin, err := PinWindowSizeIfGenerationArgs("$7", generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(pin, " ")
+	for _, want := range []string{
+		"if-shell -F #{==:#{@wrap_server_generation}," + generation + "}",
+		"display-message -p -t $7",
+		"#{window_id}",
+		"show-options -w -A -t $7 window-size",
+		"set-option -w -t $7 window-size manual",
+		generationMismatchMessage,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("window-size pin args %q missing %q", got, want)
+		}
+	}
+	restore, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "latest", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = strings.Join(restore, " ")
+	if !strings.Contains(got, "set-option -w -t @4 window-size latest") ||
+		!strings.Contains(got, generationMismatchMessage) {
+		t.Fatalf("window-size restore args = %q", got)
+	}
+	inherited, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "latest", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(inherited, " "); !strings.Contains(
+		got, "set-option -w -u -t @4 window-size",
+	) {
+		t.Fatalf("inherited window-size restore args = %q", got)
+	}
+	if _, err := RestoreWindowSizeIfGenerationArgs(generation, "@4", "unsafe", false); err == nil {
+		t.Fatal("accepted invalid window-size mode")
+	}
+}
+
+func TestAttachWindowIgnoringSizeGuardsCurrentWindow(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	args, err := AttachWindowIgnoringSizeIfGenerationArgs("$7", generation, "@4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(args, " ")
+	for _, want := range []string{
+		"if-shell -F -t $7",
+		"#{==:#{@wrap_server_generation}," + generation + "}",
+		"#{==:#{window_id},@4}",
+		"attach-session -f ignore-size -t $7",
+		generationMismatchMessage,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("window-guarded attach args %q missing %q", got, want)
+		}
+	}
+}
+
+func TestAttachWindowGuardRefusesChangedCurrentWindow(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not on PATH")
+	}
+	socket := fmt.Sprintf(
+		"wrap-attach-window-%d-%d",
+		os.Getpid(),
+		tmuxTestCounter.Add(1),
+	)
+	server := NewServer(socket)
+	server.ConfigFile = os.DevNull
+	t.Cleanup(func() { _, _ = server.Run("kill-server") })
+	if err := server.NewSession("target", t.TempDir(), ""); err != nil {
+		t.Fatal(err)
+	}
+	const generation = "0123456789abcdef0123456789abcdef"
+	if _, err := server.EnsureServerGeneration(generation); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := server.Sessions()
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, %v", sessions, err)
+	}
+	windowID, err := server.Run("display-message", "-p", "-t", sessions[0].ID, "#{window_id}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Run("new-window", "-d", "-t", sessions[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Run("select-window", "-t", sessions[0].ID+":1"); err != nil {
+		t.Fatal(err)
+	}
+	args, err := AttachWindowIgnoringSizeIfGenerationArgs(
+		sessions[0].ID,
+		generation,
+		strings.TrimSpace(windowID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := server.Run(args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(output) != generationMismatchMessage {
+		t.Fatalf("changed-window attach output = %q", output)
 	}
 }
 
@@ -1013,6 +1145,26 @@ func TestSessionCurrentPathIfGenerationClassifiesFailures(t *testing.T) {
 	f.err = errors.New("permission denied")
 	if _, err := s.SessionCurrentPathIfGeneration("$7", generation); err == nil || errors.Is(err, ErrMissingTarget) {
 		t.Fatalf("transport failure = %v, want unclassified error", err)
+	}
+}
+
+func TestIsGenerationMismatchOutput(t *testing.T) {
+	for _, output := range []string{
+		"wrap-server-generation-mismatch",
+		" wrap-server-generation-mismatch\n",
+	} {
+		if !IsGenerationMismatchOutput(output) {
+			t.Fatalf("IsGenerationMismatchOutput(%q) = false", output)
+		}
+	}
+	for _, output := range []string{
+		"",
+		"wrap-session-identity-mismatch",
+		"prefix wrap-server-generation-mismatch",
+	} {
+		if IsGenerationMismatchOutput(output) {
+			t.Fatalf("IsGenerationMismatchOutput(%q) = true", output)
+		}
 	}
 }
 

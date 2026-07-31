@@ -1,5 +1,44 @@
 # Troubleshooting
 
+## Browser mirror does not start
+
+The mirror is optional and requires `cloudflared` 2020.5.1 or newer on
+`PATH`. Check it from the same environment that launches wrap:
+
+```sh
+cloudflared --version
+```
+
+Press `m` again after correcting the installation. wrap uses a Cloudflare
+Quick Tunnel and does not create, edit, or remove named-tunnel configuration.
+An existing Cloudflare configuration can prevent Quick Tunnel startup; the
+overlay reports a retryable failure without changing that configuration.
+Startup also fails after 30 seconds if `cloudflared` cannot obtain a Quick
+Tunnel URL. Confirm the host can make the outbound Cloudflare connections
+allowed by your local firewall or network policy; wrap never opens a public
+listener itself.
+
+If the QR page opens but pairing fails, rotate with `R` and scan the new URL.
+The fragment is intentionally removed from the address bar and kept only for
+that browser tab. Reloading the same tab can reconnect; a different tab without
+the fragment cannot. A rotated or revoked credential is rejected and stops
+reconnecting. Quick Tunnel URLs are ephemeral and have no uptime guarantee, so
+an unexpected tunnel exit revokes the workspace mirror and requires a fresh
+`m`.
+
+Use the complete HTTPS Quick Tunnel URL shown by wrap. Loading the loopback
+page directly is unsupported because the WebSocket server accepts only the
+exact Quick Tunnel HTTPS origin. `Pairing key missing` means the tab did not
+receive or retain the URL fragment; rescan the current QR code. `Incompatible
+browser` means the page lacks a secure context or working WebCrypto support;
+update the browser and rescan. wrap connects only after its crypto self-test
+passes.
+
+If an open remote terminal ends, disappears from a later poll, or belongs to a
+restarted tmux server generation, wrap closes that viewer instead of attaching
+to a reused session identity. Return to the remote list and select a terminal
+that is still mirrored.
+
 ## wrap says tmux is missing or too old
 
 wrap requires tmux 3.2 or newer.

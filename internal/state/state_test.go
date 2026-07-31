@@ -289,6 +289,12 @@ func TestChromeBuildIncludesPaneHeadingsAndHelp(t *testing.T) {
 	}
 }
 
+func TestChromeBuildIncludesMirrorManager(t *testing.T) {
+	if ChromeBuild < 14 {
+		t.Fatalf("ChromeBuild = %d, want at least 14 so existing watch panes restart with mirror ownership and shutdown semantics", ChromeBuild)
+	}
+}
+
 func TestChromeParamsRoundTrip(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	p := ChromeParams{

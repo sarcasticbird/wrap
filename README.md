@@ -34,6 +34,8 @@ integration: any program that rings the terminal bell can request attention.
 - macOS or Linux
 
 Go is needed only when installing from source.
+Encrypted browser mirroring additionally requires `cloudflared` 2020.5.1 or
+newer on `PATH`; ordinary local use does not.
 
 ## Install
 
@@ -120,6 +122,7 @@ key labels shown in the headings.
 | `Enter` | Select/open the current row or show the current session |
 | `h` | Open Help in the focused list pane |
 | `n` | Bind the selected tree row or create a scratch terminal |
+| `m` | Mirror the selected non-diff terminal to an encrypted browser session |
 | `r` | Rename a scratch terminal |
 | `x` | Tree: kill the selected live entry; terminals: kill only a scratch terminal |
 | `q` | Detach without stopping sessions |
@@ -146,6 +149,39 @@ with an ellipsis so the most specific path components remain visible.
 ▸ ⌄ scratch
     /Users/alex/Projects/example
 ```
+
+### Encrypted browser mirror
+
+Focus a workspace-root, repository/worktree, or scratch row in Terminals and
+press `m`. wrap starts a loopback-only web server and an ephemeral Cloudflare
+Quick Tunnel, then shows a QR code and pairing URL. Scan it to open an
+interactive xterm client on a phone or another browser. Diff terminals cannot
+be mirrored.
+
+The URL fragment is the live shell credential: anyone who has it can control
+every terminal currently mirrored from that workspace. The browser removes
+the fragment from visible history immediately and retains it only in
+tab-scoped session storage. Terminal frames are encrypted in the browser with
+AES-GCM using keys derived from that fragment; the secret is never sent in an
+HTTP request, WebSocket header, query, or cookie.
+
+Inside the overlay:
+
+- Up / Down or `j` / `k` scroll pairing details in a short pane.
+- `x` revokes the selected terminal; revoking the last one stops the server
+  and tunnel.
+- `R` creates a new pairing credential and disconnects existing browsers.
+- `Esc` closes the overlay (or cancels startup) without revoking a ready
+  mirror.
+
+Quick Tunnels are ephemeral and development-oriented: their hostname and
+availability are not stable. Cloudflare terminates browser TLS and supplies
+the encrypted client assets from wrap, so an actively compromised edge could
+replace the page before browser-side encryption starts. The design protects
+terminal frames from passive tunnel inspection, not from a host, browser, or
+edge that can replace either endpoint. See
+[Architecture and trust boundaries](docs/architecture.md) for the protocol
+and lifecycle boundaries.
 
 ### tmux prefix and pane control
 
@@ -226,12 +262,13 @@ commands directly.
 
 ## Security
 
-wrap itself makes no network requests, but it starts trusted configured
-commands and user programs that may do so. It reads the folders you open,
-enables OSC 52 clipboard writes inside its tmux servers, and keeps sessions
-alive after UI detach. Treat opened repositories as trusted: Git may run
-clean/process filters selected by their configuration and attributes while
-wrap inspects working-tree changes.
+wrap makes no network requests during ordinary local use. When you explicitly
+start a mirror, it launches `cloudflared` to create a Quick Tunnel. It also
+starts trusted configured commands and user programs that may use the network.
+wrap reads the folders you open, enables OSC 52 clipboard writes inside its
+tmux servers, and keeps sessions alive after UI detach. Treat opened
+repositories as trusted: Git may run clean/process filters selected by their
+configuration and attributes while wrap inspects working-tree changes.
 
 Read [SECURITY.md](SECURITY.md) before using wrap with untrusted commands or
 repositories.

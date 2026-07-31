@@ -1,6 +1,7 @@
 package terms
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,9 +13,42 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"github.com/sarcasticbird/wrap/internal/config"
+	mirrorapi "github.com/sarcasticbird/wrap/internal/mirror"
 	"github.com/sarcasticbird/wrap/internal/state"
 	"github.com/sarcasticbird/wrap/internal/tmux"
 )
+
+type fakeMirror struct {
+	events     chan mirrorapi.Event
+	snapshot   mirrorapi.Snapshot
+	mirrored   []mirrorapi.HostSession
+	revoked    []mirrorapi.Identity
+	rotations  int
+	reconciles [][]mirrorapi.HostSession
+}
+
+func newFakeMirror() *fakeMirror {
+	return &fakeMirror{events: make(chan mirrorapi.Event, 8)}
+}
+
+func (m *fakeMirror) Events() <-chan mirrorapi.Event { return m.events }
+func (m *fakeMirror) Snapshot() mirrorapi.Snapshot   { return m.snapshot }
+func (m *fakeMirror) Mirror(_ context.Context, session mirrorapi.HostSession) error {
+	m.mirrored = append(m.mirrored, session)
+	return nil
+}
+func (m *fakeMirror) Revoke(_ context.Context, identity mirrorapi.Identity) error {
+	m.revoked = append(m.revoked, identity)
+	return nil
+}
+func (m *fakeMirror) Rotate(context.Context) error {
+	m.rotations++
+	return nil
+}
+func (m *fakeMirror) Reconcile(_ context.Context, sessions []mirrorapi.HostSession) error {
+	m.reconciles = append(m.reconciles, sessions)
+	return nil
+}
 
 type fakeBackend struct {
 	sessionsErr      error
@@ -141,6 +175,209 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+}
+
+func TestMirrorEligibilityAndRowMarker(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		row  row
+		want bool
+	}{
+		{"root", row{name: "vb", kind: ""}, true},
+		{"entry", row{name: "vb/api", kind: tmux.SessionKindEntry}, true},
+		{"scratch", row{name: "vb·term·1", kind: tmux.SessionKindScratch}, true},
+		{"legacy", row{name: "vb/legacy"}, true},
+		{"diff", row{name: "vb/diff", kind: tmux.SessionKindDiff}, false},
+		{"other workspace", row{name: "other/api", kind: tmux.SessionKindEntry}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := mirrorEligible("vb", test.row); got != test.want {
+				t.Fatalf("mirrorEligible = %v, want %v", got, test.want)
+			}
+		})
+	}
+	got := renderRow(row{name: "vb/api", mirrored: true, bell: true, activity: true}, 80)
+	if !strings.Contains(got, "📡") || !strings.Contains(got, "🔔") {
+		t.Fatalf("mirrored bell row = %q", got)
+	}
+}
+
+func TestMirrorKeyStartsEligibleRowAndOverlayBlocksOrdinaryKeys(t *testing.T) {
+	mirrors := newFakeMirror()
+	m := NewModel(&fakeBackend{}, Options{WS: "vb", Root: "/workspace", Mirrors: mirrors})
+	var mod tea.Model = m
+	mod, _ = mod.Update(rowsMsg{sessions: []tmux.SessionInfo{{
+		ID: "$7", Generation: "generation-a", Name: "vb/api", Kind: tmux.SessionKindEntry,
+	}}})
+	mod, cmd := mod.Update(key("m"))
+	got := mod.(Model)
+	if !got.mirrorOpen || cmd == nil {
+		t.Fatalf("mirror overlay/cmd = %v/%v", got.mirrorOpen, cmd)
+	}
+	if msg := cmd(); msg == nil {
+		t.Fatal("mirror command returned no result message")
+	}
+	if len(mirrors.mirrored) != 1 || mirrors.mirrored[0].ID != "$7" {
+		t.Fatalf("mirror calls = %+v", mirrors.mirrored)
+	}
+	before := got.Cursor
+	mod, _ = got.Update(key("j"))
+	if mod.(Model).Cursor != before {
+		t.Fatal("navigation escaped the mirror overlay")
+	}
+}
+
+func TestMirrorOperationMessagesIgnoreStaleCompletionsAndSnapshots(t *testing.T) {
+	mirrors := newFakeMirror()
+	canceled := false
+	m := NewModel(&fakeBackend{}, Options{WS: "vb", Mirrors: mirrors})
+	m.mirrorOpen = true
+	m.mirrorStarting = true
+	m.mirrorOperationID = 2
+	m.mirrorCancel = func() { canceled = true }
+
+	staleSnapshot := mirrorapi.Snapshot{State: mirrorapi.StateStopped}
+	mod, _ := m.Update(mirrorEventMsg{
+		event: mirrorapi.Event{Snapshot: &staleSnapshot},
+		ok:    true,
+	})
+	got := mod.(Model)
+	if !got.mirrorStarting || canceled {
+		t.Fatal("stale snapshot canceled the active mirror operation")
+	}
+
+	mod, _ = got.Update(mirrorOperationMsg{
+		operation: "revoke",
+		token:     1,
+	})
+	got = mod.(Model)
+	if !got.mirrorStarting || !got.mirrorOpen || canceled {
+		t.Fatal("stale operation completion mutated the active mirror operation")
+	}
+
+	mod, _ = got.Update(mirrorOperationMsg{
+		operation: "start",
+		token:     2,
+	})
+	got = mod.(Model)
+	if got.mirrorStarting || !canceled {
+		t.Fatal("current operation completion did not clear its cancellation state")
+	}
+}
+
+func TestMirrorOverlayPreservesPairingURLWhenQRDoesNotFit(t *testing.T) {
+	const pairingURL = "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	m := Model{
+		mirrorOpen:       true,
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: pairingURL,
+			QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE\nQR-LINE-FOUR",
+			Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+		},
+	}
+	m.Width = 30
+	m.Height = 8
+	view := ansi.Strip(m.mirrorView("Terminals"))
+	if !strings.Contains(strings.ReplaceAll(view, "\n", ""), pairingURL) {
+		t.Fatalf("narrow mirror overlay omitted or truncated pairing URL:\n%s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if runewidth.StringWidth(line) > m.Width {
+			t.Fatalf("narrow mirror overlay emitted %d-cell line:\n%s", runewidth.StringWidth(line), view)
+		}
+	}
+	if strings.Contains(view, "QR-LINE") {
+		t.Fatalf("narrow mirror overlay rendered a partial QR:\n%s", view)
+	}
+}
+
+func TestMirrorOverlayScrollsThroughCompletePairingURL(t *testing.T) {
+	const pairingURL = "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	m := Model{
+		mirrorOpen:       true,
+		mirrorTargetName: "vb/api",
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: pairingURL,
+			Sessions:   []mirrorapi.Session{{Name: "vb/api"}},
+		},
+	}
+	m.Width = 12
+	m.Height = 4
+	urlLines := mirrorWrapLine(pairingURL, m.Width)
+	if m.mirrorMaxScroll() == 0 {
+		t.Fatal("short overlay did not expose a scroll range")
+	}
+	for _, want := range urlLines {
+		found := false
+		for offset := 0; offset <= m.mirrorMaxScroll(); offset++ {
+			m.mirrorScroll = offset
+			if strings.Contains(ansi.Strip(m.mirrorView("Terminals")), want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("wrapped credential chunk %q is unreachable", want)
+		}
+	}
+	m.mirrorScroll = 0
+	mod, _ := m.Update(key("down"))
+	if mod.(Model).mirrorScroll != 1 {
+		t.Fatal("down did not scroll the mirror overlay")
+	}
+	mod, _ = mod.Update(key("up"))
+	if mod.(Model).mirrorScroll != 0 {
+		t.Fatal("up did not scroll the mirror overlay")
+	}
+	m.mirrorScroll = m.mirrorMaxScroll()
+	mod, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	if mod.(Model).mirrorScroll != 0 {
+		t.Fatal("resize did not clamp a stale mirror scroll offset")
+	}
+}
+
+func TestMirrorOverlayOmitsQRThatCannotFitScrollViewport(t *testing.T) {
+	m := Model{
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State:      mirrorapi.StateReady,
+			PairingURL: "https://quiet-river.trycloudflare.com/#k=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+			QR:         "QR-LINE-ONE\nQR-LINE-TWO\nQR-LINE-THREE",
+		},
+	}
+	m.Width = 30
+	m.Height = 4
+	if content := strings.Join(m.mirrorContentLines(), "\n"); strings.Contains(content, "QR-LINE") {
+		t.Fatalf("scroll content included an unusable partial QR:\n%s", content)
+	}
+}
+
+func TestMirrorOverlayShowsStartupFailureDetail(t *testing.T) {
+	m := Model{
+		mirrorSnapshot: mirrorapi.Snapshot{
+			State: mirrorapi.StateFailed,
+			Err:   "start cloudflared: timeout\nINF \x1b]52;c;Y2xpcGJvYXJk\a dial tcp blocked",
+		},
+	}
+	m.Width = 18
+	m.Height = 14
+	content := ansi.Strip(m.mirrorView("Terminals"))
+	flatContent := strings.ReplaceAll(content, "\n", "")
+	if want := "start cloudflared: timeoutINF \\x1b]52;c;Y2xpcGJvYXJk\\a dial tcp blocked"; !strings.Contains(flatContent, want) {
+		t.Fatalf("failed mirror overlay omitted diagnostic %q:\n%s", want, content)
+	}
+	for _, r := range content {
+		if r < 0x20 && r != '\n' {
+			t.Fatalf("failed mirror overlay retained control byte %#x:\n%q", r, content)
+		}
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if runewidth.StringWidth(line) > m.Width {
+			t.Fatalf("failed mirror overlay emitted %d-cell line:\n%s", runewidth.StringWidth(line), content)
+		}
+	}
 }
 
 func writeMalformedSelection(t *testing.T, ws string) {
