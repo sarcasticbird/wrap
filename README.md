@@ -1,22 +1,25 @@
 # wrap
 
-Supervise persistent coding-agent terminals from one tmux workspace.
+Supervise persistent coding-agent terminals from one tmux workspace and
+mirror any of them into an encrypted browser session.
 
-> **Status:** `v0.1.0-beta.3` is a pre-1.0 release. CLI and configuration
+> **Status:** `v0.1.0-beta.4` is a pre-1.0 release. CLI and configuration
 > behavior may change before 1.0.
 
 wrap opens a folder, discovers its Git repositories and worktrees, and gives
 you three panes: a repository tree, a persistent terminal, and a monitor of
 every terminal in the workspace. When a program rings the terminal bell, its
-session is marked with a 🔔 without moving the list.
+session is marked with a 🔔 without moving the list. Press `m` to pair a
+selected terminal with a phone or another browser through an ephemeral
+Cloudflare tunnel with application-layer encryption.
 
 <img width="1638" height="1002" alt="Screenshot 2026-07-29 at 8 47 47 AM" src="https://github.com/user-attachments/assets/00f561a5-f4f8-4d4a-b1b8-6ed8c2fa7789" />
-
-<img width="687" height="1144" alt="A766918D-478B-4775-9B76-05A74D83460E_1_105_c" src="https://github.com/user-attachments/assets/d2ed91a8-ff75-46ba-a649-10901c4f7e93" />
 
 ## Why wrap
 
 - See which agent needs attention without cycling through terminal tabs.
+- Take an interactive terminal to your phone or another browser through an
+  encrypted, ephemeral mirror.
 - Detach from the UI without stopping shells, agents, or long-running jobs.
 - Use existing folders, repositories, and worktrees; wrap does not create or
   rearrange them.
@@ -44,7 +47,7 @@ newer on `PATH`; ordinary local use does not.
 Install this beta with Go:
 
 ```sh
-go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.3
+go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.4
 wrap version
 ```
 
@@ -52,7 +55,7 @@ wrap version
 your `PATH`.
 
 Prebuilt archives for macOS and Linux are attached to the
-[`v0.1.0-beta.3` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.3).
+[`v0.1.0-beta.4` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.4).
 Each archive contains `wrap`, `LICENSE`, and `README.md`; verify it against
 `checksums.txt` before installing.
 
