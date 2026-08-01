@@ -1,1 +1,1 @@
-internal/mirror/assets/vendor/** -diff linguist-vendored
+internal/mirror/assets/third_party/** -diff linguist-vendored

@@ -86,6 +86,16 @@ func filePath(ws string) (string, error) {
 	return filepath.Join(d, "current"), nil
 }
 
+// MirrorLogPath returns the privacy-sensitive diagnostic log location for a
+// workspace. The mirror package owns creation, permissions, and rotation.
+func MirrorLogPath(ws string) (string, error) {
+	d, err := dir(ws)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "mirror.log"), nil
+}
+
 // LockWorkspace serializes launch, session mutation, selection writes, and
 // shutdown for one workspace name. The lock is advisory and process-scoped
 // through a file in the same state directory as workspace.json.
@@ -428,7 +438,7 @@ func ReadMeta(ws string) (Meta, bool, error) {
 //
 // Old chrome.json files have no "build" key and decode to 0, so any
 // workspace built before this existed rebuilds on the next launch.
-const ChromeBuild = 14
+const ChromeBuild = 15
 
 // ChromeParams records what the live chrome was BUILT with: the launch
 // params LaunchUI used for its splits/keys, the entry topology fingerprint,

@@ -39,6 +39,90 @@ restarted tmux server generation, wrap closes that viewer instead of attaching
 to a reused session identity. Return to the remote list and select a terminal
 that is still mirrored.
 
+### Browser remains on Checking encryption
+
+Do not install the desktop `xterm` program. wrap embeds the browser terminal
+and all of its xterm.js assets in the binary; a missing host `xterm` executable
+cannot cause this screen.
+
+First press `R` in the mirror overlay and scan the newly displayed QR code.
+Use the same browser tab while testing: the credential is tab-scoped, the URL
+fragment disappears immediately, and an old or revoked credential cannot
+pair. If the new URL still remains on `Checking encryption…`, confirm that the
+host is running the build you intended to test and inspect its mirror log.
+
+Each workspace writes bounded JSONL diagnostics to:
+
+```text
+${XDG_STATE_HOME}/wrap/<workspace>/mirror.log
+```
+
+When `XDG_STATE_HOME` is unset, the path is
+`~/.local/state/wrap/<workspace>/mirror.log`. The file and its single rotated
+backup (`mirror.log.1`) are mode `0600`; each is limited to about 1 MiB. The
+records use UTC timestamps and allowlisted lifecycle codes. They intentionally
+omit pairing credentials, URL queries and fragments, terminal contents,
+session names and IDs, and raw subprocess errors.
+
+Press `h` while the mirror overlay is open for the workspace name, log path,
+and safe tail command. Press `c` to copy the complete pairing URL with
+`pbcopy` on macOS or an available `wl-copy`, `xclip`, or `xsel` helper on Linux
+when selecting it directly in the pane is impractical.
+
+```sh
+workspace=my-workspace
+state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+ls -l "$state_home/wrap/$workspace"/mirror.log*
+tail -n 100 "$state_home/wrap/$workspace/mirror.log"
+```
+
+Look for `server/asset_missing` with `client_asset_unavailable`, handshake
+`rejected` events, tunnel `process_start_failed`, or `process_exit` with code
+`unexpected_exit`, and viewer `open_failed` events. The overlay warning
+`diagnostics unavailable` means logging failed safely; it does not hide a
+ready pairing URL or disable an otherwise healthy mirror.
+
+### Pairing QR is missing or clipped
+
+wrap renders a pairing QR only when the entire overlay composition fits. If
+the Terminals pane is too short, wrap grows that pane using its stable tmux pane
+ID and restores the exact original height when the overlay closes or the QR is
+no longer available. Its adjacent Tree pane temporarily shrinks as it grows;
+the full-height terminal pane, pane widths, zoom, and selection do not change.
+
+If the layout cannot grow far enough, use the complete pairing URL shown near
+the top of the overlay or manually enlarge the pane when prompted. A QR should
+be entirely present or entirely absent; clipped QR rows indicate a bug. Report
+the candidate checksum, tmux version, original pane height, and safe diagnostic
+events, without including the pairing URL or QR image.
+
+### First terminal open remains dashed or unavailable
+
+`Opening terminal…` is expected briefly while wrap verifies that the new tmux
+client and its stable logical window match the captured rows and columns. The
+host performs one corrective resize if needed and does not forward terminal
+output until the geometry converges. A very wide terminal opens at 50% with
+panning; pressing `Fit` explicitly may reveal the full tmux canvas and its
+separators at a much smaller width-fit scale. A tall canvas can remain
+vertically scrollable. Persistent dotted padding or
+`Terminal display unavailable` means that the geometry or browser display gate
+did not complete. It does not mean the host needs a desktop `xterm` program.
+
+Press `Fit` to retry the visible browser measurement. If it still fails, return
+to Terminals and reopen the same terminal. In `mirror.log`, a successful first
+attach ends with `geometry_verified`; `geometry_corrected` records the one safe
+correction, while `geometry_failed` means wrap blocked a mismatched client
+before streaming it. A repeated failure should be reported with the exact wrap
+candidate checksum, phone and browser version, orientation, whether the
+software keyboard was open, and those safe lifecycle events. Do not include
+the pairing URL or fragment, terminal screenshots or content, session names,
+or session IDs.
+
+If the log reports a captured large window but a repeated `80x24` viewer
+window, the candidate is restoring tmux's remembered manual size instead of
+the captured host geometry. Use a build containing the manual-pin resize fix;
+do not weaken the geometry gate.
+
 ## wrap says tmux is missing or too old
 
 wrap requires tmux 3.2 or newer.

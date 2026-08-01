@@ -2,15 +2,20 @@ package mirror
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/sarcasticbird/wrap/internal/tmux"
@@ -23,28 +28,69 @@ type Identity struct {
 
 type Viewer interface {
 	Write([]byte) error
-	Resize(columns, rows uint16) error
 	Close() error
 	Done() <-chan error
 }
 
+type ViewerGeometry struct {
+	Columns uint16
+	Rows    uint16
+
+	statusRows  uint16
+	statusValue string
+}
+
+type viewerClientGeometry struct {
+	name          string
+	pid           int
+	columns       uint16
+	rows          uint16
+	flags         string
+	windowID      string
+	windowColumns uint16
+	windowRows    uint16
+	windowBigger  bool
+	statusRows    uint16
+}
+
+type PreparedViewer interface {
+	Geometry() ViewerGeometry
+	Start() (Viewer, error)
+	Close() error
+}
+
 type ViewerFactory interface {
-	Open(
+	Prepare(
 		ctx context.Context,
 		identity Identity,
-		columns, rows uint16,
 		output func([]byte) error,
-	) (Viewer, error)
+	) (PreparedViewer, error)
 }
 
 type PTYViewerFactory struct {
 	SessionSocket string
 	TmuxPath      string
 	Environment   []string
+	Record        func(DiagnosticRecord)
 
 	pinMu sync.Mutex
 	pins  map[viewerWindowKey]*viewerWindowPin
+	run   func([]string) (string, error)
+
+	queryClient   func(int) (viewerClientGeometry, error)
+	resizePTY     func(*os.File, ViewerGeometry) error
+	refreshClient func(string) error
+	waitGeometry  func(context.Context, time.Duration) error
 }
+
+const (
+	viewerGeometryPollInterval = 10 * time.Millisecond
+	viewerGeometryPhaseTimeout = 2 * time.Second
+	viewerGeometryAttempts     = int(viewerGeometryPhaseTimeout / viewerGeometryPollInterval)
+	viewerWindowPinAttempts    = 3
+)
+
+var errViewerClientNotAttached = errors.New("tmux viewer client is not attached")
 
 type viewerWindowKey struct {
 	generation string
@@ -55,55 +101,150 @@ type viewerWindowPin struct {
 	references        int
 	originalMode      string
 	originalInherited bool
+	restore           bool
+	owner             string
+	hookIndex         uint32
 }
 
-func (f *PTYViewerFactory) Open(
+func (f *PTYViewerFactory) Prepare(
 	ctx context.Context,
 	identity Identity,
-	columns, rows uint16,
 	output func([]byte) error,
-) (Viewer, error) {
-	if err := validateDimensions(columns, rows); err != nil {
-		return nil, err
-	}
+) (PreparedViewer, error) {
 	if output == nil {
 		return nil, errors.New("viewer output callback is required")
 	}
-	windowID, releasePin, err := f.pinWindow(identity)
+	windowID, geometry, releasePin, err := f.pinWindow(identity)
 	if err != nil {
 		return nil, err
 	}
-	command, err := f.buildCommand(identity, windowID)
-	if err != nil {
-		return nil, errors.Join(err, releasePin())
+	return &ptyViewerPreparation{
+		factory:    f,
+		ctx:        ctx,
+		identity:   identity,
+		windowID:   windowID,
+		geometry:   geometry,
+		output:     output,
+		releasePin: releasePin,
+	}, nil
+}
+
+type ptyViewerPreparation struct {
+	factory    *PTYViewerFactory
+	ctx        context.Context
+	identity   Identity
+	windowID   string
+	geometry   ViewerGeometry
+	output     func([]byte) error
+	releasePin func() error
+
+	mu      sync.Mutex
+	started bool
+	closed  bool
+}
+
+func (p *ptyViewerPreparation) Geometry() ViewerGeometry {
+	return p.geometry
+}
+
+func (p *ptyViewerPreparation) Start() (Viewer, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, errors.New("prepared viewer is closed")
 	}
-	ptmx, err := pty.StartWithSize(command, &pty.Winsize{Cols: columns, Rows: rows})
+	if p.started {
+		return nil, errors.New("prepared viewer is already started")
+	}
+	command, err := p.factory.buildCommand(p.identity, p.windowID)
 	if err != nil {
+		p.closed = true
+		return nil, errors.Join(err, p.releasePin())
+	}
+	ptmx, err := pty.StartWithSize(command, &pty.Winsize{
+		Cols: p.geometry.Columns,
+		Rows: p.geometry.Rows,
+	})
+	if err != nil {
+		p.closed = true
 		return nil, errors.Join(
 			fmt.Errorf("start tmux viewer PTY: %w", err),
-			releasePin(),
+			p.releasePin(),
+		)
+	}
+	if command.Process == nil {
+		p.closed = true
+		return nil, errors.Join(
+			errors.New("start tmux viewer PTY: process is unavailable"),
+			stopUnverifiedViewer(command, ptmx),
+			p.releasePin(),
+		)
+	}
+	if _, err := p.factory.verifyViewerGeometry(
+		p.ctx,
+		command.Process.Pid,
+		ptmx,
+		p.windowID,
+		p.geometry,
+	); err != nil {
+		p.closed = true
+		return nil, errors.Join(
+			fmt.Errorf("verify tmux viewer geometry: %w", err),
+			stopUnverifiedViewer(command, ptmx),
+			p.releasePin(),
 		)
 	}
 	viewer := &ptyViewer{
 		command: command,
 		ptmx:    ptmx,
-		output:  output,
+		output:  p.output,
 		terminalEnded: func() (bool, error) {
-			return f.viewerTerminalEnded(identity)
+			return p.factory.viewerTerminalEnded(p.identity)
 		},
-		releasePin: releasePin,
+		releasePin: p.releasePin,
 		done:       make(chan error, 1),
 		finished:   make(chan struct{}),
 	}
 	go viewer.run()
 	go func() {
 		select {
-		case <-ctx.Done():
+		case <-p.ctx.Done():
 			viewer.terminate()
 		case <-viewer.finished:
 		}
 	}()
+	p.started = true
 	return viewer, nil
+}
+
+func stopUnverifiedViewer(command *exec.Cmd, ptmx *os.File) error {
+	var result error
+	if command != nil && command.Process != nil {
+		if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			result = errors.Join(result, fmt.Errorf("stop unverified tmux viewer: %w", err))
+		}
+	}
+	if ptmx != nil {
+		if err := ptmx.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			result = errors.Join(result, fmt.Errorf("close unverified viewer PTY: %w", err))
+		}
+	}
+	if command != nil && command.Process != nil {
+		if err := viewerWaitError(command.Wait(), true); err != nil {
+			result = errors.Join(result, fmt.Errorf("wait for unverified tmux viewer: %w", err))
+		}
+	}
+	return result
+}
+
+func (p *ptyViewerPreparation) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.started || p.closed {
+		return nil
+	}
+	p.closed = true
+	return p.releasePin()
 }
 
 func (f *PTYViewerFactory) buildCommand(
@@ -133,64 +274,185 @@ func (f *PTYViewerFactory) buildCommand(
 
 func (f *PTYViewerFactory) pinWindow(
 	identity Identity,
-) (string, func() error, error) {
+) (string, ViewerGeometry, func() error, error) {
 	f.pinMu.Lock()
 	defer f.pinMu.Unlock()
 	if f.pins == nil {
 		f.pins = make(map[viewerWindowKey]*viewerWindowPin)
 	}
-	args, err := tmux.PinWindowSizeIfGenerationArgs(identity.ID, identity.Generation)
-	if err != nil {
-		return "", nil, err
+	for range viewerWindowPinAttempts {
+		args, err := tmux.CaptureWindowSizeIfGenerationArgs(identity.ID, identity.Generation)
+		if err != nil {
+			return "", ViewerGeometry{}, nil, err
+		}
+		result, err := f.runTmux(args)
+		if err != nil {
+			return "", ViewerGeometry{}, nil, fmt.Errorf("capture mirrored tmux window size: %w", err)
+		}
+		windowID, geometry, mode, inherited, err := parseWindowPin(result)
+		if err != nil {
+			return "", ViewerGeometry{}, nil, fmt.Errorf("capture mirrored tmux window size: %w", err)
+		}
+		key := viewerWindowKey{generation: identity.Generation, windowID: windowID}
+		if pin := f.pins[key]; pin != nil {
+			pin.references++
+			return windowID, geometry, f.releaseWindowFunc(key), nil
+		}
+		windowRows := geometry.Rows - geometry.statusRows
+		owner := ""
+		var hookIndex uint32
+		if inherited {
+			owner, hookIndex, err = newViewerWindowPinOwner()
+			if err != nil {
+				return "", ViewerGeometry{}, nil, err
+			}
+		}
+		pinArgs, err := tmux.PinWindowSizeIfGenerationArgs(
+			identity.ID,
+			identity.Generation,
+			windowID,
+			geometry.Columns,
+			windowRows,
+			mode,
+			inherited,
+			geometry.statusValue,
+			owner,
+			hookIndex,
+		)
+		if err != nil {
+			return "", ViewerGeometry{}, nil, err
+		}
+		pinResult, err := f.runTmux(pinArgs)
+		if err != nil {
+			pinErr := fmt.Errorf("pin mirrored tmux window size: %w", err)
+			if inherited {
+				rollbackErr := f.restoreWindowPin(key, mode, inherited, owner, hookIndex)
+				if rollbackErr != nil {
+					return "", ViewerGeometry{}, nil, errors.Join(
+						pinErr,
+						fmt.Errorf("roll back partial mirrored tmux window pin: %w", rollbackErr),
+					)
+				}
+			}
+			if tmux.IsWindowPinConflictError(err) {
+				continue
+			}
+			return "", ViewerGeometry{}, nil, pinErr
+		}
+		if tmux.IsWindowPinMismatchOutput(pinResult) {
+			continue
+		}
+		if strings.TrimSpace(pinResult) != "" {
+			pinErr := fmt.Errorf("unexpected tmux window pin result %q", pinResult)
+			if inherited {
+				if rollbackErr := f.restoreWindowPin(key, mode, inherited, owner, hookIndex); rollbackErr != nil {
+					return "", ViewerGeometry{}, nil, errors.Join(
+						pinErr,
+						fmt.Errorf("roll back partial mirrored tmux window pin: %w", rollbackErr),
+					)
+				}
+			}
+			return "", ViewerGeometry{}, nil, pinErr
+		}
+		f.pins[key] = &viewerWindowPin{
+			references:        1,
+			originalMode:      mode,
+			originalInherited: inherited,
+			restore:           inherited,
+			owner:             owner,
+			hookIndex:         hookIndex,
+		}
+		return windowID, geometry, f.releaseWindowFunc(key), nil
 	}
-	result, err := f.runTmux(args)
-	if err != nil {
-		return "", nil, fmt.Errorf("pin mirrored tmux window size: %w", err)
-	}
-	windowID, mode, inherited, err := parseWindowPin(result)
-	if err != nil {
-		return "", nil, fmt.Errorf("pin mirrored tmux window size: %w", err)
-	}
-	key := viewerWindowKey{generation: identity.Generation, windowID: windowID}
-	if pin := f.pins[key]; pin != nil {
-		pin.references++
-		return windowID, f.releaseWindowFunc(key), nil
-	}
-	f.pins[key] = &viewerWindowPin{
-		references:        1,
-		originalMode:      mode,
-		originalInherited: inherited,
-	}
-	return windowID, f.releaseWindowFunc(key), nil
+	return "", ViewerGeometry{}, nil, errors.New("tmux window state did not stabilize for mirroring")
 }
 
-func parseWindowPin(result string) (windowID, mode string, inherited bool, err error) {
-	lines := strings.Split(strings.TrimSpace(result), "\n")
-	if len(lines) != 2 {
-		return "", "", false, fmt.Errorf("unexpected tmux pin result %q", result)
+func parseWindowPin(result string) (
+	windowID string,
+	geometry ViewerGeometry,
+	mode string,
+	inherited bool,
+	err error,
+) {
+	windowID, geometry, mode, inherited, err = parseWindowPinUnchecked(result)
+	if err != nil {
+		return "", ViewerGeometry{}, "", false, err
 	}
-	windowID = strings.TrimSpace(lines[0])
+	if err := validateDimensions(geometry.Columns, geometry.Rows); err != nil {
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("invalid tmux window geometry: %w", err)
+	}
+	return windowID, geometry, mode, inherited, nil
+}
+
+func parseWindowPinUnchecked(result string) (
+	windowID string,
+	geometry ViewerGeometry,
+	mode string,
+	inherited bool,
+	err error,
+) {
+	lines := strings.Split(strings.TrimSpace(result), "\n")
+	if len(lines) != 3 {
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux pin result %q", result)
+	}
+	geometryFields := strings.Split(lines[0], "\t")
+	if len(geometryFields) != 3 {
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux window geometry %q", lines[0])
+	}
+	windowID = strings.TrimSpace(geometryFields[0])
 	if !validWindowID(windowID) {
-		return "", "", false, fmt.Errorf("unexpected tmux window id %q", windowID)
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux window id %q", windowID)
+	}
+	columns, columnsErr := strconv.ParseUint(geometryFields[1], 10, 16)
+	rows, rowsErr := strconv.ParseUint(geometryFields[2], 10, 16)
+	if columnsErr != nil || rowsErr != nil {
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux window geometry %q", lines[0])
+	}
+	statusRows, err := parseStatusRows(lines[2])
+	if err != nil {
+		return "", ViewerGeometry{}, "", false, err
+	}
+	if rows > uint64(^uint16(0))-uint64(statusRows) {
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("tmux viewer rows overflow: %d + %d", rows, statusRows)
+	}
+	geometry = ViewerGeometry{
+		Columns:     uint16(columns),
+		Rows:        uint16(rows) + statusRows,
+		statusRows:  statusRows,
+		statusValue: strings.TrimSpace(lines[2]),
 	}
 	fields := strings.Fields(lines[1])
 	if len(fields) != 2 {
-		return "", "", false, fmt.Errorf("unexpected tmux window-size result %q", lines[1])
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux window-size result %q", lines[1])
 	}
 	switch fields[0] {
 	case "window-size":
 	case "window-size*":
 		inherited = true
 	default:
-		return "", "", false, fmt.Errorf("unexpected tmux window-size source %q", fields[0])
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux window-size source %q", fields[0])
 	}
 	mode = fields[1]
 	switch mode {
 	case "largest", "smallest", "manual", "latest":
 	default:
-		return "", "", false, fmt.Errorf("unexpected tmux window-size mode %q", mode)
+		return "", ViewerGeometry{}, "", false, fmt.Errorf("unexpected tmux window-size mode %q", mode)
 	}
-	return windowID, mode, inherited, nil
+	return windowID, geometry, mode, inherited, nil
+}
+
+func parseStatusRows(value string) (uint16, error) {
+	switch value = strings.TrimSpace(value); value {
+	case "off":
+		return 0, nil
+	case "on":
+		return 1, nil
+	}
+	rows, err := strconv.ParseUint(value, 10, 16)
+	if err != nil || rows > 5 {
+		return 0, fmt.Errorf("unexpected tmux status value %q", value)
+	}
+	return uint16(rows), nil
 }
 
 func validWindowID(windowID string) bool {
@@ -203,6 +465,239 @@ func validWindowID(windowID string) bool {
 		}
 	}
 	return true
+}
+
+func parseViewerClientGeometry(result string, targetPID int) (viewerClientGeometry, error) {
+	if targetPID <= 0 {
+		return viewerClientGeometry{}, fmt.Errorf("invalid viewer client pid %d", targetPID)
+	}
+	var match *viewerClientGeometry
+	for _, line := range strings.Split(strings.TrimSpace(result), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 10 {
+			return viewerClientGeometry{}, fmt.Errorf("unexpected tmux client geometry %q", line)
+		}
+		pidValue, err := strconv.ParseInt(fields[1], 10, 0)
+		if err != nil || pidValue <= 0 {
+			return viewerClientGeometry{}, fmt.Errorf("unexpected tmux client pid %q", fields[1])
+		}
+		columns, columnsErr := strconv.ParseUint(fields[2], 10, 16)
+		rows, rowsErr := strconv.ParseUint(fields[3], 10, 16)
+		windowColumns, windowColumnsErr := strconv.ParseUint(fields[6], 10, 16)
+		windowRows, windowRowsErr := strconv.ParseUint(fields[7], 10, 16)
+		if columnsErr != nil || rowsErr != nil || windowColumnsErr != nil || windowRowsErr != nil {
+			return viewerClientGeometry{}, fmt.Errorf("unexpected tmux client dimensions %q", line)
+		}
+		if !validWindowID(fields[5]) {
+			return viewerClientGeometry{}, fmt.Errorf("unexpected tmux client window id %q", fields[5])
+		}
+		var windowBigger bool
+		switch fields[8] {
+		case "0":
+		case "1":
+			windowBigger = true
+		default:
+			return viewerClientGeometry{}, fmt.Errorf("unexpected tmux window-bigger value %q", fields[8])
+		}
+		statusRows, statusErr := parseStatusRows(fields[9])
+		if statusErr != nil {
+			return viewerClientGeometry{}, statusErr
+		}
+		if int(pidValue) != targetPID {
+			continue
+		}
+		if match != nil {
+			return viewerClientGeometry{}, fmt.Errorf("duplicate tmux viewer client pid %d", targetPID)
+		}
+		value := viewerClientGeometry{
+			name:          fields[0],
+			pid:           int(pidValue),
+			columns:       uint16(columns),
+			rows:          uint16(rows),
+			flags:         fields[4],
+			windowID:      fields[5],
+			windowColumns: uint16(windowColumns),
+			windowRows:    uint16(windowRows),
+			windowBigger:  windowBigger,
+			statusRows:    statusRows,
+		}
+		match = &value
+	}
+	if match == nil {
+		return viewerClientGeometry{}, fmt.Errorf("%w: pid %d", errViewerClientNotAttached, targetPID)
+	}
+	return *match, nil
+}
+
+func viewerGeometryMatches(
+	captured ViewerGeometry,
+	windowID string,
+	client viewerClientGeometry,
+) bool {
+	return client.windowID == windowID &&
+		viewerClientHasFlag(client.flags, "ignore-size") &&
+		client.columns == captured.Columns &&
+		client.rows == captured.Rows &&
+		client.windowColumns == captured.Columns &&
+		!client.windowBigger &&
+		client.statusRows == captured.statusRows &&
+		uint32(client.windowRows)+uint32(captured.statusRows) == uint32(captured.Rows)
+}
+
+func viewerClientHasFlag(flags, want string) bool {
+	for flag := range strings.SplitSeq(flags, ",") {
+		if strings.TrimSpace(flag) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *PTYViewerFactory) verifyViewerGeometry(
+	ctx context.Context,
+	pid int,
+	ptmx *os.File,
+	windowID string,
+	captured ViewerGeometry,
+) (ViewerGeometryDiagnostic, error) {
+	report := viewerGeometryDiagnostic(captured, viewerClientGeometry{}, false)
+	emitDiagnostic(f.Record, DiagnosticRecord{
+		Level: "info", Component: "viewer", Event: "geometry_preparing",
+		ViewerGeometry: &report,
+	})
+	corrected := false
+	for attempt := 0; attempt < viewerGeometryAttempts; attempt++ {
+		client, err := f.viewerClientGeometry(pid)
+		if err != nil {
+			if errors.Is(err, errViewerClientNotAttached) {
+				if waitErr := f.waitForViewerGeometry(ctx); waitErr != nil {
+					return f.failViewerGeometry(report, waitErr)
+				}
+				continue
+			}
+			return f.failViewerGeometry(report, err)
+		}
+		report = viewerGeometryDiagnostic(captured, client, corrected)
+		if client.windowID != windowID {
+			return f.failViewerGeometry(report, fmt.Errorf(
+				"tmux viewer attached to window %s instead of pinned window", client.windowID,
+			))
+		}
+		if viewerGeometryMatches(captured, windowID, client) {
+			emitDiagnostic(f.Record, DiagnosticRecord{
+				Level: "info", Component: "viewer", Event: "geometry_verified",
+				ViewerGeometry: &report,
+			})
+			return report, nil
+		}
+		if !corrected {
+			if err := f.resizeViewerPTY(ptmx, captured); err != nil {
+				return f.failViewerGeometry(report, err)
+			}
+			if err := f.refreshViewerClient(client.name); err != nil {
+				return f.failViewerGeometry(report, err)
+			}
+			corrected = true
+			report.Corrected = true
+			emitDiagnostic(f.Record, DiagnosticRecord{
+				Level: "info", Component: "viewer", Event: "geometry_corrected",
+				ViewerGeometry: &report,
+			})
+			// Attachment discovery and post-resize convergence are separate
+			// bounded phases. A client first observed on the last discovery
+			// attempt must still receive a verification query after correction.
+			attempt = -1
+		}
+		if err := f.waitForViewerGeometry(ctx); err != nil {
+			return f.failViewerGeometry(report, err)
+		}
+	}
+	return f.failViewerGeometry(report, errors.New("tmux viewer geometry did not converge"))
+}
+
+func viewerGeometryDiagnostic(
+	captured ViewerGeometry,
+	client viewerClientGeometry,
+	corrected bool,
+) ViewerGeometryDiagnostic {
+	return ViewerGeometryDiagnostic{
+		CapturedColumns: captured.Columns,
+		CapturedRows:    captured.Rows,
+		ClientColumns:   client.columns,
+		ClientRows:      client.rows,
+		WindowColumns:   client.windowColumns,
+		WindowRows:      client.windowRows,
+		StatusRows:      captured.statusRows,
+		Corrected:       corrected,
+	}
+}
+
+func (f *PTYViewerFactory) failViewerGeometry(
+	report ViewerGeometryDiagnostic,
+	err error,
+) (ViewerGeometryDiagnostic, error) {
+	emitDiagnostic(f.Record, DiagnosticRecord{
+		Level: "warn", Component: "viewer", Event: "geometry_failed",
+		ViewerGeometry: &report,
+	})
+	return report, err
+}
+
+func (f *PTYViewerFactory) viewerClientGeometry(pid int) (viewerClientGeometry, error) {
+	if f.queryClient != nil {
+		return f.queryClient(pid)
+	}
+	result, err := f.runTmux([]string{
+		"list-clients", "-F",
+		"#{client_name}\t#{client_pid}\t#{client_width}\t#{client_height}\t#{client_flags}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window_bigger}\t#{status}",
+	})
+	if err != nil {
+		return viewerClientGeometry{}, fmt.Errorf("query tmux viewer client geometry: %w", err)
+	}
+	return parseViewerClientGeometry(result, pid)
+}
+
+func (f *PTYViewerFactory) resizeViewerPTY(ptmx *os.File, geometry ViewerGeometry) error {
+	if f.resizePTY != nil {
+		return f.resizePTY(ptmx, geometry)
+	}
+	if ptmx == nil {
+		return errors.New("viewer PTY is unavailable")
+	}
+	if err := pty.Setsize(ptmx, &pty.Winsize{Cols: geometry.Columns, Rows: geometry.Rows}); err != nil {
+		return fmt.Errorf("correct viewer PTY geometry: %w", err)
+	}
+	return nil
+}
+
+func (f *PTYViewerFactory) refreshViewerClient(name string) error {
+	if f.refreshClient != nil {
+		return f.refreshClient(name)
+	}
+	if name == "" {
+		return errors.New("tmux viewer client name is empty")
+	}
+	if _, err := f.runTmux([]string{"refresh-client", "-t", name}); err != nil {
+		return fmt.Errorf("refresh tmux viewer client: %w", err)
+	}
+	return nil
+}
+
+func (f *PTYViewerFactory) waitForViewerGeometry(ctx context.Context) error {
+	if f.waitGeometry != nil {
+		return f.waitGeometry(ctx, viewerGeometryPollInterval)
+	}
+	timer := time.NewTimer(viewerGeometryPollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (f *PTYViewerFactory) releaseWindowFunc(key viewerWindowKey) func() error {
@@ -228,11 +723,28 @@ func (f *PTYViewerFactory) releaseWindow(key viewerWindowKey) error {
 		return nil
 	}
 	delete(f.pins, key)
+	if !pin.restore {
+		return nil
+	}
+	return f.restoreWindowPin(
+		key, pin.originalMode, pin.originalInherited, pin.owner, pin.hookIndex,
+	)
+}
+
+func (f *PTYViewerFactory) restoreWindowPin(
+	key viewerWindowKey,
+	mode string,
+	inherited bool,
+	owner string,
+	hookIndex uint32,
+) error {
 	args, err := tmux.RestoreWindowSizeIfGenerationArgs(
 		key.generation,
 		key.windowID,
-		pin.originalMode,
-		pin.originalInherited,
+		mode,
+		inherited,
+		owner,
+		hookIndex,
 	)
 	if err != nil {
 		return err
@@ -241,13 +753,33 @@ func (f *PTYViewerFactory) releaseWindow(key viewerWindowKey) error {
 		return nil
 	} else if tmux.IsMissingTargetError(err) {
 		return nil
+	} else if err != nil && strings.Contains(strings.ToLower(err.Error()), "server exited unexpectedly") {
+		// Killing the final session can make tmux exit between the viewer's
+		// terminal-end probe and pin cleanup. There is no surviving window to
+		// restore, so that shutdown race is already a successful cleanup.
+		return nil
 	} else if err != nil {
 		return fmt.Errorf("restore mirrored tmux window size: %w", err)
 	}
 	return nil
 }
 
+func newViewerWindowPinOwner() (string, uint32, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", 0, fmt.Errorf("create tmux window pin owner: %w", err)
+	}
+	hookIndex := binary.BigEndian.Uint32(value[:4]) & 0x7fffffff
+	if hookIndex == 0 {
+		hookIndex = 1
+	}
+	return hex.EncodeToString(value[:]), hookIndex, nil
+}
+
 func (f *PTYViewerFactory) runTmux(args []string) (string, error) {
+	if f.run != nil {
+		return f.run(args)
+	}
 	tmuxPath, socket, err := f.commandSettings()
 	if err != nil {
 		return "", err
@@ -340,18 +872,6 @@ func (v *ptyViewer) Write(data []byte) error {
 	defer v.ioMu.Unlock()
 	if _, err := v.ptmx.Write(data); err != nil {
 		return fmt.Errorf("write viewer PTY: %w", err)
-	}
-	return nil
-}
-
-func (v *ptyViewer) Resize(columns, rows uint16) error {
-	if err := validateDimensions(columns, rows); err != nil {
-		return err
-	}
-	v.ioMu.Lock()
-	defer v.ioMu.Unlock()
-	if err := pty.Setsize(v.ptmx, &pty.Winsize{Cols: columns, Rows: rows}); err != nil {
-		return fmt.Errorf("resize viewer PTY: %w", err)
 	}
 	return nil
 }

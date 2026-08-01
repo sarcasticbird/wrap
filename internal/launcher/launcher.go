@@ -2,6 +2,7 @@
 package launcher
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -9,10 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sarcasticbird/wrap/internal/config"
 	"github.com/sarcasticbird/wrap/internal/state"
@@ -35,7 +39,12 @@ type Manager struct {
 	Exe  string // absolute path to the wrap binary, for pane commands
 	WS   string // workspace name
 
-	workspaceLockHeld bool
+	workspaceLockHeld        bool
+	currentPane              string
+	mirrorPaneMu             sync.Mutex
+	mirrorPaneOriginalHeight int
+	clipboardMu              sync.Mutex
+	clipboardWrite           func(string) error
 }
 
 func New(ws string) (*Manager, error) {
@@ -49,11 +58,146 @@ func New(ws string) (*Manager, error) {
 	// fixed wrap:0.N pane targets.
 	ui.ConfigFile = os.DevNull
 	return &Manager{
-		UI:   ui,
-		Sess: tmux.NewServer(tmux.SocketSessions),
-		Exe:  exe,
-		WS:   ws,
+		UI:             ui,
+		Sess:           tmux.NewServer(tmux.SocketSessions),
+		Exe:            exe,
+		WS:             ws,
+		currentPane:    os.Getenv("TMUX_PANE"),
+		clipboardWrite: writeSystemClipboard,
 	}, nil
+}
+
+const maxMirrorClipboardBytes = 4096
+
+// CopyMirrorPairingURL sends the pairing URL to a platform clipboard helper
+// over stdin. It never enters a process argument, terminal control sequence,
+// or persistent tmux paste buffer.
+func (m *Manager) CopyMirrorPairingURL(value string) error {
+	if value == "" || len(value) > maxMirrorClipboardBytes {
+		return errors.New("clipboard value has invalid length")
+	}
+	write := m.clipboardWrite
+	if write == nil {
+		write = writeSystemClipboard
+	}
+	m.clipboardMu.Lock()
+	defer m.clipboardMu.Unlock()
+	if err := write(value); err != nil {
+		return fmt.Errorf("copy pairing URL: %w", err)
+	}
+	return nil
+}
+
+const clipboardWriteTimeout = 2 * time.Second
+
+func clipboardCommand(
+	goos string,
+	lookPath func(string) (string, error),
+) (string, []string, error) {
+	type candidate struct {
+		name string
+		args []string
+	}
+	var candidates []candidate
+	switch goos {
+	case "darwin":
+		candidates = []candidate{{name: "pbcopy"}}
+	case "linux":
+		wayland := []candidate{{name: "wl-copy"}}
+		x11 := []candidate{
+			{name: "xclip", args: []string{"-selection", "clipboard"}},
+			{name: "xsel", args: []string{"--clipboard", "--input"}},
+		}
+		if os.Getenv("WAYLAND_DISPLAY") != "" {
+			candidates = append(wayland, x11...)
+		} else if os.Getenv("DISPLAY") != "" {
+			candidates = append(x11, wayland...)
+		} else {
+			candidates = append(wayland, x11...)
+		}
+	default:
+		return "", nil, fmt.Errorf("system clipboard is unsupported on %s", goos)
+	}
+	for _, candidate := range candidates {
+		if path, err := lookPath(candidate.name); err == nil {
+			return path, candidate.args, nil
+		}
+	}
+	return "", nil, errors.New("no supported system clipboard helper found")
+}
+
+func writeSystemClipboard(value string) error {
+	path, args, err := clipboardCommand(runtime.GOOS, exec.LookPath)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), clipboardWriteTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, path, args...)
+	command.Stdin = strings.NewReader(value)
+	if err := command.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return errors.New("system clipboard helper timed out")
+		}
+		return fmt.Errorf("system clipboard helper failed: %w", err)
+	}
+	return nil
+}
+
+// EnsureMirrorPaneHeight grows the Terms pane just enough to show a complete
+// pairing QR. The pane that launched this process is addressed by its stable
+// tmux ID, and its exact original height is retained for restoration.
+func (m *Manager) EnsureMirrorPaneHeight(required int) error {
+	m.mirrorPaneMu.Lock()
+	defer m.mirrorPaneMu.Unlock()
+
+	current, err := m.UI.PaneHeight(m.currentPane)
+	if err != nil {
+		return fmt.Errorf("read Terms pane height: %w", err)
+	}
+	if current >= required {
+		return nil
+	}
+
+	capturedOriginal := false
+	if m.mirrorPaneOriginalHeight == 0 {
+		m.mirrorPaneOriginalHeight = current
+		capturedOriginal = true
+	}
+	if err := m.UI.ResizePaneHeight(m.currentPane, required); err != nil {
+		if capturedOriginal {
+			m.mirrorPaneOriginalHeight = 0
+		}
+		return fmt.Errorf("grow Terms pane for pairing QR: %w", err)
+	}
+	return nil
+}
+
+// RestoreMirrorPaneHeight returns a pane grown for the pairing QR to its exact
+// prior height. State is retained after an error so process cleanup can retry.
+func (m *Manager) RestoreMirrorPaneHeight() error {
+	m.mirrorPaneMu.Lock()
+	defer m.mirrorPaneMu.Unlock()
+
+	if m.mirrorPaneOriginalHeight == 0 {
+		return nil
+	}
+	if err := m.UI.ResizePaneHeight(m.currentPane, m.mirrorPaneOriginalHeight); err != nil {
+		return fmt.Errorf("restore Terms pane height: %w", err)
+	}
+	restored, err := m.UI.PaneHeight(m.currentPane)
+	if err != nil {
+		return fmt.Errorf("verify restored Terms pane height: %w", err)
+	}
+	if restored != m.mirrorPaneOriginalHeight {
+		return fmt.Errorf(
+			"restore Terms pane height: tmux reached %d rows, want %d",
+			restored,
+			m.mirrorPaneOriginalHeight,
+		)
+	}
+	m.mirrorPaneOriginalHeight = 0
+	return nil
 }
 
 // SessionCurrentPath reads the active pane path only while the captured

@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -21,7 +22,13 @@ type ServerOptions struct {
 	PublicHost string
 	Handler    ClientHandler
 	Random     io.Reader
+	Record     func(DiagnosticRecord)
 }
+
+const (
+	remoteDiagnosticQueueSize = 8
+	remoteDiagnosticInterval  = time.Minute
+)
 
 type ClientHandler interface {
 	InitialSessions() []Session
@@ -29,18 +36,29 @@ type ClientHandler interface {
 	Open(context.Context, *Client, OpenRequest) error
 	Close(*Client) error
 	Input(*Client, []byte) error
-	Resize(*Client, ResizeRequest) error
 	Disconnected(*Client)
 }
 
 type LocalServer struct {
-	listener net.Listener
-	server   *http.Server
-	ctx      context.Context
-	cancel   context.CancelFunc
-	secret   Secret
-	handler  ClientHandler
-	random   io.Reader
+	listener             net.Listener
+	server               *http.Server
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	secret               Secret
+	handler              ClientHandler
+	random               io.Reader
+	assetFS              fs.FS
+	record               func(DiagnosticRecord)
+	stopOnce             sync.Once
+	remoteDiagnostics    chan DiagnosticRecord
+	remoteDiagnosticStop chan struct{}
+	remoteDiagnosticDone chan struct{}
+	remoteStopOnce       sync.Once
+	remoteDiagnosticMu   sync.Mutex
+	remoteDiagnosticLast map[string]time.Time
+	remoteStopped        bool
+	now                  func() time.Time
+	websocketHandlers    sync.WaitGroup
 
 	handshakes chan struct{}
 	clients    chan struct{}
@@ -57,15 +75,22 @@ func StartLocalServer(ctx context.Context, options ServerOptions) (*LocalServer,
 		return nil, fmt.Errorf("listen for mirror server: %w", err)
 	}
 	server := &LocalServer{
-		listener:      listener,
-		secret:        options.Secret,
-		handler:       options.Handler,
-		random:        options.Random,
-		publicHost:    options.PublicHost,
-		handshakes:    make(chan struct{}, MaxHandshakes),
-		clients:       make(chan struct{}, MaxClients),
-		secretVersion: 1,
-		connections:   make(map[*Client]uint64),
+		listener:             listener,
+		secret:               options.Secret,
+		handler:              options.Handler,
+		random:               options.Random,
+		assetFS:              assets,
+		record:               options.Record,
+		publicHost:           options.PublicHost,
+		handshakes:           make(chan struct{}, MaxHandshakes),
+		clients:              make(chan struct{}, MaxClients),
+		secretVersion:        1,
+		connections:          make(map[*Client]uint64),
+		remoteDiagnostics:    make(chan DiagnosticRecord, remoteDiagnosticQueueSize),
+		remoteDiagnosticStop: make(chan struct{}),
+		remoteDiagnosticDone: make(chan struct{}),
+		remoteDiagnosticLast: make(map[string]time.Time),
+		now:                  time.Now,
 	}
 	if server.handler == nil {
 		server.handler = noOpClientHandler{}
@@ -78,6 +103,7 @@ func StartLocalServer(ctx context.Context, options ServerOptions) (*LocalServer,
 		Handler:           server,
 		ReadHeaderTimeout: HandshakeTimeout,
 	}
+	go server.runRemoteDiagnostics()
 	go func() {
 		<-server.ctx.Done()
 		_ = server.Close(context.Background())
@@ -88,11 +114,78 @@ func StartLocalServer(ctx context.Context, options ServerOptions) (*LocalServer,
 			_ = listener.Close()
 		}
 	}()
+	emitDiagnostic(server.record, DiagnosticRecord{Level: "info", Component: "server", Event: "started"})
 	return server, nil
 }
 
 func (s *LocalServer) LocalURL() string {
 	return "http://" + s.listener.Addr().String()
+}
+
+func (s *LocalServer) runRemoteDiagnostics() {
+	defer close(s.remoteDiagnosticDone)
+	for {
+		select {
+		case record := <-s.remoteDiagnostics:
+			emitDiagnostic(s.record, record)
+		case <-s.remoteDiagnosticStop:
+			for {
+				select {
+				case record := <-s.remoteDiagnostics:
+					emitDiagnostic(s.record, record)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *LocalServer) stopRemoteDiagnostics() {
+	s.remoteStopOnce.Do(func() {
+		s.remoteDiagnosticMu.Lock()
+		s.remoteStopped = true
+		close(s.remoteDiagnosticStop)
+		s.remoteDiagnosticMu.Unlock()
+	})
+}
+
+func (s *LocalServer) recordHandshakeRejection(code string) {
+	s.recordRemoteDiagnostic("handshake:"+code, DiagnosticRecord{
+		Level: "warn", Component: "handshake", Event: "rejected", Code: code,
+	})
+}
+
+func (s *LocalServer) recordMissingAsset(name string) {
+	if !requiredMirrorAsset(name) {
+		return
+	}
+	s.recordRemoteDiagnostic("asset:"+name, DiagnosticRecord{
+		Level: "error", Component: "server", Event: "asset_missing",
+		Code: "client_asset_unavailable", Path: name,
+	})
+}
+
+func (s *LocalServer) recordRemoteDiagnostic(key string, record DiagnosticRecord) {
+	if s.record == nil {
+		return
+	}
+	now := s.now()
+	s.remoteDiagnosticMu.Lock()
+	defer s.remoteDiagnosticMu.Unlock()
+	if s.remoteStopped {
+		return
+	}
+	last := s.remoteDiagnosticLast[key]
+	if !last.IsZero() && now.Sub(last) < remoteDiagnosticInterval {
+		return
+	}
+
+	select {
+	case s.remoteDiagnostics <- record:
+		s.remoteDiagnosticLast[key] = now
+	default:
+	}
 }
 
 func (s *LocalServer) SetPublicHost(host string) {
@@ -117,7 +210,27 @@ func (s *LocalServer) SetSecret(secret Secret) {
 
 func (s *LocalServer) Close(ctx context.Context) error {
 	s.cancel()
-	return s.server.Shutdown(ctx)
+	err := s.server.Shutdown(ctx)
+	handlersDone := make(chan struct{})
+	go func() {
+		s.websocketHandlers.Wait()
+		close(handlersDone)
+	}()
+	select {
+	case <-handlersDone:
+	case <-ctx.Done():
+		return errors.Join(err, fmt.Errorf("wait for mirror WebSocket handlers: %w", ctx.Err()))
+	}
+	s.stopRemoteDiagnostics()
+	select {
+	case <-s.remoteDiagnosticDone:
+		s.stopOnce.Do(func() {
+			emitDiagnostic(s.record, DiagnosticRecord{Level: "info", Component: "server", Event: "stopped"})
+		})
+		return err
+	case <-ctx.Done():
+		return errors.Join(err, fmt.Errorf("drain mirror diagnostics: %w", ctx.Err()))
+	}
 }
 
 func (s *LocalServer) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -150,9 +263,12 @@ func (s *LocalServer) ServeHTTP(response http.ResponseWriter, request *http.Requ
 }
 
 func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *http.Request) {
+	s.websocketHandlers.Add(1)
+	defer s.websocketHandlers.Done()
 	select {
 	case s.handshakes <- struct{}{}:
 	default:
+		s.recordHandshakeRejection("server_busy")
 		http.Error(response, "mirror is busy", http.StatusServiceUnavailable)
 		return
 	}
@@ -168,11 +284,13 @@ func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *htt
 	secretVersion := s.secretVersion
 	s.mu.RUnlock()
 	if publicHost == "" {
+		s.recordHandshakeRejection("server_starting")
 		http.Error(response, "mirror is starting", http.StatusServiceUnavailable)
 		return
 	}
 	origins := request.Header.Values("Origin")
 	if len(origins) != 1 || origins[0] != "https://"+publicHost {
+		s.recordHandshakeRejection("origin_rejected")
 		http.Error(response, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -181,6 +299,7 @@ func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *htt
 		CompressionMode:    websocket.CompressionDisabled,
 	})
 	if err != nil {
+		s.recordHandshakeRejection("upgrade_failed")
 		return
 	}
 	connection.SetReadLimit(MaxWireMessage)
@@ -196,12 +315,18 @@ func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *htt
 	<-s.handshakes
 	handshakeHeld = false
 	if err != nil {
-		_ = connection.Close(websocket.StatusPolicyViolation, "authentication failed")
+		s.recordHandshakeRejection("authentication_failed")
+		if s.ctx.Err() != nil {
+			_ = connection.CloseNow()
+		} else {
+			_ = connection.Close(websocket.StatusPolicyViolation, "authentication failed")
+		}
 		return
 	}
 	select {
 	case s.clients <- struct{}{}:
 	default:
+		s.recordHandshakeRejection("client_capacity")
 		_ = connection.Close(websocket.StatusTryAgainLater, "mirror client capacity reached")
 		return
 	}
@@ -209,6 +334,7 @@ func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *htt
 	s.mu.Lock()
 	if secretVersion != s.secretVersion {
 		s.mu.Unlock()
+		s.recordHandshakeRejection("credential_expired")
 		_ = connection.Close(websocket.StatusPolicyViolation, "pairing credential expired")
 		return
 	}
@@ -225,9 +351,11 @@ func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *htt
 		TagMirrorList,
 		SessionList{Sessions: s.handler.InitialSessions()},
 	); err != nil {
+		s.recordHandshakeRejection("session_list_failed")
 		_ = connection.Close(websocket.StatusInternalError, "mirror unavailable")
 		return
 	}
+	emitDiagnostic(s.record, DiagnosticRecord{Level: "info", Component: "handshake", Event: "authenticated"})
 	s.handler.Connected(client)
 	client.run(s.ctx)
 }
@@ -239,18 +367,39 @@ func (noOpClientHandler) Connected(*Client)                                {}
 func (noOpClientHandler) Open(context.Context, *Client, OpenRequest) error { return nil }
 func (noOpClientHandler) Close(*Client) error                              { return nil }
 func (noOpClientHandler) Input(*Client, []byte) error                      { return nil }
-func (noOpClientHandler) Resize(*Client, ResizeRequest) error              { return nil }
 func (noOpClientHandler) Disconnected(*Client)                             {}
 
 func (s *LocalServer) serveAsset(response http.ResponseWriter, name, contentType string) {
-	data, err := fs.ReadFile(assets, name)
+	assetFS := s.assetFS
+	if assetFS == nil {
+		assetFS = assets
+	}
+	data, err := fs.ReadFile(assetFS, name)
 	if err != nil {
+		s.recordMissingAsset(name)
 		http.NotFound(response, nil)
 		return
 	}
 	response.Header().Set("Content-Type", contentType)
 	response.WriteHeader(http.StatusOK)
 	_, _ = response.Write(data)
+}
+
+func requiredMirrorAsset(name string) bool {
+	switch name {
+	case "assets/index.html",
+		"assets/wrap-mirror.css",
+		"assets/wrap-mirror-bootstrap.js",
+		"assets/wrap-mirror.js",
+		"assets/wrap-mirror-state.js",
+		"assets/wrap-mirror-viewport.js",
+		"assets/third_party/xterm/xterm.mjs",
+		"assets/third_party/xterm/xterm.css",
+		"assets/third_party/xterm/addon-fit.mjs":
+		return true
+	default:
+		return false
+	}
 }
 
 func assetContentType(name string) string {

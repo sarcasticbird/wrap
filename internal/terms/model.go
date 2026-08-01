@@ -36,6 +36,9 @@ type Backend interface {
 	ShutdownWorkspace() error
 	SetWorkspaceAlert(alert bool) error
 	RingWorkspaceAlert() error
+	CopyMirrorPairingURL(string) error
+	EnsureMirrorPaneHeight(required int) error
+	RestoreMirrorPaneHeight() error
 }
 
 var _ Backend = (*launcher.Manager)(nil)
@@ -127,49 +130,61 @@ type mirrorOperationMsg struct {
 	err       error
 }
 
+type mirrorCopyMsg struct {
+	token uint64
+	err   error
+}
+
 type mirrorReconcileMsg struct {
 	err error
 }
 
 type Model struct {
 	pane.Nav
-	backend           Backend
-	ws                string
-	root              string
-	cmd               string
-	sessions          map[string]tmux.SessionInfo
-	lastSeen          map[string]int64
-	expanded          map[sessionKey]bool
-	paths             map[sessionKey]pathState
-	current           string // last-read state-selection (the tree's pick)
-	display           string // local Enter/`n` switch override; cleared when state picks anew
-	renaming          bool
-	renameBuf         []rune
-	renameTarget      string // session identity captured at "r" time; survives row churn before enter
-	renameTargetID    string
-	renameTargetGen   string
-	alerted           bool   // last workspace-level alert state pushed to the title
-	alertRung         bool   // one-shot BEL attempted for the current alert episode
-	stale             string // why the last session poll failed; "" once one succeeds again
-	selectionStale    string // why the last selection read failed; rows still update
-	alertErr          string // why the last title transition failed; "" once one lands
-	ringErr           string // why this episode's one-shot BEL failed; held until clear
-	displayStale      string // why the displayed-session read failed; last display remains
-	polling           bool
-	timerPending      bool
-	keys              config.Keys
-	helpOpen          bool
-	mirrors           Mirror
-	mirrorSnapshot    mirrorapi.Snapshot
-	mirrorOpen        bool
-	mirrorTarget      mirrorapi.Identity
-	mirrorTargetName  string
-	mirrorCancel      context.CancelFunc
-	mirrorStarting    bool
-	mirrorOperationID uint64
-	mirrorScroll      int
-	mirrorReconciling bool
-	mirrorSyncErr     string
+	backend                   Backend
+	ws                        string
+	root                      string
+	cmd                       string
+	sessions                  map[string]tmux.SessionInfo
+	lastSeen                  map[string]int64
+	expanded                  map[sessionKey]bool
+	paths                     map[sessionKey]pathState
+	current                   string // last-read state-selection (the tree's pick)
+	display                   string // local Enter/`n` switch override; cleared when state picks anew
+	renaming                  bool
+	renameBuf                 []rune
+	renameTarget              string // session identity captured at "r" time; survives row churn before enter
+	renameTargetID            string
+	renameTargetGen           string
+	alerted                   bool   // last workspace-level alert state pushed to the title
+	alertRung                 bool   // one-shot BEL attempted for the current alert episode
+	stale                     string // why the last session poll failed; "" once one succeeds again
+	selectionStale            string // why the last selection read failed; rows still update
+	alertErr                  string // why the last title transition failed; "" once one lands
+	ringErr                   string // why this episode's one-shot BEL failed; held until clear
+	displayStale              string // why the displayed-session read failed; last display remains
+	polling                   bool
+	timerPending              bool
+	keys                      config.Keys
+	helpOpen                  bool
+	mirrors                   Mirror
+	mirrorSnapshot            mirrorapi.Snapshot
+	mirrorOpen                bool
+	mirrorHelpOpen            bool
+	mirrorTarget              mirrorapi.Identity
+	mirrorTargetName          string
+	mirrorCancel              context.CancelFunc
+	mirrorStarting            bool
+	mirrorOperationID         uint64
+	mirrorCopyOperationID     uint64
+	mirrorScroll              int
+	mirrorReconciling         bool
+	mirrorSyncErr             string
+	mirrorCopyStatus          string
+	mirrorLayoutErr           string
+	mirrorPaneResizeRequested int
+	mirrorPaneRestorePending  bool
+	mirrorPaneGrowthFailed    bool
 }
 
 // NewModel builds an empty terms Model; the first tick populates rows.
@@ -244,10 +259,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.Width, m.Height = msg.Width, msg.Height
+		if m.Height < m.mirrorPaneResizeRequested {
+			m.mirrorPaneResizeRequested = 0
+		}
+		m = m.syncMirrorPaneHeight()
 		m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
 		return m, nil
 	case tickMsg:
 		m.timerPending = false
+		m = m.syncMirrorPaneHeight()
 		return m.startPoll()
 	case rowsMsg:
 		m.polling = false
@@ -378,6 +398,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.event.Snapshot != nil {
 			if msg.event.Snapshot.PairingURL != m.mirrorSnapshot.PairingURL {
 				m.mirrorScroll = 0
+				m.invalidateMirrorCopy()
 			}
 			m.mirrorSnapshot = *msg.event.Snapshot
 		}
@@ -390,6 +411,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		m = m.syncMirrorPaneHeight()
 		return m, waitMirrorEvent(m.mirrors.Events())
 	case mirrorOperationMsg:
 		if msg.token != m.mirrorOperationID {
@@ -406,6 +428,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.operation == "revoke" {
 			m.mirrorOpen = false
+			m.mirrorHelpOpen = false
+			m.invalidateMirrorCopy()
+		}
+		m = m.syncMirrorPaneHeight()
+		return m, nil
+	case mirrorCopyMsg:
+		if msg.token != m.mirrorCopyOperationID {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.mirrorCopyStatus = "pairing URL copy failed"
+		} else {
+			m.mirrorCopyStatus = "pairing URL copied"
 		}
 		return m, nil
 	case mirrorReconcileMsg:
@@ -537,9 +572,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.ErrText = ""
 		m.mirrorOpen = true
+		m.mirrorHelpOpen = false
+		m.invalidateMirrorCopy()
 		m.mirrorScroll = 0
 		m.mirrorTarget = mirrorapi.Identity{ID: target.id, Generation: target.generation}
 		m.mirrorTargetName = target.name
+		m = m.syncMirrorPaneHeight()
 		if target.mirrored {
 			return m, nil
 		}
@@ -670,6 +708,21 @@ func (m Model) startMirror(target row) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.mirrorCopyStatus = ""
+	if m.mirrorHelpOpen {
+		switch msg.String() {
+		case "up", "k":
+			m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
+			m.mirrorScroll = max(0, m.mirrorScroll-1)
+		case "down", "j":
+			m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
+			m.mirrorScroll = min(m.mirrorMaxScroll(), m.mirrorScroll+1)
+		case "h", "esc":
+			m.mirrorHelpOpen = false
+			m.mirrorScroll = 0
+		}
+		return m, nil
+	}
 	switch msg.String() {
 	case "up", "k":
 		m.mirrorScroll = min(m.mirrorScroll, m.mirrorMaxScroll())
@@ -681,6 +734,25 @@ func (m Model) handleMirrorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clearMirrorCancel()
 		m.mirrorStarting = false
 		m.mirrorOpen = false
+		m.mirrorHelpOpen = false
+		m.invalidateMirrorCopy()
+		m = m.syncMirrorPaneHeight()
+	case "h":
+		m.mirrorHelpOpen = true
+		m.mirrorScroll = 0
+	case "c":
+		if m.mirrorSnapshot.State != mirrorapi.StateReady || m.mirrorSnapshot.PairingURL == "" {
+			return m, nil
+		}
+		pairingURL := m.mirrorSnapshot.PairingURL
+		m.mirrorCopyOperationID++
+		token := m.mirrorCopyOperationID
+		return m, func() tea.Msg {
+			return mirrorCopyMsg{
+				token: token,
+				err:   m.backend.CopyMirrorPairingURL(pairingURL),
+			}
+		}
 	case "x":
 		if m.mirrors == nil || !m.targetIsMirrored() {
 			return m, nil
@@ -724,6 +796,11 @@ func (m *Model) beginMirrorOperation() uint64 {
 	return m.mirrorOperationID
 }
 
+func (m *Model) invalidateMirrorCopy() {
+	m.mirrorCopyOperationID++
+	m.mirrorCopyStatus = ""
+}
+
 func mirrorEligible(workspace string, target row) bool {
 	return config.SessionOwnedBy(workspace, target.name) && target.kind != tmux.SessionKindDiff
 }
@@ -735,6 +812,45 @@ func (m Model) targetIsMirrored() bool {
 		}
 	}
 	return false
+}
+
+func (m Model) syncMirrorPaneHeight() Model {
+	required, qrFitsWidth := m.mirrorQRRequiredHeight()
+	needsGrowth := m.mirrorOpen && qrFitsWidth && m.Height > 0 && m.Height < required
+	if needsGrowth {
+		if m.mirrorPaneResizeRequested >= required {
+			return m
+		}
+		if err := m.backend.EnsureMirrorPaneHeight(required); err != nil {
+			m.mirrorLayoutErr = "pairing layout unavailable; enlarge pane manually"
+			m.mirrorPaneGrowthFailed = true
+			return m
+		}
+		m.mirrorPaneResizeRequested = required
+		m.mirrorPaneRestorePending = true
+		m.mirrorPaneGrowthFailed = false
+		m.mirrorLayoutErr = ""
+		return m
+	}
+	if m.mirrorOpen && qrFitsWidth && m.Height >= required && m.mirrorPaneGrowthFailed {
+		m.mirrorLayoutErr = ""
+		m.mirrorPaneGrowthFailed = false
+	}
+
+	if m.mirrorPaneRestorePending && (!m.mirrorOpen || !qrFitsWidth || m.mirrorSnapshot.State != mirrorapi.StateReady) {
+		if err := m.backend.RestoreMirrorPaneHeight(); err != nil {
+			m.mirrorLayoutErr = "pairing layout restore failed"
+			m.mirrorPaneGrowthFailed = false
+			return m
+		}
+		m.mirrorPaneResizeRequested = 0
+		m.mirrorPaneRestorePending = false
+	}
+	if !m.mirrorPaneRestorePending {
+		m.mirrorLayoutErr = ""
+		m.mirrorPaneGrowthFailed = false
+	}
+	return m
 }
 
 // handleRenameKey handles all key input while renaming: printable runes
@@ -1123,8 +1239,19 @@ func (m Model) footer() string {
 	if m.ringErr != "" {
 		return pane.AlertStyle.Render(" alert failed: " + m.ringErr + " ")
 	}
+	mirrorErrors := make([]string, 0, 2)
+	if m.mirrorLayoutErr != "" {
+		mirrorErrors = append(mirrorErrors, m.mirrorLayoutErr)
+	}
 	if m.mirrorSyncErr != "" {
-		return pane.AlertStyle.Render(" " + m.mirrorSyncErr + " ")
+		mirrorErrors = append(mirrorErrors, m.mirrorSyncErr)
+	}
+	if len(mirrorErrors) != 0 {
+		status := " " + strings.Join(mirrorErrors, " · ") + " "
+		if m.Width > 0 {
+			status = runewidth.Truncate(status, m.Width, "")
+		}
+		return pane.AlertStyle.Render(status)
 	}
 	return ""
 }
@@ -1141,13 +1268,18 @@ func (m Model) mirrorView(heading string) string {
 		lines = append(lines, content...)
 	}
 	footer := "esc close"
-	if m.mirrorSnapshot.State == mirrorapi.StateReady {
-		footer = "x revoke · R rotate · esc close"
+	if m.mirrorHelpOpen {
+		footer = "h / esc close help"
+	} else if m.mirrorSnapshot.State == mirrorapi.StateReady {
+		footer = "c copy · x revoke · R rotate · esc close"
 	} else if !m.mirrorStarting {
 		footer = "m retry · esc close"
 	}
 	if m.mirrorMaxScroll() > 0 {
 		footer = "↑/↓ scroll · " + footer
+	}
+	if m.mirrorCopyStatus != "" {
+		footer = m.mirrorCopyStatus + " · " + footer
 	}
 	for i := range lines {
 		if m.Width > 0 {
@@ -1167,37 +1299,18 @@ func (m Model) mirrorView(heading string) string {
 }
 
 func (m Model) mirrorContentLines() []string {
+	if m.mirrorHelpOpen {
+		return m.mirrorHelpContentLines()
+	}
 	var lines []string
 	switch {
 	case m.mirrorStarting || m.mirrorSnapshot.State == mirrorapi.StateStarting:
 		lines = append(lines, "", "Starting encrypted mirror…", "", m.mirrorTargetName)
 	case m.mirrorSnapshot.State == mirrorapi.StateReady:
-		lines = append(lines, "")
-		lines = append(lines, mirrorWrapLine(m.mirrorSnapshot.PairingURL, m.Width)...)
-		lines = append(lines,
-			"",
-			"Anyone with this URL can control mirrored terminals.",
-			"",
-			m.mirrorTargetName+" · "+strconv.Itoa(len(m.mirrorSnapshot.Sessions))+" mirrored",
-		)
-		if m.mirrorSnapshot.QR != "" {
-			qrLines := strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")
-			qrFitsWidth := m.Width <= 0
-			if !qrFitsWidth {
-				qrFitsWidth = true
-				for _, line := range qrLines {
-					if runewidth.StringWidth(line) > m.Width {
-						qrFitsWidth = false
-						break
-					}
-				}
-			}
-			qrFitsHeight := m.Height <= 0 || len(qrLines) <= max(0, m.Height-2)
-			if qrFitsWidth && qrFitsHeight {
-				lines = append(lines, "")
-				lines = append(lines, qrLines...)
-			}
-		}
+		requiredHeight, qrFitsWidth := m.mirrorQRRequiredHeight()
+		includeQR := qrFitsWidth && (m.Height <= 0 || m.Height >= requiredHeight)
+		showQRHint := m.mirrorSnapshot.QR != "" && !includeQR
+		lines = append(lines, m.mirrorReadyContentLines(includeQR, showQRHint)...)
 	default:
 		lines = append(lines,
 			"",
@@ -1211,7 +1324,76 @@ func (m Model) mirrorContentLines() []string {
 			}
 		}
 	}
+	if m.mirrorSnapshot.DiagnosticsWarning != "" {
+		lines = append(lines, "", pane.SafeLabel(m.mirrorSnapshot.DiagnosticsWarning))
+	}
+	if m.mirrorLayoutErr != "" {
+		lines = append(lines, "", m.mirrorLayoutErr)
+	}
 	return lines
+}
+
+func (m Model) mirrorHelpContentLines() []string {
+	lines := []string{
+		"",
+		"Mirror help",
+		"",
+		"c copy pairing URL · x revoke · R rotate",
+		"",
+		"Diagnostics",
+		"workspace=" + shellQuote(m.ws),
+		`state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}`,
+		`tail -n 40 "$state_home/wrap/$workspace/mirror.log"`,
+		"",
+		"Credentials and terminal contents are omitted from this log.",
+	}
+	var wrapped []string
+	for _, line := range lines {
+		wrapped = append(wrapped, mirrorWrapLine(line, m.Width)...)
+	}
+	return wrapped
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func (m Model) mirrorReadyContentLines(includeQR, showQRHint bool) []string {
+	lines := []string{""}
+	lines = append(lines, mirrorWrapLine(m.mirrorSnapshot.PairingURL, m.Width)...)
+	if showQRHint {
+		lines = append(lines, "", "Enlarge pane to show QR")
+	}
+	lines = append(lines,
+		"",
+		"Anyone with this URL can control mirrored terminals.",
+		"",
+		m.mirrorTargetName+" · "+strconv.Itoa(len(m.mirrorSnapshot.Sessions))+" mirrored",
+	)
+	if includeQR {
+		lines = append(lines, "")
+		lines = append(lines, strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")...)
+	}
+	return lines
+}
+
+func (m Model) mirrorQRRequiredHeight() (int, bool) {
+	if m.mirrorSnapshot.State != mirrorapi.StateReady || m.mirrorSnapshot.QR == "" {
+		return 0, false
+	}
+	qrLines := strings.Split(strings.Trim(m.mirrorSnapshot.QR, "\n"), "\n")
+	if m.Width > 0 {
+		for _, line := range qrLines {
+			if runewidth.StringWidth(line) > m.Width {
+				return 0, false
+			}
+		}
+	}
+	contentHeight := len(m.mirrorReadyContentLines(true, false))
+	if m.mirrorSnapshot.DiagnosticsWarning != "" {
+		contentHeight += 2
+	}
+	return contentHeight + 2, true
 }
 
 func (m Model) mirrorMaxScroll() int {

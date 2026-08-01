@@ -21,18 +21,12 @@ import (
 type integrationViewer struct {
 	output func([]byte) error
 	writes chan []byte
-	sizes  chan ResizeRequest
 	done   chan error
 	once   sync.Once
 }
 
 func (v *integrationViewer) Write(data []byte) error {
 	v.writes <- append([]byte(nil), data...)
-	return nil
-}
-
-func (v *integrationViewer) Resize(columns, rows uint16) error {
-	v.sizes <- ResizeRequest{Columns: columns, Rows: rows}
 	return nil
 }
 
@@ -112,17 +106,18 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 		Viewers: viewerFactoryFunc(func(
 			_ context.Context,
 			_ Identity,
-			_, _ uint16,
 			output func([]byte) error,
-		) (Viewer, error) {
+		) (PreparedViewer, error) {
 			viewer := &integrationViewer{
 				output: output,
 				writes: make(chan []byte, 1),
-				sizes:  make(chan ResizeRequest, 1),
 				done:   make(chan error),
 			}
 			openedViewers <- viewer
-			return viewer, nil
+			return &fakePreparedViewer{
+				geometry: ViewerGeometry{Columns: 132, Rows: 41},
+				viewer:   viewer,
+			}, nil
 		}),
 		StartServer: func(ctx context.Context, options ServerOptions) (ServerResource, error) {
 			server, startErr := StartLocalServer(ctx, options)
@@ -161,9 +156,12 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	assertSessionFrame(t, connection, opener, TagStatus, "vb/api", "vb/web")
 
 	writeEncryptedControl(t, connection, sealer, TagOpen, OpenRequest{
-		ID: session.ID, Generation: session.Generation, Columns: 80, Rows: 24,
+		ID: session.ID, Generation: session.Generation,
 	})
 	viewer := receiveWithin(t, openedViewers, "viewer open")
+	assertOpenedFrame(t, connection, opener, Opened{
+		ID: session.ID, Generation: session.Generation, Columns: 132, Rows: 41,
+	})
 	if got := receiveWithin(t, acknowledged, "viewer acknowledgement"); got != (Identity{
 		ID: session.ID, Generation: session.Generation,
 	}) {
@@ -175,12 +173,6 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	writeEncryptedRaw(t, connection, sealer, TagInput, []byte("hello"))
 	if got := string(receiveWithin(t, viewer.writes, "viewer input")); got != "hello" {
 		t.Fatalf("viewer input = %q", got)
-	}
-	writeEncryptedControl(t, connection, sealer, TagResize, ResizeRequest{
-		Columns: 120, Rows: 40,
-	})
-	if got := receiveWithin(t, viewer.sizes, "viewer resize"); got != (ResizeRequest{Columns: 120, Rows: 40}) {
-		t.Fatalf("viewer resize = %+v", got)
 	}
 	if err := viewer.output([]byte("world")); err != nil {
 		t.Fatal(err)
@@ -197,9 +189,12 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	}
 
 	writeEncryptedControl(t, connection, sealer, TagOpen, OpenRequest{
-		ID: secondSession.ID, Generation: secondSession.Generation, Columns: 90, Rows: 30,
+		ID: secondSession.ID, Generation: secondSession.Generation,
 	})
 	secondViewer := receiveWithin(t, openedViewers, "second viewer open")
+	assertOpenedFrame(t, connection, opener, Opened{
+		ID: secondSession.ID, Generation: secondSession.Generation, Columns: 132, Rows: 41,
+	})
 	if got := receiveWithin(t, acknowledged, "second viewer acknowledgement"); got != (Identity{
 		ID: secondSession.ID, Generation: secondSession.Generation,
 	}) {
@@ -336,11 +331,11 @@ func dialEncryptedManager(
 		t.Fatal(err)
 	}
 	salt := append(append([]byte(nil), serverNonce...), clientNonce...)
-	c2s, err := hkdf.Key(sha256.New, secret[:], salt, "wrap-mirror/v1/c2s", 32)
+	c2s, err := hkdf.Key(sha256.New, secret[:], salt, "wrap-mirror/v2/c2s", 32)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2c, err := hkdf.Key(sha256.New, secret[:], salt, "wrap-mirror/v1/s2c", 32)
+	s2c, err := hkdf.Key(sha256.New, secret[:], salt, "wrap-mirror/v2/s2c", 32)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,6 +416,26 @@ func assertSessionFrame(
 		if list.Sessions[i].Name != wantName {
 			t.Fatalf("session %d name = %q, want %q", i, list.Sessions[i].Name, wantName)
 		}
+	}
+}
+
+func assertOpenedFrame(
+	t *testing.T,
+	connection *websocket.Conn,
+	opener *integrationCipher,
+	want Opened,
+) {
+	t.Helper()
+	tag, payload := readEncryptedFrame(t, connection, opener)
+	if tag != TagOpened {
+		t.Fatalf("opened frame tag = 0x%02x, want 0x%02x", tag, TagOpened)
+	}
+	var opened Opened
+	if err := DecodeControl(tag, payload, &opened); err != nil {
+		t.Fatal(err)
+	}
+	if opened != want {
+		t.Fatalf("opened frame = %+v, want %+v", opened, want)
 	}
 }
 

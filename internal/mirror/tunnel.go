@@ -88,6 +88,7 @@ type TunnelOptions struct {
 	Command        commandFactory
 	StartupTimeout time.Duration
 	StopTimeout    time.Duration
+	Record         func(DiagnosticRecord)
 }
 
 type Tunnel struct {
@@ -102,6 +103,7 @@ type Tunnel struct {
 	waitErr error
 	closing bool
 	once    sync.Once
+	record  func(DiagnosticRecord)
 }
 
 func StartTunnel(ctx context.Context, localURL string, options TunnelOptions) (*Tunnel, error) {
@@ -154,6 +156,7 @@ func StartTunnel(ctx context.Context, localURL string, options TunnelOptions) (*
 	command.Stdout = output
 	command.Stderr = output
 	if err := command.Start(); err != nil {
+		emitDiagnostic(options.Record, DiagnosticRecord{Level: "error", Component: "tunnel", Event: "process_start_failed", Code: "process_unavailable"})
 		cancelProcess()
 		return nil, fmt.Errorf("start cloudflared Quick Tunnel: %w", err)
 	}
@@ -164,12 +167,15 @@ func StartTunnel(ctx context.Context, localURL string, options TunnelOptions) (*
 		stop:    stopTimeout,
 		done:    make(chan error, 1),
 		waited:  make(chan struct{}),
+		record:  options.Record,
 	}
+	emitDiagnostic(tunnel.record, DiagnosticRecord{Level: "info", Component: "tunnel", Event: "process_started"})
 	go tunnel.wait()
 
 	for {
 		if publicURL, parseErr := extractQuickTunnelURL(diagnostics.String()); parseErr == nil {
 			tunnel.url = publicURL
+			emitDiagnostic(tunnel.record, DiagnosticRecord{Level: "info", Component: "tunnel", Event: "ready"})
 			return tunnel, nil
 		}
 		select {
@@ -225,6 +231,7 @@ func (t *Tunnel) Close() error {
 			<-t.waited
 		}
 		t.cancel()
+		emitDiagnostic(t.record, DiagnosticRecord{Level: "info", Component: "tunnel", Event: "stopped"})
 	})
 	return t.waitError()
 }
@@ -237,6 +244,7 @@ func (t *Tunnel) wait() {
 	t.waitErr = err
 	t.mu.Unlock()
 	if !closing {
+		emitDiagnostic(t.record, DiagnosticRecord{Level: "error", Component: "tunnel", Event: "process_exit", Code: "unexpected_exit"})
 		t.done <- err
 	}
 	close(t.done)

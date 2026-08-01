@@ -11,6 +11,33 @@ import (
 	"github.com/sarcasticbird/wrap/internal/config"
 )
 
+func TestMirrorLogPathUsesXDGStateHome(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", root)
+	got, err := MirrorLogPath("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "wrap", "api", "mirror.log")
+	if got != want {
+		t.Fatalf("mirror log path = %q, want %q", got, want)
+	}
+}
+
+func TestMirrorLogPathFallsBackToUserStateDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", home)
+	got, err := MirrorLogPath("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".local", "state", "wrap", "api", "mirror.log")
+	if got != want {
+		t.Fatalf("mirror log path = %q, want %q", got, want)
+	}
+}
+
 func TestLockWorkspaceSerializesSameName(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	releaseFirst, err := LockWorkspace("api")
@@ -292,6 +319,12 @@ func TestChromeBuildIncludesPaneHeadingsAndHelp(t *testing.T) {
 func TestChromeBuildIncludesMirrorManager(t *testing.T) {
 	if ChromeBuild < 14 {
 		t.Fatalf("ChromeBuild = %d, want at least 14 so existing watch panes restart with mirror ownership and shutdown semantics", ChromeBuild)
+	}
+}
+
+func TestChromeBuildIncludesMobileMirrorAndPairingLayout(t *testing.T) {
+	if ChromeBuild < 15 {
+		t.Fatalf("ChromeBuild = %d, want at least 15 so existing terms panes restart with mobile mirror assets and pairing layout management", ChromeBuild)
 	}
 }
 

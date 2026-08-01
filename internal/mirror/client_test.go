@@ -10,15 +10,13 @@ import (
 )
 
 type dispatchHandler struct {
-	openErr   error
-	closeErr  error
-	inputErr  error
-	resizeErr error
-	onOpen    func(*Client)
-	onClose   func(*Client)
-	onInput   func(*Client)
-	onResize  func(*Client)
-	sessions  []Session
+	openErr  error
+	closeErr error
+	inputErr error
+	onOpen   func(*Client)
+	onClose  func(*Client)
+	onInput  func(*Client)
+	sessions []Session
 }
 
 func (h dispatchHandler) InitialSessions() []Session { return h.sessions }
@@ -40,12 +38,6 @@ func (h dispatchHandler) Input(client *Client, _ []byte) error {
 		h.onInput(client)
 	}
 	return h.inputErr
-}
-func (h dispatchHandler) Resize(client *Client, _ ResizeRequest) error {
-	if h.onResize != nil {
-		h.onResize(client)
-	}
-	return h.resizeErr
 }
 func (dispatchHandler) Disconnected(*Client) {}
 
@@ -96,7 +88,7 @@ func TestClientDispatchEnforcesOneOpenViewer(t *testing.T) {
 		queue:   newOutboundQueue(MaxClientQueueBytes),
 	}
 	open, err := EncodeControl(TagOpen, OpenRequest{
-		ID: "$7", Generation: "generation-a", Columns: 80, Rows: 24,
+		ID: "$7", Generation: "generation-a",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,10 +105,6 @@ func TestClientDispatchEnforcesOneOpenViewer(t *testing.T) {
 }
 
 func TestClientDispatchDropsFramesForViewerThatJustEnded(t *testing.T) {
-	resize, err := EncodeControl(TagResize, ResizeRequest{Columns: 80, Rows: 24})
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, test := range []struct {
 		name    string
 		tag     byte
@@ -124,7 +112,6 @@ func TestClientDispatchDropsFramesForViewerThatJustEnded(t *testing.T) {
 	}{
 		{name: "close", tag: TagClose},
 		{name: "input", tag: TagInput, payload: []byte("x")},
-		{name: "resize", tag: TagResize, payload: resize},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &Client{
@@ -162,7 +149,6 @@ func TestClientDispatchValidatesFramesForViewerThatJustEnded(t *testing.T) {
 	}{
 		{name: "non-empty close", tag: TagClose, payload: []byte("x")},
 		{name: "oversized input", tag: TagInput, payload: make([]byte, MaxWireMessage)},
-		{name: "malformed resize", tag: TagResize, payload: []byte("{")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &Client{
@@ -178,10 +164,6 @@ func TestClientDispatchValidatesFramesForViewerThatJustEnded(t *testing.T) {
 
 func TestClientDispatchDropsHandlerErrorAfterConcurrentViewerEnd(t *testing.T) {
 	handlerErr := errors.New("no terminal is open")
-	resize, err := EncodeControl(TagResize, ResizeRequest{Columns: 80, Rows: 24})
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, test := range []struct {
 		name    string
 		tag     byte
@@ -200,13 +182,6 @@ func TestClientDispatchDropsHandlerErrorAfterConcurrentViewerEnd(t *testing.T) {
 			handler: dispatchHandler{
 				inputErr: handlerErr,
 				onInput:  func(client *Client) { client.markViewerClosed() },
-			},
-		},
-		{
-			name: "resize", tag: TagResize, payload: resize,
-			handler: dispatchHandler{
-				resizeErr: handlerErr,
-				onResize:  func(client *Client) { client.markViewerClosed() },
 			},
 		},
 	} {
@@ -252,7 +227,7 @@ func TestClientDispatchTurnsOpenFailureIntoFixedEncryptedError(t *testing.T) {
 		queue:   newOutboundQueue(MaxClientQueueBytes),
 	}
 	open, err := EncodeControl(TagOpen, OpenRequest{
-		ID: "$7", Generation: "generation-a", Columns: 80, Rows: 24,
+		ID: "$7", Generation: "generation-a",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -275,6 +250,30 @@ func TestClientDispatchTurnsOpenFailureIntoFixedEncryptedError(t *testing.T) {
 	}
 }
 
+func TestClientDispatchDropsOpenErrorAfterConcurrentViewerEnd(t *testing.T) {
+	client := &Client{
+		handler: dispatchHandler{
+			openErr: errors.New("terminal disappeared during open"),
+			onOpen:  func(client *Client) { client.markViewerClosed() },
+		},
+		queue: newOutboundQueue(MaxClientQueueBytes),
+	}
+	open, err := EncodeControl(TagOpen, OpenRequest{
+		ID: "$7", Generation: "generation-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.dispatch(t.Context(), TagOpen, open); err != nil {
+		t.Fatalf("concurrent viewer end closed client: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if frame, ok := client.queue.pop(ctx); ok {
+		t.Fatalf("concurrent viewer end queued stale frame: %+v", frame)
+	}
+}
+
 func TestClientDispatchDoesNotOverwriteImmediateViewerClose(t *testing.T) {
 	client := &Client{
 		handler: dispatchHandler{onOpen: func(client *Client) {
@@ -283,7 +282,7 @@ func TestClientDispatchDoesNotOverwriteImmediateViewerClose(t *testing.T) {
 		queue: newOutboundQueue(MaxClientQueueBytes),
 	}
 	open, err := EncodeControl(TagOpen, OpenRequest{
-		ID: "$7", Generation: "generation-a", Columns: 80, Rows: 24,
+		ID: "$7", Generation: "generation-a",
 	})
 	if err != nil {
 		t.Fatal(err)

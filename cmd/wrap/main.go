@@ -351,6 +351,7 @@ func runWatch(ws string) error {
 		Workspace:     ws,
 		SessionSocket: tmux.SocketSessions,
 		Acknowledger:  m,
+		Diagnostics:   mirrorDiagnostics(ws),
 	})
 	if err != nil {
 		return err
@@ -363,6 +364,16 @@ func runWatch(ws string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return errors.Join(runErr, mirrors.Shutdown(shutdownCtx))
+}
+
+func mirrorDiagnostics(ws string) mirror.DiagnosticSink {
+	path, err := state.MirrorLogPath(ws)
+	if err != nil {
+		return mirror.DiagnosticSinkFunc(func(mirror.DiagnosticRecord) error {
+			return err
+		})
+	}
+	return mirror.NewJSONLDiagnosticSink(path)
 }
 
 func runAttach(ws string) error {

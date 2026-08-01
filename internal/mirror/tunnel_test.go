@@ -83,6 +83,7 @@ while :; do sleep 1; done
 	}
 	var mu sync.Mutex
 	var calls [][]string
+	diagnostics := &recordingDiagnosticSink{}
 	command := func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		mu.Lock()
 		calls = append(calls, append([]string{name}, args...))
@@ -94,6 +95,9 @@ while :; do sleep 1; done
 		Command:        command,
 		StartupTimeout: time.Second,
 		StopTimeout:    time.Second,
+		Record: func(record DiagnosticRecord) {
+			_ = diagnostics.Write(record)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -112,6 +116,12 @@ while :; do sleep 1; done
 	got := strings.Join(calls[1], " ")
 	if !strings.HasSuffix(got, "tunnel --no-autoupdate --url http://127.0.0.1:43210") {
 		t.Fatalf("tunnel command = %q", got)
+	}
+	records := diagnostics.snapshot()
+	for _, event := range []string{"process_started", "ready", "stopped"} {
+		if !containsDiagnostic(records, "tunnel", event, "") {
+			t.Fatalf("missing tunnel diagnostic %q in %+v", event, records)
+		}
 	}
 }
 

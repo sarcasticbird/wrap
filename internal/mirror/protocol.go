@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	ProtocolVersion = 1
+	ProtocolVersion = 2
 
 	TagClientHello byte = 0x01
 	TagMirrorList  byte = 0x02
@@ -19,7 +19,7 @@ const (
 	TagClose       byte = 0x05
 	TagInput       byte = 0x06
 	TagOutput      byte = 0x07
-	TagResize      byte = 0x08
+	TagOpened      byte = 0x08
 	TagRevoked     byte = 0x09
 	TagShutdown    byte = 0x0a
 	TagError       byte = 0x0b
@@ -52,13 +52,13 @@ type SessionList struct {
 type OpenRequest struct {
 	ID         string `json:"id"`
 	Generation string `json:"generation"`
-	Columns    uint16 `json:"columns"`
-	Rows       uint16 `json:"rows"`
 }
 
-type ResizeRequest struct {
-	Columns uint16 `json:"columns"`
-	Rows    uint16 `json:"rows"`
+type Opened struct {
+	ID         string `json:"id"`
+	Generation string `json:"generation"`
+	Columns    uint16 `json:"columns"`
+	Rows       uint16 `json:"rows"`
 }
 
 type Revoked struct {
@@ -132,7 +132,6 @@ func ValidateClientFrame(tag byte, value any) error {
 		if err := validateIdentity(open.ID, open.Generation); err != nil {
 			return err
 		}
-		return validateDimensions(open.Columns, open.Rows)
 	case TagClose:
 		switch payload := value.(type) {
 		case nil:
@@ -151,12 +150,6 @@ func ValidateClientFrame(tag byte, value any) error {
 		if len(payload)+1+16 > MaxWireMessage {
 			return errors.New("input payload exceeds wire limit")
 		}
-	case TagResize:
-		resize, ok := value.(ResizeRequest)
-		if !ok {
-			return errors.New("invalid resize payload")
-		}
-		return validateDimensions(resize.Columns, resize.Rows)
 	default:
 		return fmt.Errorf("tag 0x%02x is not valid from client", tag)
 	}
@@ -193,6 +186,15 @@ func ValidateServerFrame(tag byte, value any) error {
 		if len(payload)+1+16 > MaxWireMessage {
 			return errors.New("output payload exceeds wire limit")
 		}
+	case TagOpened:
+		opened, ok := value.(Opened)
+		if !ok {
+			return errors.New("invalid opened payload")
+		}
+		if err := validateIdentity(opened.ID, opened.Generation); err != nil {
+			return err
+		}
+		return validateDimensions(opened.Columns, opened.Rows)
 	case TagRevoked:
 		revoked, ok := value.(Revoked)
 		if !ok {
@@ -250,7 +252,7 @@ func validateDimensions(columns, rows uint16) error {
 
 func isControlTag(tag byte) bool {
 	switch tag {
-	case TagClientHello, TagMirrorList, TagStatus, TagOpen, TagResize,
+	case TagClientHello, TagMirrorList, TagStatus, TagOpen, TagOpened,
 		TagRevoked, TagShutdown, TagError:
 		return true
 	default:

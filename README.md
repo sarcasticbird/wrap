@@ -47,7 +47,18 @@ require `cloudflared`.
 
 ## Install
 
-Install this beta with Go:
+Install from the
+[`sarcasticbird/homebrew-tap`](https://github.com/sarcasticbird/homebrew-tap):
+
+```sh
+brew install sarcasticbird/tap/wrap
+wrap version
+```
+
+The formula installs tmux as a dependency. Encrypted browser mirroring still
+requires `cloudflared`; install it separately as shown below.
+
+Or install this beta from source with Go:
 
 ```sh
 go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.4
@@ -175,18 +186,48 @@ Focus a workspace-root, repository/worktree, or scratch row in Terminals and
 press `m`. wrap starts a loopback-only web server and an ephemeral Cloudflare
 Quick Tunnel, then shows a QR code and pairing URL. Scan it to open an
 interactive xterm client on a phone or another browser. Diff terminals cannot
-be mirrored.
+be mirrored. If the Terminals pane is too short for the complete pairing
+composition, wrap grows only that pane and restores its exact previous height
+when the overlay closes. Its adjacent Tree pane may temporarily shrink; the
+full-height terminal pane, pane widths, zoom, and selection are unchanged. The
+URL and a manual-enlarge hint remain available if the pane cannot grow; a QR
+code is never rendered partially.
+
+The phone viewer opens at a readable scale: it uses **Fit** when the terminal
+width fits at 50% or larger, and otherwise starts at 50% with panning. The
+terminal header keeps `Keyboard`, `Fit`, and `Close` reachable without consuming
+a bottom row. `Keyboard` opens the software keyboard and horizontally
+scrollable special-key row; its label becomes `Hide keyboard` so both can be
+collapsed while typing. A tap on the terminal also enters typing mode, while a
+one-finger drag pans without opening the keyboard. Two-finger pinch previews a
+continuous manual scale from 30% through 200%, commits the terminal metrics when
+the gesture ends, and briefly displays the current percentage. Press `Fit` to
+fit the terminal width; a tall terminal remains vertically scrollable, and Fit
+may go smaller than 30% for very wide sessions. Opening, fitting, pinching,
+panning, rotating the phone, and opening the keyboard never resize the remote
+tmux window.
+
+The browser terminal implementation and its xterm.js assets are embedded in
+the wrap binary. The host does not need an `xterm` executable or a separate
+xterm package.
 
 The URL fragment is the live shell credential: anyone who has it can control
 every terminal currently mirrored from that workspace. The browser removes
 the fragment from visible history immediately and retains it only in
-tab-scoped session storage. Terminal frames are encrypted in the browser with
-AES-GCM using keys derived from that fragment; the secret is never sent in an
-HTTP request, WebSocket header, query, or cookie.
+tab-scoped session storage. A browser may clone that storage when a paired tab
+is duplicated or creates another tab, so rotate the credential instead of
+treating duplication as an independent pairing test. Terminal frames are
+encrypted in the browser with AES-GCM using keys derived from that fragment;
+the secret is never sent in an HTTP request, WebSocket header, query, or cookie.
 
 Inside the overlay:
 
 - Up / Down or `j` / `k` scroll pairing details in a short pane.
+- `c` copies the complete pairing URL with `pbcopy` on macOS or an available
+  `wl-copy`, `xclip`, or `xsel` helper on Linux. The URL is passed over stdin,
+  not through process arguments or a tmux paste buffer.
+- `h` shows the workspace diagnostics path, safe tail command, and privacy
+  note; `Esc` closes Help before it closes the overlay.
 - `x` revokes the selected terminal; revoking the last one stops the server
   and tunnel.
 - `R` creates a new pairing credential and disconnects existing browsers.
@@ -261,6 +302,7 @@ For the process model and direct tmux recovery commands, read
 - [Configuration](docs/configuration.md)
 - [Architecture and trust boundaries](docs/architecture.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Mobile mirror UAT](docs/mobile-mirror-uat.md)
 - [Security policy](SECURITY.md)
 
 ## Development
