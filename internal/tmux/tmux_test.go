@@ -873,8 +873,17 @@ func TestRealTmuxSessionCurrentPathIfGenerationTracksLiveCD(t *testing.T) {
 	if _, err := s.Run("kill-server"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.NewSession("replacement", start, ""); err != nil {
-		t.Fatal(err)
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		err := s.NewSession("replacement", start, "")
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "server exited unexpectedly") ||
+			time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if _, err := s.SessionCurrentPathIfGeneration(id, generation); !errors.Is(err, ErrServerGenerationChanged) {
 		t.Fatalf("stale path identity after restart = %v, want ErrServerGenerationChanged", err)
@@ -1093,8 +1102,18 @@ func TestGenerationGuardedAttachRefusesRestartedServer(t *testing.T) {
 	if _, err := s.Run("kill-server"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.NewSession("unrelated", t.TempDir(), ""); err != nil {
-		t.Fatal(err)
+	replacementRoot := t.TempDir()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		err := s.NewSession("unrelated", replacementRoot, "")
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "server exited unexpectedly") ||
+			time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	const replacementGeneration = "fedcba9876543210fedcba9876543210"
 	if _, err := s.EnsureServerGeneration(replacementGeneration); err != nil {
