@@ -3,7 +3,7 @@
 Supervise persistent coding-agent terminals from one tmux workspace and
 mirror any of them into an encrypted browser session visible from anywhere.
 
-> **Status:** `v0.1.0-beta.4` is a pre-1.0 release. CLI and configuration
+> **Status:** `v0.1.0-beta.5` is a pre-1.0 release. CLI and configuration
 > behavior may change before 1.0.
 
 wrap opens a folder, discovers its Git repositories and worktrees, and gives
@@ -61,7 +61,7 @@ requires `cloudflared`; install it separately as shown below.
 Or install this beta from source with Go:
 
 ```sh
-go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.4
+go install github.com/sarcasticbird/wrap/cmd/wrap@v0.1.0-beta.5
 wrap version
 ```
 
@@ -80,7 +80,7 @@ For Linux packages and binaries, use Cloudflare's
 [official downloads](https://developers.cloudflare.com/tunnel/downloads/).
 
 Prebuilt archives for macOS and Linux are attached to the
-[`v0.1.0-beta.4` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.4).
+[`v0.1.0-beta.5` release](https://github.com/sarcasticbird/wrap/releases/tag/v0.1.0-beta.5).
 Each archive contains `wrap`, `LICENSE`, and `README.md`; verify it against
 `checksums.txt` before installing.
 
