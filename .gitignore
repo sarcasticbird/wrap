@@ -1,6 +1,8 @@
 # Build artifacts
 /wrap
+/bin/
 /dist/
+/.coop.toml
 *.test
 coverage.out
 
