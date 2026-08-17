@@ -67,8 +67,8 @@ globalThis.__historyCalls = [];
 globalThis.history = {replaceState(state, title, url) { __historyCalls.push({state, title, url}); location.hash = ""; }};
 globalThis.__storedCredential = null;
 globalThis.sessionStorage = {
-  setItem(key, value) { if (key === "wrap.mirror.v2.secret") __storedCredential = value; },
-  removeItem(key) { if (key === "wrap.mirror.v2.secret") __storedCredential = null; },
+  setItem(key, value) { if (key === "wrap.mirror.v3.secret") __storedCredential = value; },
+  removeItem(key) { if (key === "wrap.mirror.v3.secret") __storedCredential = null; },
 };
 globalThis.__bootstrapElements = elements;
 globalThis.__webSocketCalls = 0;
@@ -124,8 +124,8 @@ globalThis.__historyURL = null;
 globalThis.history = {replaceState(state, title, url) { __historyURL = url; location.hash = ""; }};
 globalThis.__storedCredential = "prior-credential";
 globalThis.sessionStorage = {
-  setItem(key, value) { if (key === "wrap.mirror.v2.secret") __storedCredential = value; },
-  removeItem(key) { if (key === "wrap.mirror.v2.secret") __storedCredential = null; },
+  setItem(key, value) { if (key === "wrap.mirror.v3.secret") __storedCredential = value; },
+  removeItem(key) { if (key === "wrap.mirror.v3.secret") __storedCredential = null; },
 };
 globalThis.__wrapMirrorImport = () => Promise.resolve();
 `); err != nil {

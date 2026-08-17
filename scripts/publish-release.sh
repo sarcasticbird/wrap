@@ -30,7 +30,6 @@ fi
 dist=$(CDPATH= cd -- "$dist_input" && pwd)
 
 assets=(
-  "$dist/wrap_${tag}_darwin_amd64.tar.gz"
   "$dist/wrap_${tag}_darwin_arm64.tar.gz"
   "$dist/wrap_${tag}_linux_amd64.tar.gz"
   "$dist/wrap_${tag}_linux_arm64.tar.gz"

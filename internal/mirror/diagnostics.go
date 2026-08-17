@@ -56,21 +56,23 @@ var diagnosticEvents = map[string]struct{}{
 }
 
 var diagnosticCodes = map[string]struct{}{
-	"authentication_failed":    {},
-	"client_asset_unavailable": {},
-	"client_capacity":          {},
-	"credential_expired":       {},
-	"origin_rejected":          {},
-	"process_unavailable":      {},
-	"server_busy":              {},
-	"server_starting":          {},
-	"server_unavailable":       {},
-	"session_list_failed":      {},
-	"terminal_ended":           {},
-	"terminal_unavailable":     {},
-	"tunnel_unavailable":       {},
-	"unexpected_exit":          {},
-	"upgrade_failed":           {},
+	"authentication_failed":        {},
+	"automatic_target_unavailable": {},
+	"client_asset_unavailable":     {},
+	"client_capacity":              {},
+	"cleanup_incomplete":           {},
+	"credential_expired":           {},
+	"origin_rejected":              {},
+	"process_unavailable":          {},
+	"server_busy":                  {},
+	"server_starting":              {},
+	"server_unavailable":           {},
+	"session_list_failed":          {},
+	"terminal_ended":               {},
+	"terminal_unavailable":         {},
+	"tunnel_unavailable":           {},
+	"unexpected_exit":              {},
+	"upgrade_failed":               {},
 }
 
 type DiagnosticRecord struct {

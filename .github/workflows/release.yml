@@ -1,8 +1,8 @@
 name: release
 
-# Publishes a GitHub Release with binaries for macOS and Linux when a
-# version tag is pushed. The complete reusable CI workflow runs first: a tag
-# that fails either platform, lint, docs, or reproducibility checks cannot
+# Publishes a GitHub Release for Apple Silicon macOS and 64-bit ARM/x86 Linux
+# when a version tag is pushed. The complete reusable CI workflow runs first:
+# a tag that fails either platform, lint, docs, or reproducibility checks cannot
 # become a release. The public repository also protects v* tags from updates
 # and deletion; publish-release.sh performs a defensive post-publish recheck.
 

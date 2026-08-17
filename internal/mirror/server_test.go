@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -324,7 +325,6 @@ func TestLocalServerBindsLoopbackAndServesOnlyKnownRoutes(t *testing.T) {
 		{"/assets/wrap-mirror.css", http.StatusOK, "text/css; charset=utf-8"},
 		{"/assets/wrap-mirror-bootstrap.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/wrap-mirror.js", http.StatusOK, "text/javascript; charset=utf-8"},
-		{"/assets/wrap-mirror-state.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/wrap-mirror-viewport.js", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/assets/third_party/xterm/xterm.mjs", http.StatusOK, "text/javascript; charset=utf-8"},
 		{"/missing", http.StatusNotFound, "text/plain; charset=utf-8"},
@@ -389,18 +389,123 @@ func TestLocalServerRejectsWrongMethods(t *testing.T) {
 	}
 }
 
-type staticClientHandler struct {
-	sessions []Session
+type automaticClientHandler struct {
+	ready Ready
 }
 
-func (h staticClientHandler) InitialSessions() []Session { return h.sessions }
-func (staticClientHandler) Connected(*Client)            {}
-func (staticClientHandler) Open(context.Context, *Client, OpenRequest) error {
-	return nil
+func (h automaticClientHandler) Connected(ctx context.Context, client *Client) error {
+	client.viewerOpen.Store(true)
+	return client.SendControl(ctx, TagReady, h.ready)
 }
-func (staticClientHandler) Close(*Client) error         { return nil }
-func (staticClientHandler) Input(*Client, []byte) error { return nil }
-func (staticClientHandler) Disconnected(*Client)        {}
+func (automaticClientHandler) Close(*Client) error         { return nil }
+func (automaticClientHandler) Input(*Client, []byte) error { return nil }
+func (automaticClientHandler) Disconnected(*Client)        {}
+
+type failingConnectedHandler struct {
+	connected    chan *Client
+	disconnected chan struct{}
+}
+
+func (h *failingConnectedHandler) Connected(_ context.Context, client *Client) error {
+	h.connected <- client
+	return errors.New("viewer attach failed")
+}
+func (*failingConnectedHandler) Close(*Client) error         { return nil }
+func (*failingConnectedHandler) Input(*Client, []byte) error { return nil }
+func (h *failingConnectedHandler) Disconnected(*Client) {
+	select {
+	case h.disconnected <- struct{}{}:
+	default:
+	}
+}
+
+func TestWebSocketViewerOpenFailureDisconnectsClientAndWriter(t *testing.T) {
+	var secret Secret
+	for i := range secret {
+		secret[i] = byte(i)
+	}
+	handler := &failingConnectedHandler{
+		connected: make(chan *Client, 1), disconnected: make(chan struct{}, 1),
+	}
+	server, err := StartLocalServer(t.Context(), ServerOptions{Secret: secret, Handler: handler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	host := strings.TrimPrefix(server.LocalURL(), "http://")
+	server.SetPublicHost(host)
+	connection, opener, _ := dialAuthenticatedMirror(t, host, secret, 0x54)
+	t.Cleanup(func() { _ = connection.CloseNow() })
+	client := <-handler.connected
+	kind, encrypted, err := connection.Read(t.Context())
+	if err != nil || kind != websocket.MessageBinary {
+		t.Fatalf("viewer-open failure frame = kind:%v error:%v", kind, err)
+	}
+	tag, payload, err := opener.Open(encrypted)
+	if err != nil || tag != TagError {
+		t.Fatalf("viewer-open failure tag = 0x%02x, error:%v", tag, err)
+	}
+	var problem ProtocolError
+	if err := DecodeControl(tag, payload, &problem); err != nil {
+		t.Fatal(err)
+	}
+	if problem.Code != "terminal_unavailable" || problem.Retry {
+		t.Fatalf("viewer-open failure payload = %+v", problem)
+	}
+	if _, _, err := connection.Read(t.Context()); err == nil {
+		t.Fatal("viewer-open failure left WebSocket open after terminal error")
+	}
+	select {
+	case <-handler.disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("viewer-open failure did not disconnect handler")
+	}
+	select {
+	case <-client.writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("viewer-open failure leaked writer goroutine")
+	}
+}
+
+func TestWebSocketAutomaticTargetOpensWithoutSessionList(t *testing.T) {
+	var secret Secret
+	for i := range secret {
+		secret[i] = byte(i)
+	}
+	ready := Ready{
+		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Columns: 80, Rows: 24,
+	}
+	server, err := StartLocalServer(t.Context(), ServerOptions{
+		Secret:  secret,
+		Handler: automaticClientHandler{ready: ready},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	host := strings.TrimPrefix(server.LocalURL(), "http://")
+	server.SetPublicHost(host)
+	connection, opener, _ := dialAuthenticatedMirror(t, host, secret, 0x55)
+	t.Cleanup(func() { _ = connection.CloseNow() })
+	kind, ciphertext, err := connection.Read(t.Context())
+	if err != nil || kind != websocket.MessageBinary {
+		t.Fatalf("automatic frame kind/error = %v/%v", kind, err)
+	}
+	tag, payload, err := opener.Open(ciphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag != TagReady {
+		t.Fatalf("first automatic frame tag = 0x%02x, want ready", tag)
+	}
+	var opened Ready
+	if err := DecodeControl(tag, payload, &opened); err != nil {
+		t.Fatal(err)
+	}
+	if opened.ID != ready.ID || opened.Generation != ready.Generation {
+		t.Fatalf("opened = %+v", opened)
+	}
+}
 
 func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
 	diagnostics := &recordingDiagnosticSink{}
@@ -408,12 +513,8 @@ func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
 	for i := range secret {
 		secret[i] = byte(i)
 	}
-	handler := staticClientHandler{sessions: []Session{{
-		ID:         "$7",
-		Generation: "0123456789abcdef0123456789abcdef",
-		Name:       "vb/api",
-		Kind:       "entry",
-	}}}
+	ready := Ready{ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Columns: 80, Rows: 24}
+	handler := automaticClientHandler{ready: ready}
 	server, err := StartLocalServer(t.Context(), ServerOptions{
 		Secret:  secret,
 		Handler: handler,
@@ -469,21 +570,21 @@ func TestWebSocketRequiresExactOriginAndEncryptedHello(t *testing.T) {
 	if err := connection.Write(t.Context(), websocket.MessageBinary, hello); err != nil {
 		t.Fatal(err)
 	}
-	kind, encryptedList, err := connection.Read(t.Context())
+	kind, encryptedReady, err := connection.Read(t.Context())
 	if err != nil || kind != websocket.MessageBinary {
-		t.Fatalf("encrypted list read = %v/%v", kind, err)
+		t.Fatalf("encrypted ready read = %v/%v", kind, err)
 	}
 	opener, _ := NewOpener(s2c)
-	tag, payload, err := opener.Open(encryptedList)
-	if err != nil || tag != TagMirrorList {
-		t.Fatalf("list frame tag/error = %x/%v", tag, err)
+	tag, payload, err := opener.Open(encryptedReady)
+	if err != nil || tag != TagReady {
+		t.Fatalf("ready frame tag/error = %x/%v", tag, err)
 	}
-	var list SessionList
-	if err := DecodeControl(tag, payload, &list); err != nil {
+	var opened Ready
+	if err := DecodeControl(tag, payload, &opened); err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Sessions) != 1 || list.Sessions[0].Name != "vb/api" {
-		t.Fatalf("initial sessions = %+v", list.Sessions)
+	if opened.ID != ready.ID {
+		t.Fatalf("ready = %+v", opened)
 	}
 	if !containsDiagnostic(diagnostics.snapshot(), "handshake", "authenticated", "") {
 		t.Fatalf("successful handshake diagnostic missing: %+v", diagnostics.snapshot())
@@ -495,7 +596,8 @@ func TestWebSocketAuthenticatedClientCapacityPrecedesInitialList(t *testing.T) {
 	for i := range secret {
 		secret[i] = byte(i)
 	}
-	server, err := StartLocalServer(t.Context(), ServerOptions{Secret: secret})
+	ready := Ready{ID: "$7", Generation: "generation", Columns: 80, Rows: 24}
+	server, err := StartLocalServer(t.Context(), ServerOptions{Secret: secret, Handler: automaticClientHandler{ready: ready}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -509,26 +611,77 @@ func TestWebSocketAuthenticatedClientCapacityPrecedesInitialList(t *testing.T) {
 		}
 	})
 	for i := 0; i < MaxClients; i++ {
-		connection, opener := dialAuthenticatedMirror(t, host, secret, byte(i))
+		connection, opener, _ := dialAuthenticatedMirror(t, host, secret, byte(i))
 		connections = append(connections, connection)
 		kind, ciphertext, err := connection.Read(t.Context())
 		if err != nil || kind != websocket.MessageBinary {
-			t.Fatalf("client %d initial list read = %v/%v", i, kind, err)
+			t.Fatalf("client %d ready read = %v/%v", i, kind, err)
 		}
 		tag, _, err := opener.Open(ciphertext)
-		if err != nil || tag != TagMirrorList {
-			t.Fatalf("client %d initial list tag/error = %x/%v", i, tag, err)
+		if err != nil || tag != TagReady {
+			t.Fatalf("client %d ready tag/error = %x/%v", i, tag, err)
 		}
 	}
 	if got := len(server.handshakes); got != 0 {
 		t.Fatalf("authenticated clients retained %d handshake permits", got)
 	}
 
-	ninth, _ := dialAuthenticatedMirror(t, host, secret, 0xf0)
+	ninth, _, _ := dialAuthenticatedMirror(t, host, secret, 0xf0)
 	connections = append(connections, ninth)
 	_, _, err = ninth.Read(t.Context())
 	if status := websocket.CloseStatus(err); status != websocket.StatusTryAgainLater {
 		t.Fatalf("ninth client close = %v (status %v)", err, status)
+	}
+}
+
+func TestWebSocketTerminalCloseReleasesClientSlot(t *testing.T) {
+	var secret Secret
+	for i := range secret {
+		secret[i] = byte(i)
+	}
+	ready := Ready{ID: "$7", Generation: "generation", Columns: 80, Rows: 24}
+	server, err := StartLocalServer(t.Context(), ServerOptions{Secret: secret, Handler: automaticClientHandler{ready: ready}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	host := strings.TrimPrefix(server.LocalURL(), "http://")
+	server.SetPublicHost(host)
+	connection, opener, sealer := dialAuthenticatedMirror(t, host, secret, 0x71)
+	t.Cleanup(func() { _ = connection.CloseNow() })
+	kind, encrypted, err := connection.Read(t.Context())
+	if err != nil || kind != websocket.MessageBinary {
+		t.Fatalf("ready frame = kind:%v error:%v", kind, err)
+	}
+	if tag, _, err := opener.Open(encrypted); err != nil || tag != TagReady {
+		t.Fatalf("ready tag = 0x%02x, error:%v", tag, err)
+	}
+	closeFrame, err := sealer.Seal(TagClose, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.Write(t.Context(), websocket.MessageBinary, closeFrame); err != nil {
+		t.Fatal(err)
+	}
+	kind, encrypted, err = connection.Read(t.Context())
+	if err != nil || kind != websocket.MessageBinary {
+		t.Fatalf("close acknowledgement = kind:%v error:%v", kind, err)
+	}
+	if tag, payload, err := opener.Open(encrypted); err != nil || tag != TagClose || len(payload) != 0 {
+		t.Fatalf("close acknowledgement tag/payload/error = 0x%02x/%d/%v", tag, len(payload), err)
+	}
+	readCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	_, _, err = connection.Read(readCtx)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("terminal close did not promptly release connection: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(server.clients) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(server.clients); got != 0 {
+		t.Fatalf("closed terminal retained %d client slots", got)
 	}
 }
 
@@ -605,7 +758,7 @@ func TestWebSocketRejectsWrongSecretAndOversizedHandshake(t *testing.T) {
 	host := strings.TrimPrefix(server.LocalURL(), "http://")
 	server.SetPublicHost(host)
 
-	wrong, _ := dialAuthenticatedMirror(t, host, wrongSecret, 0x20)
+	wrong, _, _ := dialAuthenticatedMirror(t, host, wrongSecret, 0x20)
 	t.Cleanup(func() { _ = wrong.CloseNow() })
 	_, _, err = wrong.Read(t.Context())
 	if status := websocket.CloseStatus(err); status != websocket.StatusPolicyViolation {
@@ -636,7 +789,7 @@ func TestWebSocketRejectsWrongSecretAndOversizedHandshake(t *testing.T) {
 	}
 }
 
-func dialAuthenticatedMirror(t *testing.T, host string, secret Secret, seed byte) (*websocket.Conn, *Opener) {
+func dialAuthenticatedMirror(t *testing.T, host string, secret Secret, seed byte) (*websocket.Conn, *Opener, *Sealer) {
 	t.Helper()
 	connection, _, err := websocket.Dial(t.Context(), "ws://"+host+"/ws", &websocket.DialOptions{
 		HTTPHeader:      http.Header{"Origin": []string{"https://" + host}},
@@ -679,5 +832,5 @@ func dialAuthenticatedMirror(t *testing.T, host string, secret Secret, seed byte
 	if err != nil {
 		t.Fatal(err)
 	}
-	return connection, opener
+	return connection, opener, sealer
 }

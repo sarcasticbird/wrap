@@ -1,125 +1,44 @@
-# Configuration
+# CLI, state, and naming
 
-wrap works without a configuration file. When present, the file is:
-
-```text
-$XDG_CONFIG_HOME/wrap/wrap.toml
-```
-
-If `XDG_CONFIG_HOME` is unset, wrap uses:
+Wrap has no configuration file and no configured command. Its complete public
+command surface is:
 
 ```text
-~/.config/wrap/wrap.toml
+wrap [-n NAME]
+wrap list [--json]
+wrap show INSTANCE [--json]
+wrap regen INSTANCE [--json]
+wrap remove INSTANCE
+wrap doctor [--json]
+wrap version
 ```
 
-An absent or empty file is valid. Start from the
-[parser-backed example](../examples/wrap.toml) when you want explicit
-settings.
+`NAME` is a printable label up to 64 Unicode characters without slashes,
+backslashes, control characters, or outer whitespace. Command words such as
+`list` are valid names when supplied with `--name`.
 
-## Complete example
+Without a name, Wrap starts with the current directory basename and adds a
+deterministic numeric suffix when another target already uses it. Management
+selectors accept an exact name, an exact instance ID, or an unambiguous ID
+prefix.
 
-```toml
-walk_depth = 1
-tree_side = "left"
-tree_width = 25
+Running `wrap -n NEW` again in the same wrapped window renames that live
+instance atomically when `NEW` is unused. It never starts a second tunnel or
+redirects an existing name from another window.
 
-[defaults]
-cmd = ""
+`list --json` contains only non-secret data. `show --json` and `regen --json`
+include the pairing URL because those commands explicitly request the active
+credential.
 
-[keys]
-focus_tree = "M-2"
-focus_terminal = "M-1"
-focus_terms = "M-3"
-```
+## Environment paths
 
-Unknown keys produce a warning and are ignored. Invalid recognized values,
-such as `tree_side = "up"`, stop launch with an error.
+- State: `$XDG_STATE_HOME/wrap`, falling back to `~/.local/state/wrap`
+- Runtime sockets: `$XDG_RUNTIME_DIR/wrap`, falling back to
+  `<state>/runtime`
 
-## Layout and discovery
+State is not an autostart mechanism. Workers and tunnels are not restored after
+logout or reboot.
 
-`walk_depth`, `tree_side`, and `tree_width` are accepted either at the top
-level or inside `[defaults]`. A top-level value wins when both positions are
-present. This compatibility does not apply to `cmd`, which belongs in
-`[defaults]`.
-
-### `walk_depth`
-
-- Default: `1`
-- Accepted result: clamped to `1..5`
-
-This is the number of directory levels wrap examines during repository
-discovery. The directory scan stops descending once it finds a plain repository
-or a directory containing `.bare`. A plain repository keeps its own row; wrap
-then queries `git worktree list` and adds linked worktrees that do not already
-have rows. A `.bare` container is expanded directly into its non-bare
-worktrees.
-
-### `tree_side`
-
-- Default: `"left"`
-- Values: `"left"` or `"right"`
-
-`left` places the tree and terminal monitor to the left of the terminal.
-`right` mirrors the columns. Any other value is an error.
-
-### `tree_width`
-
-- Default: `25`
-- Accepted result: clamped to `10..60`
-
-The value is the percentage of the window assigned to the tree/monitor
-column. The terminal receives the remaining width. Explicit zero is a real
-value and clamps to `10` whether it is written at the top level or inside
-`[defaults]`; only an omitted value receives `25`.
-
-## New-session command
-
-```toml
-[defaults]
-cmd = ""
-```
-
-An empty value starts the user's default shell. A non-empty value is passed to
-tmux as the shell command for each new work session:
-
-```toml
-[defaults]
-cmd = "codex"
-```
-
-This value is trusted. wrap does not tokenize, validate, or sandbox it. Test
-the command manually in the target folders before making it the default.
-The value is persisted in wrap's mode-`0600` chrome state so configuration
-changes can rebuild the UI; do not embed tokens or other credentials in it.
-
-The tree does not start commands. It records a selection; pressing `n` in the
-terminals pane starts or binds that selection using `cmd`.
-
-Terminal PWD details, creation ordering, and scratch-only lifecycle protection
-require no configuration. Use
-Left and Right in the terminals pane to collapse or expand the selected row.
-wrap does not inspect process environments or infer tool-specific state.
-
-## Focus keys
-
-```toml
-[keys]
-focus_tree = "M-2"
-focus_terminal = "M-1"
-focus_terms = "M-3"
-```
-
-Values use tmux key syntax. By default, `M-1` focuses the active terminal,
-`M-2` focuses Git, and `M-3` focuses Terminals. On macOS, `M-1` is usually
-Option-1 when the terminal is configured to send Option as Alt/Meta. The Git
-and Terminals headings show the effective configured bindings.
-
-## Applying changes
-
-Configuration is loaded at launch. If a layout, key, command, discovery, or
-chrome build value differs from the live UI, wrap rebuilds only that
-workspace's UI chrome and starts new pane subprocesses. Work sessions on
-`tmux -L wrap` are preserved.
-
-Another client attached to the rebuilt UI chrome is detached and can reattach
-by launching the workspace again.
+Private worker leases and control sockets live in the runtime directory.
+Allowlisted, bounded JSONL diagnostics live under `<state>/diagnostics`; they
+contain no pairing credential.

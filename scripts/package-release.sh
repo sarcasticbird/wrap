@@ -45,13 +45,13 @@ stage_root=$(mktemp -d "$output/.stage.XXXXXX")
 trap 'rm -rf -- "$stage_root"' 0 1 2 15
 umask 022
 
-for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
+for target in darwin/arm64 linux/arm64 linux/amd64; do
   os=${target%/*}
   arch=${target#*/}
   name="wrap_${version}_${os}_${arch}"
   stage="$stage_root/${os}_${arch}"
 
-  mkdir -p "$stage/docs" "$stage/examples"
+  mkdir -p "$stage/docs"
   (
     cd "$repo"
     CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
@@ -62,30 +62,28 @@ for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
   cp "$repo/docs/architecture.md" "$repo/docs/configuration.md" \
     "$repo/docs/mobile-mirror-uat.md" "$repo/docs/troubleshooting.md" \
     "$stage/docs/"
-  cp "$repo/examples/wrap.toml" "$stage/examples/"
   chmod 0755 "$stage/wrap"
   chmod 0644 "$stage/LICENSE" "$stage/README.md" "$stage/SECURITY.md" \
     "$stage/docs/architecture.md" "$stage/docs/configuration.md" \
-    "$stage/docs/mobile-mirror-uat.md" "$stage/docs/troubleshooting.md" \
-    "$stage/examples/wrap.toml"
+    "$stage/docs/mobile-mirror-uat.md" "$stage/docs/troubleshooting.md"
   TZ=UTC touch -t 197001010000 "$stage/wrap" "$stage/LICENSE" \
     "$stage/README.md" "$stage/SECURITY.md" "$stage/docs/architecture.md" \
     "$stage/docs/configuration.md" "$stage/docs/mobile-mirror-uat.md" \
-    "$stage/docs/troubleshooting.md" "$stage/examples/wrap.toml"
+    "$stage/docs/troubleshooting.md"
   case "$(tar --version 2>/dev/null)" in
     *bsdtar*)
       COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --numeric-owner \
         --options gzip:!timestamp -C "$stage" \
         -czf "$output/${name}.tar.gz" wrap LICENSE README.md SECURITY.md \
         docs/architecture.md docs/configuration.md docs/mobile-mirror-uat.md \
-        docs/troubleshooting.md examples/wrap.toml
+        docs/troubleshooting.md
       ;;
     *)
       tar --sort=name --mtime="@0" --owner=0 --group=0 --numeric-owner \
         -C "$stage" -czf "$output/${name}.tar.gz" \
         wrap LICENSE README.md SECURITY.md docs/architecture.md \
         docs/configuration.md docs/mobile-mirror-uat.md \
-        docs/troubleshooting.md examples/wrap.toml
+        docs/troubleshooting.md
       ;;
   esac
 done

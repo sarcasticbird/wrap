@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"sort"
 	"sync"
 	"time"
 )
@@ -23,6 +22,7 @@ const (
 
 type HostSession struct {
 	ID           string
+	WindowID     string
 	Generation   string
 	Name         string
 	Kind         string
@@ -36,24 +36,13 @@ type Snapshot struct {
 	PublicURL          string
 	PairingURL         string
 	QR                 string
-	Sessions           []Session
 	Err                string
 	DiagnosticsWarning string
-}
-
-type ViewedEvent struct {
-	ID         string
-	Generation string
-	Activity   int64
+	CleanupWarning     string
 }
 
 type Event struct {
 	Snapshot *Snapshot
-	Viewed   *ViewedEvent
-}
-
-type Acknowledger interface {
-	AcknowledgeSession(id, generation string) error
 }
 
 type TunnelResource interface {
@@ -70,14 +59,13 @@ type ServerResource interface {
 }
 
 type ManagerOptions struct {
-	Workspace     string
-	SessionSocket string
-	Acknowledger  Acknowledger
-	Viewers       ViewerFactory
-	StartServer   func(context.Context, ServerOptions) (ServerResource, error)
-	StartTunnel   func(context.Context, string) (TunnelResource, error)
-	Random        io.Reader
-	Diagnostics   DiagnosticSink
+	Workspace   string
+	Target      *HostSession
+	Viewers     ViewerFactory
+	StartServer func(context.Context, ServerOptions) (ServerResource, error)
+	StartTunnel func(context.Context, string) (TunnelResource, error)
+	Random      io.Reader
+	Diagnostics DiagnosticSink
 }
 
 type Manager struct {
@@ -85,7 +73,7 @@ type Manager struct {
 	mu   sync.RWMutex
 
 	workspace    string
-	acknowledger Acknowledger
+	target       HostSession
 	viewers      ViewerFactory
 	startServer  func(context.Context, ServerOptions) (ServerResource, error)
 	startTunnel  func(context.Context, string) (TunnelResource, error)
@@ -101,8 +89,6 @@ type Manager struct {
 	qr                 string
 	errText            string
 	secret             Secret
-	generation         string
-	sessions           map[Identity]HostSession
 	server             ServerResource
 	tunnel             TunnelResource
 	runtimeCancel      context.CancelFunc
@@ -114,6 +100,7 @@ type Manager struct {
 	shutdownAsked      bool
 	diagnosticsFailed  bool
 	diagnosticsWarning string
+	cleanupWarning     string
 }
 
 type activeViewer struct {
@@ -139,22 +126,27 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 	if options.Random == nil {
 		options.Random = rand.Reader
 	}
+	if options.Target == nil {
+		return nil, errors.New("mirror target is required")
+	}
+	target := *options.Target
+	if err := validateIdentity(target.ID, target.Generation); err != nil {
+		return nil, err
+	}
 	manager := &Manager{
-		workspace:    options.Workspace,
-		acknowledger: options.Acknowledger,
-		viewers:      options.Viewers,
-		random:       options.Random,
-		diagnostics:  options.Diagnostics,
-		events:       make(chan Event, 64),
-		sessions:     make(map[Identity]HostSession),
-		clients:      make(map[*Client]struct{}),
-		active:       make(map[*Client]activeViewer),
-		opening:      make(map[*Client]*openingViewer),
+		workspace:   options.Workspace,
+		target:      target,
+		viewers:     options.Viewers,
+		random:      options.Random,
+		diagnostics: options.Diagnostics,
+		events:      make(chan Event, 64),
+		clients:     make(map[*Client]struct{}),
+		active:      make(map[*Client]activeViewer),
+		opening:     make(map[*Client]*openingViewer),
 	}
 	if manager.viewers == nil {
 		manager.viewers = &PTYViewerFactory{
-			SessionSocket: options.SessionSocket,
-			Record:        manager.recordDiagnostic,
+			Record: manager.recordDiagnostic,
 		}
 	}
 	if options.StartServer != nil {
@@ -175,6 +167,10 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 	return manager, nil
 }
 
+func (m *Manager) Start(ctx context.Context) error {
+	return m.start(ctx)
+}
+
 func (m *Manager) Events() <-chan Event {
 	return m.events
 }
@@ -185,9 +181,15 @@ func (m *Manager) Snapshot() Snapshot {
 	return m.snapshotLocked()
 }
 
-func (m *Manager) Mirror(ctx context.Context, session HostSession) error {
-	identity := Identity{ID: session.ID, Generation: session.Generation}
-	if err := validateIdentity(identity.ID, identity.Generation); err != nil {
+func (m *Manager) ClientCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.clients)
+}
+
+func (m *Manager) start(ctx context.Context) error {
+	session := m.target
+	if err := validateIdentity(session.ID, session.Generation); err != nil {
 		return err
 	}
 	m.opMu.Lock()
@@ -198,29 +200,14 @@ func (m *Manager) Mirror(ctx context.Context, session HostSession) error {
 		m.mu.Unlock()
 		return errors.New("mirror manager is shut down")
 	}
-	if m.generation != "" && m.generation != session.Generation {
-		cleanup := m.clearLocked(StateStopped, "")
-		m.generation = session.Generation
-		changed := m.snapshotLocked()
-		m.mu.Unlock()
-		_ = cleanup.close(ctx, Shutdown{Reason: "session server restarted", Retry: false})
-		m.publishSnapshot(changed)
-		m.mu.Lock()
-	}
 	if m.shutdownAsked {
 		m.mu.Unlock()
 		return errors.New("mirror manager is shutting down")
 	}
-	if m.generation == "" {
-		m.generation = session.Generation
-	}
 	if m.state == StateReady {
-		m.sessions[identity] = session
 		snapshot := m.snapshotLocked()
-		clients := m.clientsLocked()
 		m.mu.Unlock()
 		m.publishSnapshot(snapshot)
-		broadcastStatus(ctx, clients, snapshot.Sessions)
 		return nil
 	}
 	m.state = StateStarting
@@ -313,130 +300,13 @@ func (m *Manager) Mirror(ctx context.Context, session HostSession) error {
 	m.publicURL = tunnel.URL()
 	m.pairingURL = pairingURL
 	m.qr = qr
-	m.sessions[identity] = session
 	m.state = StateReady
 	snapshot := m.snapshotLocked()
-	clients := m.clientsLocked()
 	startupComplete = true
 	m.mu.Unlock()
 	m.publishSnapshot(snapshot)
-	broadcastStatus(ctx, clients, snapshot.Sessions)
 	go m.watchTunnel(tunnel)
 	return nil
-}
-
-func (m *Manager) Revoke(ctx context.Context, identity Identity) error {
-	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "credential", Event: "revoked"})
-	m.opMu.Lock()
-	defer m.opMu.Unlock()
-	m.mu.Lock()
-	delete(m.sessions, identity)
-	var viewers []Viewer
-	for client, active := range m.active {
-		if active.identity == identity {
-			viewers = append(viewers, active.viewer)
-			delete(m.active, client)
-			client.markViewerClosed()
-		}
-	}
-	for client, opening := range m.opening {
-		if opening.identity == identity {
-			if opening.viewer != nil {
-				viewers = append(viewers, opening.viewer)
-			}
-			delete(m.opening, client)
-			client.markViewerClosed()
-		}
-	}
-	clients := m.clientsLocked()
-	if len(m.sessions) != 0 {
-		snapshot := m.snapshotLocked()
-		m.mu.Unlock()
-		err := closeViewers(viewers)
-		broadcastRevoked(ctx, clients, identity, "mirror revoked")
-		broadcastStatus(ctx, clients, snapshot.Sessions)
-		m.publishSnapshot(snapshot)
-		return err
-	}
-	cleanup := m.clearLocked(StateStopped, "")
-	cleanup.viewers = append(cleanup.viewers, viewers...)
-	snapshot := m.snapshotLocked()
-	m.mu.Unlock()
-	err := cleanup.close(ctx, Shutdown{Reason: "no mirrored terminals remain", Retry: false})
-	m.publishSnapshot(snapshot)
-	return err
-}
-
-func (m *Manager) Reconcile(ctx context.Context, sessions []HostSession) error {
-	m.opMu.Lock()
-	defer m.opMu.Unlock()
-	live := make(map[Identity]HostSession, len(sessions))
-	var generation string
-	for _, session := range sessions {
-		if err := validateIdentity(session.ID, session.Generation); err != nil {
-			return err
-		}
-		if generation == "" {
-			generation = session.Generation
-		} else if generation != session.Generation {
-			return errors.New("session poll contains multiple server generations")
-		}
-		live[Identity{ID: session.ID, Generation: session.Generation}] = session
-	}
-	m.mu.Lock()
-	if generation != "" && m.generation != "" && generation != m.generation {
-		cleanup := m.clearLocked(StateStopped, "")
-		m.generation = generation
-		snapshot := m.snapshotLocked()
-		m.mu.Unlock()
-		err := cleanup.close(ctx, Shutdown{Reason: "session server restarted", Retry: false})
-		m.publishSnapshot(snapshot)
-		return err
-	}
-	if generation != "" {
-		m.generation = generation
-	}
-	var viewers []Viewer
-	for identity := range m.sessions {
-		session, ok := live[identity]
-		if !ok {
-			delete(m.sessions, identity)
-			for client, active := range m.active {
-				if active.identity == identity {
-					viewers = append(viewers, active.viewer)
-					delete(m.active, client)
-					client.markViewerClosed()
-				}
-			}
-			for client, opening := range m.opening {
-				if opening.identity == identity {
-					if opening.viewer != nil {
-						viewers = append(viewers, opening.viewer)
-					}
-					delete(m.opening, client)
-					client.markViewerClosed()
-				}
-			}
-			continue
-		}
-		m.sessions[identity] = session
-	}
-	if m.state == StateReady && len(m.sessions) == 0 {
-		cleanup := m.clearLocked(StateStopped, "")
-		cleanup.viewers = append(cleanup.viewers, viewers...)
-		snapshot := m.snapshotLocked()
-		m.mu.Unlock()
-		err := cleanup.close(ctx, Shutdown{Reason: "mirrored terminals ended", Retry: false})
-		m.publishSnapshot(snapshot)
-		return err
-	}
-	snapshot := m.snapshotLocked()
-	clients := m.clientsLocked()
-	m.mu.Unlock()
-	err := closeViewers(viewers)
-	broadcastStatus(ctx, clients, snapshot.Sessions)
-	m.publishSnapshot(snapshot)
-	return err
 }
 
 func (m *Manager) Rotate(ctx context.Context) error {
@@ -467,27 +337,40 @@ func (m *Manager) Rotate(ctx context.Context) error {
 		return errors.New("mirror stopped during pairing rotation")
 	}
 	server := m.server
-	clients := m.clientsLocked()
-	viewers := m.detachClientsLocked()
-	m.mu.Unlock()
-	err = errors.Join(
-		closeViewers(viewers),
-		closeClients(ctx, clients, Shutdown{Reason: "pairing rotated", Retry: false}),
-	)
+	// Cut off the old credential before potentially slow viewer and WebSocket
+	// cleanup. SetSecret atomically advances the server secret version and
+	// rejects both new old-key handshakes and already-authenticated clients. The
+	// manager lock keeps their Disconnected callbacks from taking ownership of
+	// viewer cleanup before rotation has detached the viewers and their errors.
 	server.SetSecret(secret)
-	m.mu.Lock()
-	if m.state != StateReady || m.server != server {
-		m.mu.Unlock()
-		return errors.Join(err, errors.New("mirror stopped during pairing rotation"))
-	}
 	m.secret = secret
 	m.pairingURL = pairingURL
 	m.qr = qr
+	viewers := m.detachClientsLocked()
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 	m.publishSnapshot(snapshot)
 	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "credential", Event: "rotated"})
-	return err
+	// Rotation is committed once SetSecret returns. Cleanup failures cannot make
+	// the credential result indeterminate, but must remain visible to callers.
+	cleanupErr := errors.Join(
+		closeViewers(viewers),
+		cleanupViewerFactory(m.viewers),
+	)
+	m.mu.Lock()
+	m.cleanupWarning = ""
+	if cleanupErr != nil {
+		m.cleanupWarning = "pairing rotated, but terminal cleanup was incomplete"
+	}
+	snapshot = m.snapshotLocked()
+	m.mu.Unlock()
+	m.publishSnapshot(snapshot)
+	if cleanupErr != nil {
+		m.recordDiagnostic(DiagnosticRecord{
+			Level: "warn", Component: "credential", Event: "rotated", Code: "cleanup_incomplete",
+		})
+	}
+	return nil
 }
 
 func (m *Manager) Shutdown(ctx context.Context) error {
@@ -518,31 +401,32 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	return err
 }
 
-func (m *Manager) InitialSessions() []Session {
-	return m.Snapshot().Sessions
-}
-
-func (m *Manager) Connected(client *Client) {
+func (m *Manager) Connected(ctx context.Context, client *Client) error {
 	m.mu.Lock()
-	if (m.state == StateStarting || m.state == StateReady) && !m.shutdown {
-		m.clients[client] = struct{}{}
+	if m.state != StateReady || m.shutdown {
+		m.mu.Unlock()
+		return errors.New("mirror target is unavailable")
 	}
-	sessions := m.snapshotLocked().Sessions
+	m.clients[client] = struct{}{}
 	m.mu.Unlock()
-	_ = client.SendControl(context.Background(), TagStatus, SessionList{Sessions: sessions})
+	if !client.viewerOpen.CompareAndSwap(false, true) {
+		return errors.New("a terminal is already open")
+	}
+	if err := m.open(ctx, client); err != nil {
+		client.viewerOpen.Store(false)
+		return err
+	}
+	return nil
 }
 
-func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest) error {
-	identity := Identity(request)
-	m.mu.RLock()
-	session, ok := m.sessions[identity]
-	m.mu.RUnlock()
-	if !ok {
-		return errors.New("mirrored terminal ended")
-	}
+func (m *Manager) open(ctx context.Context, client *Client) error {
+	session := m.target
+	identity := Identity{ID: session.ID, Generation: session.Generation}
 	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "preparing"})
 	var opening *openingViewer
-	prepared, err := m.viewers.Prepare(ctx, identity, func(output []byte) error {
+	viewerIdentity := identity
+	viewerIdentity.WindowID = session.WindowID
+	prepared, err := m.viewers.Prepare(ctx, viewerIdentity, func(output []byte) error {
 		return m.sendViewerOutput(client, opening, output)
 	})
 	if err != nil {
@@ -550,13 +434,13 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 		return err
 	}
 	geometry := prepared.Geometry()
-	opened := Opened{
+	opened := Ready{
 		ID:         identity.ID,
 		Generation: identity.Generation,
 		Columns:    geometry.Columns,
 		Rows:       geometry.Rows,
 	}
-	if err := ValidateServerFrame(TagOpened, opened); err != nil {
+	if err := ValidateServerFrame(TagReady, opened); err != nil {
 		_ = prepared.Close()
 		m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "open_failed", Code: "terminal_unavailable"})
 		return err
@@ -576,14 +460,14 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 		}
 		return errors.New("a terminal is already open")
 	}
-	if _, stillMirrored := m.sessions[identity]; !stillMirrored {
+	if m.state != StateReady || m.shutdown {
 		m.mu.Unlock()
 		_ = prepared.Close()
 		return errors.New("mirrored terminal ended")
 	}
 	opening = &openingViewer{identity: identity}
 	m.opening[client] = opening
-	if err := client.SendControl(ctx, TagOpened, opened); err != nil {
+	if err := client.SendControl(ctx, TagReady, opened); err != nil {
 		delete(m.opening, client)
 		m.mu.Unlock()
 		_ = prepared.Close()
@@ -605,13 +489,6 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 	}
 	opening.viewer = viewer
 	m.mu.Unlock()
-	if m.acknowledger != nil {
-		if err := m.acknowledger.AcknowledgeSession(identity.ID, identity.Generation); err != nil {
-			m.removeOpening(client, opening)
-			_ = viewer.Close()
-			return err
-		}
-	}
 	m.mu.Lock()
 	reserved := m.opening[client] == opening
 	if reserved {
@@ -619,7 +496,7 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 	}
 	_, connected = m.clients[client]
 	_, exists = m.active[client]
-	_, stillMirrored := m.sessions[identity]
+	stillMirrored := m.state == StateReady && !m.shutdown
 	if !reserved || !connected || exists || !stillMirrored {
 		m.mu.Unlock()
 		_ = viewer.Close()
@@ -636,19 +513,9 @@ func (m *Manager) Open(ctx context.Context, client *Client, request OpenRequest)
 	}
 	m.active[client] = activeViewer{identity: identity, viewer: viewer, opening: opening}
 	m.mu.Unlock()
-	event := Event{Viewed: &ViewedEvent{
-		ID: identity.ID, Generation: identity.Generation, Activity: session.Activity,
-	}}
-	if m.publishViewed(event) {
-		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "opened"})
-		go m.watchViewer(client, identity, viewer)
-		return nil
-	}
-	_ = viewer.Close()
-	m.mu.Lock()
-	delete(m.active, client)
-	m.mu.Unlock()
-	return errors.New("mirror host event queue is full")
+	m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "opened"})
+	go m.watchViewer(client, identity, viewer)
+	return nil
 }
 
 func (m *Manager) Close(client *Client) error {
@@ -663,10 +530,13 @@ func (m *Manager) Close(client *Client) error {
 	if ok {
 		err := active.viewer.Close()
 		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "closed"})
+		m.recordViewerCleanupFailure(err)
 		return err
 	}
 	if opening != nil && opening.viewer != nil {
-		return opening.viewer.Close()
+		err := opening.viewer.Close()
+		m.recordViewerCleanupFailure(err)
+		return err
 	}
 	return nil
 }
@@ -707,11 +577,11 @@ func (m *Manager) Disconnected(client *Client) {
 	delete(m.opening, client)
 	m.mu.Unlock()
 	if ok {
-		_ = active.viewer.Close()
+		m.recordViewerCleanupFailure(active.viewer.Close())
 		m.recordDiagnostic(DiagnosticRecord{Level: "info", Component: "viewer", Event: "closed"})
 	}
 	if opening != nil && opening.viewer != nil {
-		_ = opening.viewer.Close()
+		m.recordViewerCleanupFailure(opening.viewer.Close())
 	}
 }
 
@@ -768,7 +638,7 @@ func (m *Manager) watchTunnel(tunnel TunnelResource) {
 }
 
 func (m *Manager) watchViewer(client *Client, identity Identity, viewer Viewer) {
-	<-viewer.Done()
+	viewerErr := <-viewer.Done()
 	m.mu.Lock()
 	active, current := m.active[client]
 	if !current || active.identity != identity || active.viewer != viewer {
@@ -778,6 +648,7 @@ func (m *Manager) watchViewer(client *Client, identity Identity, viewer Viewer) 
 	delete(m.active, client)
 	client.markViewerClosed()
 	m.mu.Unlock()
+	m.recordViewerCleanupFailure(viewerErr)
 	m.recordDiagnostic(DiagnosticRecord{Level: "warn", Component: "viewer", Event: "ended", Code: "terminal_ended"})
 	_ = client.SendControl(context.Background(), TagError, ProtocolError{
 		Code:    "terminal_ended",
@@ -786,21 +657,37 @@ func (m *Manager) watchViewer(client *Client, identity Identity, viewer Viewer) 
 	})
 }
 
+func (m *Manager) recordViewerCleanupFailure(err error) {
+	if err == nil {
+		return
+	}
+	m.mu.Lock()
+	m.cleanupWarning = "terminal cleanup was incomplete"
+	snapshot := m.snapshotLocked()
+	m.mu.Unlock()
+	m.publishSnapshot(snapshot)
+	m.recordDiagnostic(DiagnosticRecord{
+		Level: "warn", Component: "viewer", Event: "closed", Code: "cleanup_incomplete",
+	})
+}
+
 type managerCleanup struct {
-	server  ServerResource
-	tunnel  TunnelResource
-	cancel  context.CancelFunc
-	clients []*Client
-	viewers []Viewer
+	server        ServerResource
+	tunnel        TunnelResource
+	cancel        context.CancelFunc
+	clients       []*Client
+	viewers       []Viewer
+	viewerFactory ViewerFactory
 }
 
 func (m *Manager) clearLocked(state State, errText string) managerCleanup {
 	cleanup := managerCleanup{
-		server:  m.server,
-		tunnel:  m.tunnel,
-		cancel:  m.runtimeCancel,
-		clients: m.clientsLocked(),
-		viewers: m.detachClientsLocked(),
+		server:        m.server,
+		tunnel:        m.tunnel,
+		cancel:        m.runtimeCancel,
+		clients:       m.clientsLocked(),
+		viewers:       m.detachClientsLocked(),
+		viewerFactory: m.viewers,
 	}
 	m.server = nil
 	m.tunnel = nil
@@ -809,7 +696,7 @@ func (m *Manager) clearLocked(state State, errText string) managerCleanup {
 	m.publicURL = ""
 	m.pairingURL = ""
 	m.qr = ""
-	clear(m.sessions)
+	m.cleanupWarning = ""
 	clear(m.clients)
 	m.state = state
 	m.errText = errText
@@ -842,31 +729,14 @@ func (m *Manager) detachClientsLocked() []Viewer {
 }
 
 func (m *Manager) snapshotLocked() Snapshot {
-	sessions := make([]Session, 0, len(m.sessions))
-	for _, session := range m.sessions {
-		sessions = append(sessions, Session{
-			ID:         session.ID,
-			Generation: session.Generation,
-			Name:       session.Name,
-			Kind:       session.Kind,
-			Bell:       session.Bell,
-			Activity:   session.Activity > session.SeenActivity,
-		})
-	}
-	sort.Slice(sessions, func(i, j int) bool {
-		if sessions[i].Name != sessions[j].Name {
-			return sessions[i].Name < sessions[j].Name
-		}
-		return sessions[i].ID < sessions[j].ID
-	})
 	return Snapshot{
 		State:              m.state,
 		PublicURL:          m.publicURL,
 		PairingURL:         m.pairingURL,
 		QR:                 m.qr,
-		Sessions:           sessions,
 		Err:                m.errText,
 		DiagnosticsWarning: m.diagnosticsWarning,
+		CleanupWarning:     m.cleanupWarning,
 	}
 }
 
@@ -904,64 +774,13 @@ func (m *Manager) publishSnapshot(snapshot Snapshot) {
 		return
 	default:
 	}
-	viewed, _ := m.drainEventsLocked()
-	m.refillEventsLocked(viewed)
-	if len(viewed) < cap(m.events) {
-		m.events <- event
-	}
-}
-
-func (m *Manager) publishViewed(event Event) bool {
-	m.eventMu.Lock()
-	defer m.eventMu.Unlock()
-	select {
-	case m.events <- event:
-		return true
-	default:
-	}
-	viewed, latestSnapshot := m.drainEventsLocked()
-	if len(viewed) >= cap(m.events) {
-		m.refillEventsLocked(viewed)
-		return false
-	}
-	viewed = append(viewed, event)
-	m.refillEventsLocked(viewed)
-	if latestSnapshot != nil && len(viewed) < cap(m.events) {
-		m.events <- *latestSnapshot
-	}
-	return true
-}
-
-// drainEventsLocked removes the current queue contents while retaining every
-// non-coalescible viewer acknowledgement and only the newest state snapshot.
-// eventMu must be held by the caller.
-func (m *Manager) drainEventsLocked() ([]Event, *Event) {
-	viewed := make([]Event, 0, cap(m.events))
-	var latestSnapshot Event
-	hasSnapshot := false
 	for {
 		select {
-		case event := <-m.events:
-			if event.Viewed != nil {
-				viewed = append(viewed, event)
-			} else if event.Snapshot != nil {
-				latestSnapshot = event
-				hasSnapshot = true
-			}
+		case <-m.events:
 		default:
-			if !hasSnapshot {
-				return viewed, nil
-			}
-			return viewed, &latestSnapshot
+			m.events <- event
+			return
 		}
-	}
-}
-
-// refillEventsLocked restores a queue slice known to fit the channel. eventMu
-// must be held by the caller.
-func (m *Manager) refillEventsLocked(events []Event) {
-	for _, event := range events {
-		m.events <- event
 	}
 }
 
@@ -969,6 +788,7 @@ func (c managerCleanup) close(ctx context.Context, shutdown Shutdown) error {
 	ctx, cancel := boundedCleanupContext(ctx)
 	defer cancel()
 	viewerErr := closeViewers(c.viewers)
+	viewerFactoryErr := cleanupViewerFactory(c.viewerFactory)
 	clientErr := closeClients(ctx, c.clients, shutdown)
 	var serverErr, tunnelErr error
 	if c.tunnel != nil {
@@ -980,7 +800,7 @@ func (c managerCleanup) close(ctx context.Context, shutdown Shutdown) error {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	return errors.Join(viewerErr, clientErr, serverErr, tunnelErr)
+	return errors.Join(viewerErr, viewerFactoryErr, clientErr, serverErr, tunnelErr)
 }
 
 func closeViewers(viewers []Viewer) error {
@@ -989,6 +809,14 @@ func closeViewers(viewers []Viewer) error {
 		errs = append(errs, viewer.Close())
 	}
 	return errors.Join(errs...)
+}
+
+func cleanupViewerFactory(factory ViewerFactory) error {
+	cleaner, ok := factory.(interface{ Cleanup() error })
+	if !ok {
+		return nil
+	}
+	return cleaner.Cleanup()
 }
 
 func closeClients(ctx context.Context, clients []*Client, shutdown Shutdown) error {
@@ -1006,20 +834,4 @@ func boundedCleanupContext(parent context.Context) (context.Context, context.Can
 		return context.WithCancel(parent)
 	}
 	return context.WithTimeout(parent, 5*time.Second)
-}
-
-func broadcastStatus(ctx context.Context, clients []*Client, sessions []Session) {
-	for _, client := range clients {
-		_ = client.SendControl(ctx, TagStatus, SessionList{Sessions: sessions})
-	}
-}
-
-func broadcastRevoked(ctx context.Context, clients []*Client, identity Identity, reason string) {
-	for _, client := range clients {
-		_ = client.SendControl(ctx, TagRevoked, Revoked{
-			ID:         identity.ID,
-			Generation: identity.Generation,
-			Reason:     reason,
-		})
-	}
 }

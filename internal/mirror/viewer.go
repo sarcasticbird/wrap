@@ -23,6 +23,7 @@ import (
 
 type Identity struct {
 	ID         string
+	WindowID   string
 	Generation string
 }
 
@@ -69,6 +70,7 @@ type ViewerFactory interface {
 
 type PTYViewerFactory struct {
 	SessionSocket string
+	Endpoint      tmux.Endpoint
 	TmuxPath      string
 	Environment   []string
 	Record        func(DiagnosticRecord)
@@ -254,7 +256,11 @@ func (f *PTYViewerFactory) buildCommand(
 	if err := validateIdentity(identity.ID, identity.Generation); err != nil {
 		return nil, err
 	}
-	tmuxPath, socket, err := f.commandSettings()
+	tmuxPath, endpoint, err := f.commandSettings()
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := endpoint.Args()
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +272,7 @@ func (f *PTYViewerFactory) buildCommand(
 	if err != nil {
 		return nil, fmt.Errorf("build generation-guarded viewer attach: %w", err)
 	}
-	args := append([]string{"-L", socket}, attach...)
+	args := append(prefix, attach...)
 	command := exec.Command(tmuxPath, args...)
 	command.Env = f.cleanEnvironment()
 	return command, nil
@@ -292,6 +298,13 @@ func (f *PTYViewerFactory) pinWindow(
 		windowID, geometry, mode, inherited, err := parseWindowPin(result)
 		if err != nil {
 			return "", ViewerGeometry{}, nil, fmt.Errorf("capture mirrored tmux window size: %w", err)
+		}
+		if identity.WindowID != "" && windowID != identity.WindowID {
+			return "", ViewerGeometry{}, nil, fmt.Errorf(
+				"mirrored target window changed from %s to %s",
+				identity.WindowID,
+				windowID,
+			)
 		}
 		key := viewerWindowKey{generation: identity.Generation, windowID: windowID}
 		if pin := f.pins[key]; pin != nil {
@@ -701,34 +714,66 @@ func (f *PTYViewerFactory) waitForViewerGeometry(ctx context.Context) error {
 }
 
 func (f *PTYViewerFactory) releaseWindowFunc(key viewerWindowKey) func() error {
-	var once sync.Once
-	var result error
+	var mu sync.Mutex
+	released := false
 	return func() error {
-		once.Do(func() {
-			result = f.releaseWindow(key)
-		})
-		return result
+		mu.Lock()
+		decrement := !released
+		released = true
+		defer mu.Unlock()
+		return f.releaseWindow(key, decrement)
 	}
 }
 
-func (f *PTYViewerFactory) releaseWindow(key viewerWindowKey) error {
+func (f *PTYViewerFactory) releaseWindow(key viewerWindowKey, decrement bool) error {
 	f.pinMu.Lock()
 	defer f.pinMu.Unlock()
 	pin := f.pins[key]
 	if pin == nil {
 		return nil
 	}
-	pin.references--
+	if decrement {
+		pin.references--
+	}
 	if pin.references > 0 {
 		return nil
 	}
-	delete(f.pins, key)
 	if !pin.restore {
+		delete(f.pins, key)
 		return nil
 	}
-	return f.restoreWindowPin(
+	if err := f.restoreWindowPin(
 		key, pin.originalMode, pin.originalInherited, pin.owner, pin.hookIndex,
-	)
+	); err != nil {
+		return err
+	}
+	delete(f.pins, key)
+	return nil
+}
+
+// Cleanup retries restoration for pins whose last viewer has already exited.
+// Failed pins stay in the factory so a later lifecycle cleanup can try again.
+func (f *PTYViewerFactory) Cleanup() error {
+	f.pinMu.Lock()
+	defer f.pinMu.Unlock()
+	var errs []error
+	for key, pin := range f.pins {
+		if pin.references > 0 {
+			continue
+		}
+		if !pin.restore {
+			delete(f.pins, key)
+			continue
+		}
+		if err := f.restoreWindowPin(
+			key, pin.originalMode, pin.originalInherited, pin.owner, pin.hookIndex,
+		); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		delete(f.pins, key)
+	}
+	return errors.Join(errs...)
 }
 
 func (f *PTYViewerFactory) restoreWindowPin(
@@ -780,11 +825,15 @@ func (f *PTYViewerFactory) runTmux(args []string) (string, error) {
 	if f.run != nil {
 		return f.run(args)
 	}
-	tmuxPath, socket, err := f.commandSettings()
+	tmuxPath, endpoint, err := f.commandSettings()
 	if err != nil {
 		return "", err
 	}
-	commandArgs := append([]string{"-L", socket}, args...)
+	prefix, err := endpoint.Args()
+	if err != nil {
+		return "", err
+	}
+	commandArgs := append(prefix, args...)
 	command := exec.Command(tmuxPath, commandArgs...)
 	command.Env = f.cleanEnvironment()
 	output, err := command.CombinedOutput()
@@ -815,20 +864,27 @@ func (f *PTYViewerFactory) viewerTerminalEnded(identity Identity) (bool, error) 
 	return strings.TrimSpace(result) != identity.Generation, nil
 }
 
-func (f *PTYViewerFactory) commandSettings() (string, string, error) {
+func (f *PTYViewerFactory) commandSettings() (string, tmux.Endpoint, error) {
 	tmuxPath := f.TmuxPath
 	if tmuxPath == "" {
 		var err error
 		tmuxPath, err = exec.LookPath("tmux")
 		if err != nil {
-			return "", "", fmt.Errorf("tmux not found in PATH: %w", err)
+			return "", tmux.Endpoint{}, fmt.Errorf("tmux not found in PATH: %w", err)
 		}
 	}
-	socket := f.SessionSocket
-	if socket == "" {
-		socket = tmux.SocketSessions
+	endpoint := f.Endpoint
+	if endpoint.SocketName == "" && endpoint.SocketPath == "" {
+		socket := f.SessionSocket
+		if socket == "" {
+			socket = tmux.SocketSessions
+		}
+		endpoint.SocketName = socket
 	}
-	return tmuxPath, socket, nil
+	if _, err := endpoint.Args(); err != nil {
+		return "", tmux.Endpoint{}, err
+	}
+	return tmuxPath, endpoint, nil
 }
 
 func (f *PTYViewerFactory) cleanEnvironment() []string {

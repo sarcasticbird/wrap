@@ -45,6 +45,10 @@ func parseCloudflaredVersion(output string) (string, error) {
 	return match[0], nil
 }
 
+func ParseCloudflaredVersion(output string) (string, error) {
+	return parseCloudflaredVersion(output)
+}
+
 func extractQuickTunnelURL(output string) (string, error) {
 	var found string
 	for _, field := range strings.Fields(output) {

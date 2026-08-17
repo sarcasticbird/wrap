@@ -166,6 +166,26 @@ func TestJSONLDiagnosticsRejectsUnsafeSchemaTokens(t *testing.T) {
 	}
 }
 
+func TestJSONLDiagnosticsAcceptsAutomaticTargetUnavailable(t *testing.T) {
+	sink := newJSONLDiagnosticSink(filepath.Join(t.TempDir(), "mirror.jsonl"), time.Now)
+	err := sink.Write(DiagnosticRecord{
+		Level: "warn", Component: "handshake", Event: "rejected", Code: "automatic_target_unavailable",
+	})
+	if err != nil {
+		t.Fatalf("Write() automatic target diagnostic = %v", err)
+	}
+}
+
+func TestJSONLDiagnosticsAcceptsRotationCleanupWarning(t *testing.T) {
+	sink := newJSONLDiagnosticSink(filepath.Join(t.TempDir(), "mirror.jsonl"), time.Now)
+	err := sink.Write(DiagnosticRecord{
+		Level: "warn", Component: "credential", Event: "rotated", Code: "cleanup_incomplete",
+	})
+	if err != nil {
+		t.Fatalf("cleanup warning diagnostic = %v", err)
+	}
+}
+
 func TestJSONLDiagnosticsRotatesOneBackupAtLimit(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "mirror.log")

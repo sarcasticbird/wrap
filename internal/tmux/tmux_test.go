@@ -6,11 +6,60 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestEndpointArgsSelectsExactlyOneSocket(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint Endpoint
+		want     []string
+		wantErr  string
+	}{
+		{name: "named", endpoint: Endpoint{SocketName: "work"}, want: []string{"-L", "work"}},
+		{name: "path", endpoint: Endpoint{SocketPath: "/tmp/tmux-501/default"}, want: []string{"-S", "/tmp/tmux-501/default"}},
+		{name: "missing", endpoint: Endpoint{}, wantErr: "tmux socket is required"},
+		{name: "conflicting", endpoint: Endpoint{SocketName: "work", SocketPath: "/tmp/work"}, wantErr: "exactly one tmux socket"},
+		{name: "relative path", endpoint: Endpoint{SocketPath: "relative.sock"}, wantErr: "absolute"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := tt.endpoint.Args()
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Args() error = %v, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil || !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Args() = %v, %v; want %v, nil", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestServerRunUsesSocketPath(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{out: "ok"}
+	server := NewServerPath("/tmp/tmux-501/default")
+	server.R = runner
+	got, err := server.Run("display-message", "-p", "#{window_id}")
+	if err != nil || got != "ok" {
+		t.Fatalf("Run() = %q, %v", got, err)
+	}
+	want := []string{"-S", "/tmp/tmux-501/default", "display-message", "-p", "#{window_id}"}
+	if len(runner.calls) != 1 || !reflect.DeepEqual(runner.calls[0], want) {
+		t.Fatalf("tmux calls = %v, want [%v]", runner.calls, want)
+	}
+}
 
 var tmuxTestCounter atomic.Uint64
 
@@ -1574,6 +1623,13 @@ func TestCheckVersion(t *testing.T) {
 		if (err == nil) != tc.wantOK {
 			t.Errorf("CheckVersion(%q) err=%v", tc.out, err)
 		}
+	}
+}
+
+func TestCheckVersionOutputAcceptsDevelopmentBuild(t *testing.T) {
+	version, err := CheckVersionOutput("tmux master")
+	if err != nil || version != "master" {
+		t.Fatalf("CheckVersionOutput() = %q, %v", version, err)
 	}
 }
 
