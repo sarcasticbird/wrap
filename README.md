@@ -6,9 +6,25 @@ If a terminal already runs inside tmux—whether you created it yourself or an
 app such as GhostHub owns the session—Wrap shares that exact window and leaves
 its lifecycle alone.
 
-## Build
+## Install
 
-Wrap supports Apple Silicon macOS and 64-bit ARM/x86 Linux. It requires:
+Wrap supports Apple Silicon macOS and 64-bit ARM/x86 Linux.
+
+On Apple Silicon macOS, install Wrap and its runtime dependencies with Homebrew:
+
+```sh
+brew install sarcasticbird/tap/wrap
+wrap doctor
+```
+
+The formula installs tmux and cloudflared. On Debian or Ubuntu, install tmux
+with apt and install cloudflared from
+[Cloudflare's official packages](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/),
+then build Wrap from source.
+
+### Build from source
+
+Building this checkout requires:
 
 - tmux 3.2 or newer;
 - cloudflared 2020.5.1 or newer; and
@@ -19,9 +35,6 @@ On macOS, install the runtime dependencies with Homebrew:
 ```sh
 brew install tmux cloudflared
 ```
-
-On Debian or Ubuntu, install tmux with apt and install cloudflared from
-[Cloudflare's official packages](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
 
 Build the current checkout into the Git-ignored `bin/` directory:
 
