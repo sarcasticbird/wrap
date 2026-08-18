@@ -1,6 +1,9 @@
 package mirror
 
 import (
+	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +20,7 @@ func TestModuleZipContainsMirrorRuntimeAssets(t *testing.T) {
 		t.Fatal("locate module zip test source")
 	}
 	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	repositoryRoot = moduleSourceTree(t, repositoryRoot)
 	version := module.Version{Path: "github.com/sarcasticbird/wrap", Version: "v0.0.0"}
 
 	archivePath := filepath.Join(t.TempDir(), "wrap.zip")
@@ -58,4 +62,59 @@ func TestModuleZipContainsMirrorRuntimeAssets(t *testing.T) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("test extracted module assets: %v\n%s", err, output)
 	}
+}
+
+func moduleSourceTree(t *testing.T, repositoryRoot string) string {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(repositoryRoot, ".git")); err != nil {
+		return repositoryRoot
+	}
+	command := exec.CommandContext(
+		t.Context(), "git", "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+	)
+	command.Dir = repositoryRoot
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("list publishable module files: %v", err)
+	}
+	cleanRoot := filepath.Join(t.TempDir(), "source")
+	for _, rawName := range bytes.Split(output, []byte{0}) {
+		if len(rawName) == 0 {
+			continue
+		}
+		name := string(rawName)
+		source := filepath.Join(repositoryRoot, name)
+		info, err := os.Lstat(source)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("inspect module file %s: %v", name, err)
+		}
+		destination := filepath.Join(cleanRoot, name)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, destination); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destination, data, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return cleanRoot
 }

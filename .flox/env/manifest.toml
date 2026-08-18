@@ -8,17 +8,15 @@ schema-version = "1.13.0"
 ## -------------------------------------------------------------------
 [install]
 tmux.pkg-path = "tmux"
-# Flox's catalog does not yet publish Go 1.26.5 for Intel macOS. Keep that
-# development fallback isolated while release-capable systems use the patched
-# toolchain; GitHub Actions builds every published platform from current 1.26.
+# Flox's catalog does not yet publish current Go patches for every platform.
+# These packages bootstrap the exact patched release toolchain pinned in go.mod;
+# GitHub Actions likewise builds every published platform with that exact pin.
 go.pkg-path = "go"
 go.version = "1.26.5"
 go.systems = ["aarch64-darwin", "aarch64-linux", "x86_64-linux"]
 go.pkg-group = "go-current"
-go-intel-darwin.pkg-path = "go"
-go-intel-darwin.version = "1.26.4"
-go-intel-darwin.systems = ["x86_64-darwin"]
-go-intel-darwin.pkg-group = "go-intel-darwin"
+golangci-lint.pkg-path = "golangci-lint"
+golangci-lint.version = "2.12.2"
 # gum.pkg-path = "gum"
 # gum.version = "^0.14.5"
 
@@ -96,12 +94,7 @@ go-intel-darwin.pkg-group = "go-intel-darwin"
 
 ## Other Environment Options -----------------------------------------
 [options]
-# Systems that environment is compatible with
-# systems = [
-#   "aarch64-darwin",
-#   "aarch64-linux",
-#   "x86_64-darwin",
-#   "x86_64-linux",
-# ]
+# Wrap supports Apple Silicon macOS and 64-bit ARM/x86 Linux.
+systems = ["aarch64-darwin", "aarch64-linux", "x86_64-linux"]
 # Uncomment to disable CUDA detection.
 # cuda-detection = false

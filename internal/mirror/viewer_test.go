@@ -56,6 +56,25 @@ func TestPTYViewerFactoryBuildsGenerationGuardedIgnoredSizeAttach(t *testing.T) 
 	}
 }
 
+func TestPTYViewerFactoryUsesExactSocketPath(t *testing.T) {
+	factory := PTYViewerFactory{
+		Endpoint: tmux.Endpoint{SocketPath: "/tmp/tmux-501/default"},
+		TmuxPath: "/usr/bin/tmux",
+	}
+	command, err := factory.buildCommand(Identity{
+		ID:         "$8",
+		WindowID:   "@4",
+		Generation: "0123456789abcdef0123456789abcdef",
+	}, "@4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(command.Args, " ")
+	if !strings.Contains(joined, "-S /tmp/tmux-501/default if-shell") {
+		t.Fatalf("viewer command did not use exact socket path: %q", joined)
+	}
+}
+
 func TestIntentionalViewerTerminationSuppressesKilledExit(t *testing.T) {
 	command := exec.Command("sh", "-c", "exit 7")
 	err := command.Run()
@@ -397,6 +416,25 @@ func TestPinWindowDoesNotMutateWhenGeometryIsRejected(t *testing.T) {
 	}
 }
 
+func TestPinWindowRejectsWindowDifferentFromTarget(t *testing.T) {
+	var calls [][]string
+	factory := PTYViewerFactory{
+		run: func(args []string) (string, error) {
+			calls = append(calls, append([]string(nil), args...))
+			return "@9\t132\t41\nwindow-size largest\non\n", nil
+		},
+	}
+	_, _, _, err := factory.pinWindow(Identity{
+		ID: "$8", WindowID: "@4", Generation: "0123456789abcdef0123456789abcdef",
+	})
+	if err == nil || !strings.Contains(err.Error(), "target window changed") {
+		t.Fatalf("window mismatch error = %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("tmux calls = %d, want capture only", len(calls))
+	}
+}
+
 func TestRestoreWindowPinIgnoresExitedTmuxServer(t *testing.T) {
 	factory := PTYViewerFactory{
 		run: func([]string) (string, error) {
@@ -415,6 +453,71 @@ func TestRestoreWindowPinIgnoresExitedTmuxServer(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("restore after tmux server exit = %v, want nil", err)
+	}
+}
+
+func TestReleaseWindowRetainsPinUntilRestoreSucceeds(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	key := viewerWindowKey{generation: generation, windowID: "@4"}
+	restores := 0
+	factory := PTYViewerFactory{
+		pins: map[viewerWindowKey]*viewerWindowPin{
+			key: {
+				references:        1,
+				originalMode:      "latest",
+				originalInherited: true,
+				restore:           true,
+				owner:             "00112233445566778899aabbccddeeff",
+				hookIndex:         424242,
+			},
+		},
+		run: func([]string) (string, error) {
+			restores++
+			if restores == 1 {
+				return "", errors.New("tmux temporarily unavailable")
+			}
+			return "", nil
+		},
+	}
+	release := factory.releaseWindowFunc(key)
+	if err := release(); err == nil || !strings.Contains(err.Error(), "temporarily unavailable") {
+		t.Fatalf("first release = %v, want restore error", err)
+	}
+	if pin := factory.pins[key]; pin == nil || pin.references != 0 {
+		t.Fatalf("pin after failed restore = %+v, want retained with zero references", pin)
+	}
+	if err := release(); err != nil {
+		t.Fatalf("retry release = %v", err)
+	}
+	if _, ok := factory.pins[key]; ok {
+		t.Fatal("pin metadata remained after successful restore")
+	}
+	if restores != 2 {
+		t.Fatalf("restore attempts = %d, want 2", restores)
+	}
+}
+
+func TestViewerFactoryCleanupRetriesUnreferencedPins(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	key := viewerWindowKey{generation: generation, windowID: "@4"}
+	factory := PTYViewerFactory{
+		pins: map[viewerWindowKey]*viewerWindowPin{
+			key: {
+				references:        0,
+				originalMode:      "latest",
+				originalInherited: true,
+				restore:           true,
+				owner:             "00112233445566778899aabbccddeeff",
+				hookIndex:         424242,
+			},
+		},
+		run: func([]string) (string, error) { return "", nil },
+	}
+	if err := factory.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := factory.pins[key]; ok {
+		t.Fatal("factory cleanup retained successfully restored pin")
 	}
 }
 

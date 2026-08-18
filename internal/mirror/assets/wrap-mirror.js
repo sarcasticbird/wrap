@@ -1,20 +1,15 @@
 import { Terminal } from "/assets/third_party/xterm/xterm.mjs";
-import "/assets/wrap-mirror-state.js";
 import "/assets/wrap-mirror-viewport.js";
 
-const STORAGE_KEY = "wrap.mirror.v2.secret";
+const STORAGE_KEY = "wrap.mirror.v3.secret";
 const MAX_WIRE_MESSAGE = 128 * 1024;
 const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17;
 const TAG = Object.freeze({
   hello: 0x01,
-  list: 0x02,
-  status: 0x03,
-  open: 0x04,
   close: 0x05,
   input: 0x06,
   output: 0x07,
-  opened: 0x08,
-  revoked: 0x09,
+  ready: 0x08,
   shutdown: 0x0a,
   error: 0x0b,
 });
@@ -114,7 +109,7 @@ async function cryptoSelfTest() {
     secretBytes,
     serverNonce,
     clientNonce,
-    "wrap-mirror/v2/c2s",
+    "wrap-mirror/v3/c2s",
   );
   const raw = new Uint8Array(await crypto.subtle.exportKey(
     "raw",
@@ -123,7 +118,7 @@ async function cryptoSelfTest() {
         name: "HKDF",
         hash: "SHA-256",
         salt: concat(serverNonce, clientNonce),
-        info: encoder.encode("wrap-mirror/v2/s2c"),
+        info: encoder.encode("wrap-mirror/v3/s2c"),
       },
       await crypto.subtle.importKey("raw", secretBytes, "HKDF", false, ["deriveKey"]),
       { name: "AES-GCM", length: 256 },
@@ -131,11 +126,11 @@ async function cryptoSelfTest() {
       ["encrypt", "decrypt"],
     ),
   ));
-  if (toHex(raw) !== "a7574bd01ad71ecf2d2339aa9a417029f860d957836d8883a2307599d9f51161") {
+  if (toHex(raw) !== "bf47e53cc41e5f1c829635faf9920d9215ef6ae4372d271d71b83818627d56ab") {
     throw new Error("key derivation self-test failed");
   }
-  const hello = await encryptFrame(key, 0n, TAG.hello, encoder.encode('{"version":2}'));
-  if (toHex(hello) !== "49ac75e8504742f9e9aef44d69fefb855a3694abe34934356b6b0b8d8ffb") {
+  const hello = await encryptFrame(key, 0n, TAG.hello, encoder.encode('{"version":3}'));
+  if (toHex(hello) !== "5836e8c59d70015c557cf7dc7811a1c1633af18e31732fd4cb7444af07f6") {
     throw new Error("encryption self-test failed");
   }
   secretBytes.fill(0);
@@ -181,9 +176,6 @@ const elements = {
   message: document.querySelector("#message-view"),
   messageTitle: document.querySelector("#message-title"),
   messageDetail: document.querySelector("#message-detail"),
-  list: document.querySelector("#list-view"),
-  sessionList: document.querySelector("#session-list"),
-  sessionCount: document.querySelector("#session-count"),
   terminalView: document.querySelector("#terminal-view"),
   terminalTitle: document.querySelector("#terminal-title"),
   terminalViewport: document.querySelector("#terminal-viewport"),
@@ -192,7 +184,6 @@ const elements = {
   terminalSurface: document.querySelector("#terminal-surface"),
   terminal: document.querySelector("#terminal"),
   pinchScale: document.querySelector("#pinch-scale"),
-  back: document.querySelector("#back-button"),
   close: document.querySelector("#close-button"),
   toolbar: document.querySelector("#toolbar"),
   keyboardToggle: document.querySelector("#keyboard-toggle"),
@@ -216,8 +207,7 @@ const terminal = new Terminal({
 });
 
 let connection = null;
-const closeState = globalThis.WrapMirrorCloseState;
-const viewerState = closeState.create();
+const viewerState = { current: null, closing: false };
 const viewportReducer = globalThis.WrapMirrorViewportState;
 const terminalViewportState = viewportReducer.create();
 let reconnectAttempt = 0;
@@ -281,7 +271,6 @@ function showOnly(view) {
   }
   document.body.classList.toggle("terminal-active", view === "terminal");
   elements.message.classList.toggle("hidden", view !== "message");
-  elements.list.classList.toggle("hidden", view !== "list");
   elements.terminalView.classList.toggle("hidden", view !== "terminal");
 }
 
@@ -624,101 +613,8 @@ function refitTerminalViewport() {
   applyTerminalViewport();
 }
 
-function renderSessions(nextSessions) {
-  viewerState.sessions = nextSessions;
-  const sessions = viewerState.sessions;
-  elements.sessionList.replaceChildren();
-  elements.sessionCount.textContent = String(sessions.length);
-  if (sessions.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "empty";
-    empty.textContent = "The host is not sharing any terminals.";
-    elements.sessionList.append(empty);
-  }
-  for (const session of sessions) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "session";
-    const name = document.createElement("span");
-    name.className = "session-name";
-    name.textContent = session.name;
-    const meta = document.createElement("span");
-    meta.className = "session-meta";
-    meta.textContent = session.kind || "terminal";
-    const badges = document.createElement("span");
-    badges.className = "badges";
-    if (session.bell) {
-      badges.append(makeBadge("Bell"));
-    }
-    if (session.activity) {
-      badges.append(makeBadge("New"));
-    }
-    button.append(name, meta, badges);
-    button.addEventListener("click", () => openSession(session));
-    elements.sessionList.append(button);
-  }
-  viewerState.current = null;
-  geometryAccepted = false;
-  resetTerminalViewport();
-  setOnline();
-  showOnly("list");
-}
-
-const viewerEffects = Object.freeze({
-  tags: TAG,
-  parseJSON,
-  validateSessionList,
-  render: (nextSessions) => renderSessions(nextSessions),
-  ended: () => {
-    geometryAccepted = false;
-    resetTerminalViewport();
-    showMessage("Terminal ended", "The host stopped sharing that terminal.", "Encrypted");
-    setTimeout(() => renderSessions(viewerState.sessions), 700);
-  },
-  error: (problem, target) => {
-    geometryAccepted = false;
-    resetTerminalViewport();
-    if (problem.retry === false) {
-      stopped = true;
-    }
-    showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
-    if (problem.retry === false) {
-      target.socket.close();
-    } else {
-      setTimeout(() => renderSessions(viewerState.sessions), 700);
-    }
-  },
-});
-
-function makeBadge(label) {
-  const badge = document.createElement("span");
-  badge.className = "badge";
-  badge.textContent = label;
-  return badge;
-}
-
 function parseJSON(payload) {
   return JSON.parse(decoder.decode(payload));
-}
-
-function validateSessionList(value) {
-  if (!value || !Array.isArray(value.sessions)) {
-    throw new Error("invalid session list");
-  }
-  for (const session of value.sessions) {
-    if (
-      !session ||
-      typeof session.id !== "string" ||
-      typeof session.generation !== "string" ||
-      typeof session.name !== "string" ||
-      typeof session.kind !== "string" ||
-      typeof session.bell !== "boolean" ||
-      typeof session.activity !== "boolean"
-    ) {
-      throw new Error("invalid session");
-    }
-  }
-  return value.sessions;
 }
 
 function validateOpened(value) {
@@ -747,14 +643,11 @@ function focusTerminalForPhysicalKeyboard() {
   }
 }
 
-function openSession(session) {
-  if (!connection?.authenticated || !closeState.open(viewerState, session)) {
-    return;
-  }
+function prepareAutomaticTerminal() {
   geometryAccepted = false;
   resetTerminalViewport();
   setTypingMode(false);
-  elements.terminalTitle.textContent = session.name;
+  elements.terminalTitle.textContent = "Terminal";
   setTerminalDisplayPending("Opening terminal…");
   showOnly("terminal");
   try {
@@ -762,32 +655,26 @@ function openSession(session) {
     terminal.reset();
     restoreBaseTerminalMetrics();
   } catch {
-    closeState.reset(viewerState);
+    viewerState.current = null;
+    viewerState.closing = false;
     showMessage(
       "Terminal display unavailable",
       "Reload this page to retry. Code: terminal_display_unavailable",
       "Encrypted",
     );
-    setTimeout(() => renderSessions(viewerState.sessions), 1200);
     return;
   }
-  sendJSON(TAG.open, {
-    id: session.id,
-    generation: session.generation,
-  });
 }
 
 function closeSession() {
-  if (connection?.authenticated && closeState.beginClose(viewerState)) {
+  if (connection?.authenticated && viewerState.current && !viewerState.closing) {
+    viewerState.current = null;
+    viewerState.closing = true;
     geometryAccepted = false;
     cancelTerminalMeasurement();
     queueFrame(TAG.close, new Uint8Array());
     showMessage("Closing terminal…", "Waiting for the encrypted host acknowledgement.", "Encrypted");
   }
-}
-
-function sendJSON(tag, value) {
-  queueFrame(tag, encoder.encode(JSON.stringify(value)));
 }
 
 function queueFrame(tag, payload) {
@@ -805,6 +692,25 @@ function queueFrame(tag, payload) {
   }).catch(() => poison(target, false));
 }
 
+function handleTerminalError(target, problem) {
+  viewerState.current = null;
+  viewerState.closing = false;
+  geometryAccepted = false;
+  resetTerminalViewport();
+  if (problem.retry === false) stopped = true;
+  showMessage("Terminal unavailable", String(problem.message || "The host rejected the operation."));
+  target.socket.close();
+}
+
+function handleCloseAcknowledgement() {
+  stopped = true;
+  viewerState.current = null;
+  viewerState.closing = false;
+  geometryAccepted = false;
+  resetTerminalViewport();
+  showMessage("Terminal closed", "Reload this page to reopen the encrypted terminal.", "Encrypted");
+}
+
 async function receiveMessage(target, data) {
   if (target.poisoned || !(data instanceof ArrayBuffer)) {
     throw new Error("invalid socket message");
@@ -820,53 +726,40 @@ async function receiveMessage(target, data) {
       secret,
       serverNonce,
       clientNonce,
-      "wrap-mirror/v2/c2s",
+      "wrap-mirror/v3/c2s",
     );
     target.receiveKey = await deriveDirectionalKey(
       secret,
       serverNonce,
       clientNonce,
-      "wrap-mirror/v2/s2c",
+      "wrap-mirror/v3/s2c",
     );
     target.socket.send(clientNonce);
     await target.sendChain;
-    queueFrame(TAG.hello, encoder.encode('{"version":2}'));
+    queueFrame(TAG.hello, encoder.encode('{"version":3}'));
+    prepareAutomaticTerminal();
     serverNonce.fill(0);
     clientNonce.fill(0);
     return;
   }
   const frame = await decryptFrame(target.receiveKey, target.receiveCounter, bytes);
   target.receiveCounter += 1n;
-  if (closeState.receiveMessage(viewerState, target, frame, viewerEffects)) {
-    return;
-  }
   switch (frame.tag) {
-    case TAG.list:
-      if (target.authenticated) {
-        throw new Error("duplicate initial list");
+    case TAG.close:
+      if (!target.authenticated || frame.payload.length !== 0 || !viewerState.closing) {
+        throw new Error("unexpected close acknowledgement");
       }
-      target.authenticated = true;
-      reconnectAttempt = 0;
-      renderSessions(validateSessionList(parseJSON(frame.payload)));
+      handleCloseAcknowledgement();
       break;
-    case TAG.opened: {
-      if (!target.authenticated || geometryAccepted) {
+    case TAG.ready: {
+      if (target.authenticated || geometryAccepted) {
         throw new Error("unexpected opened terminal");
       }
       const opened = validateOpened(parseJSON(frame.payload));
-      const requested = viewerState.current || viewerState.closing;
-      if (
-        !requested ||
-        opened.id !== requested.id ||
-        opened.generation !== requested.generation
-      ) {
-        throw new Error("opened terminal identity mismatch");
-      }
-      if (viewerState.closing) {
-        geometryAccepted = false;
-        cancelTerminalMeasurement();
-        break;
-      }
+      target.authenticated = true;
+      reconnectAttempt = 0;
+      viewerState.current = { id: opened.id, generation: opened.generation };
+      setOnline();
       resizeTerminalToHostGeometry(opened);
       viewportReducer.open(terminalViewportState, opened);
       geometryAccepted = true;
@@ -886,6 +779,11 @@ async function receiveMessage(target, data) {
       }
       terminal.write(frame.payload);
       break;
+    case TAG.error: {
+      const problem = parseJSON(frame.payload);
+      handleTerminalError(target, problem);
+      break;
+    }
     case TAG.shutdown: {
       const shutdown = parseJSON(frame.payload);
       if (typeof shutdown.retry !== "boolean") {
@@ -964,7 +862,8 @@ function connect() {
       return;
     }
     connection = null;
-    closeState.reset(viewerState);
+    viewerState.current = null;
+    viewerState.closing = false;
     geometryAccepted = false;
     resetTerminalViewport();
     if (event.code === 1008) {
@@ -1219,7 +1118,6 @@ elements.terminalViewport.addEventListener("pointercancel", (event) => {
     finishPinchScale();
   }
 });
-elements.back.addEventListener("click", closeSession);
 elements.close.addEventListener("click", closeSession);
 window.addEventListener("resize", updateVisualViewport);
 globalThis.visualViewport?.addEventListener("resize", updateVisualViewport);

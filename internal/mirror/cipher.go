@@ -26,11 +26,11 @@ func DeriveKeys(secret, serverNonce, clientNonce []byte) (c2s, s2c [32]byte, err
 	salt := make([]byte, 0, 32)
 	salt = append(salt, serverNonce...)
 	salt = append(salt, clientNonce...)
-	c2sBytes, err := hkdf.Key(sha256.New, secret, salt, "wrap-mirror/v2/c2s", len(c2s))
+	c2sBytes, err := hkdf.Key(sha256.New, secret, salt, "wrap-mirror/v3/c2s", len(c2s))
 	if err != nil {
 		return c2s, s2c, fmt.Errorf("derive client-to-server key: %w", err)
 	}
-	s2cBytes, err := hkdf.Key(sha256.New, secret, salt, "wrap-mirror/v2/s2c", len(s2c))
+	s2cBytes, err := hkdf.Key(sha256.New, secret, salt, "wrap-mirror/v3/s2c", len(s2c))
 	if err != nil {
 		return c2s, s2c, fmt.Errorf("derive server-to-client key: %w", err)
 	}

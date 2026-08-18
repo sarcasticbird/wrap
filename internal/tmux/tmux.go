@@ -4,10 +4,12 @@ package tmux
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -39,14 +41,44 @@ type Runner interface {
 	Run(args ...string) (string, error)
 }
 
+type ContextRunner interface {
+	RunContext(context.Context, ...string) (string, error)
+}
+
+// Endpoint selects one tmux server. Named sockets use tmux -L while exact
+// socket paths discovered from TMUX use tmux -S.
+type Endpoint struct {
+	SocketName string
+	SocketPath string
+}
+
+func (e Endpoint) Args() ([]string, error) {
+	switch {
+	case e.SocketName == "" && e.SocketPath == "":
+		return nil, errors.New("tmux socket is required")
+	case e.SocketName != "" && e.SocketPath != "":
+		return nil, errors.New("exactly one tmux socket selector is required")
+	case e.SocketName != "":
+		return []string{"-L", e.SocketName}, nil
+	case !filepath.IsAbs(e.SocketPath):
+		return nil, errors.New("tmux socket path must be absolute")
+	default:
+		return []string{"-S", e.SocketPath}, nil
+	}
+}
+
 type execRunner struct{}
 
 func (execRunner) Run(args ...string) (string, error) {
-	return runExec(args...)
+	return runExecContext(context.Background(), args...)
 }
 
-func runExec(args ...string) (string, error) {
-	cmd := exec.Command("tmux", args...)
+func (execRunner) RunContext(ctx context.Context, args ...string) (string, error) {
+	return runExecContext(ctx, args...)
+}
+
+func runExecContext(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "tmux", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
@@ -59,6 +91,9 @@ func runExec(args ...string) (string, error) {
 
 type Server struct {
 	Socket string
+	// SocketPath addresses an already-running tmux server by the exact path
+	// reported in TMUX. It is mutually exclusive with Socket.
+	SocketPath string
 	// ConfigFile, when set, is passed as tmux -f on every command.
 	// Separate sockets isolate server STATE but not configuration: a new
 	// server still reads the user's tmux.conf, so options like
@@ -73,12 +108,34 @@ func NewServer(socket string) *Server {
 	return &Server{Socket: socket, R: execRunner{}}
 }
 
+func NewServerPath(socketPath string) *Server {
+	return &Server{SocketPath: socketPath, R: execRunner{}}
+}
+
 func (s *Server) Run(args ...string) (string, error) {
-	prefix := []string{"-L", s.Socket}
+	prefix, err := (Endpoint{SocketName: s.Socket, SocketPath: s.SocketPath}).Args()
+	if err != nil {
+		return "", err
+	}
 	if s.ConfigFile != "" {
 		prefix = append([]string{"-f", s.ConfigFile}, prefix...)
 	}
 	return s.R.Run(append(prefix, args...)...)
+}
+
+func (s *Server) RunContext(ctx context.Context, args ...string) (string, error) {
+	prefix, err := (Endpoint{SocketName: s.Socket, SocketPath: s.SocketPath}).Args()
+	if err != nil {
+		return "", err
+	}
+	if s.ConfigFile != "" {
+		prefix = append([]string{"-f", s.ConfigFile}, prefix...)
+	}
+	fullArgs := append(prefix, args...)
+	if runner, ok := s.R.(ContextRunner); ok {
+		return runner.RunContext(ctx, fullArgs...)
+	}
+	return s.R.Run(fullArgs...)
 }
 
 func (s *Server) HasSession(name string) (bool, error) {
@@ -198,6 +255,8 @@ var ErrSessionIdentityChanged = errors.New("tmux session identity changed")
 
 const ServerGenerationOption = "@wrap_server_generation"
 
+const InstanceIDOption = "@wrap_instance_id"
+
 // EnsureServerGeneration initializes one unpredictable generation marker for
 // this tmux server lifetime. The if-shell command is serialized by tmux, so
 // concurrent wrap clients cannot overwrite a generation another client just
@@ -232,6 +291,75 @@ func (s *Server) KillSessionIDIfGeneration(id, generation string) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) KillSessionIDIfGenerationAndName(id, generation, name string) error {
+	if !isSessionID(id) {
+		return fmt.Errorf("invalid tmux session id %q", id)
+	}
+	if !isGeneration(generation) {
+		return fmt.Errorf("invalid tmux server generation %q", generation)
+	}
+	if name == "" {
+		return errors.New("tmux session name is empty")
+	}
+	condition := "#{&&:#{==:#{" + ServerGenerationOption + "}," + generation +
+		"},#{==:#{session_name}," + escapeFormatLiteral(name) + "}}"
+	reject := tmuxCommand("display-message", "-p", sessionIdentityMismatchMessage)
+	out, err := s.Run(
+		"if-shell", "-F", "-t", id, condition,
+		tmuxCommand("kill-session", "-t", id), reject,
+	)
+	if err != nil {
+		if isMissingSessionError(err) {
+			return nil
+		}
+		return err
+	}
+	if strings.TrimSpace(out) == sessionIdentityMismatchMessage {
+		return ErrSessionIdentityChanged
+	}
+	return nil
+}
+
+// KillSessionIDIfGenerationAndNameAndOption kills an exact helper session only
+// while every piece of its Wrap ownership identity still matches.
+func (s *Server) KillSessionIDIfGenerationAndNameAndOption(
+	id, generation, name, option, value string,
+) error {
+	if !isSessionID(id) {
+		return fmt.Errorf("invalid tmux session id %q", id)
+	}
+	if !isGeneration(generation) {
+		return fmt.Errorf("invalid tmux server generation %q", generation)
+	}
+	if name == "" {
+		return errors.New("tmux session name is empty")
+	}
+	if option == "" || !strings.HasPrefix(option, "@") {
+		return fmt.Errorf("invalid tmux ownership option %q", option)
+	}
+	if value == "" {
+		return errors.New("tmux ownership value is empty")
+	}
+	condition := "#{&&:#{==:#{" + ServerGenerationOption + "}," + generation +
+		"},#{&&:#{==:#{session_name}," + escapeFormatLiteral(name) +
+		"},#{==:#{" + option + "}," + escapeFormatLiteral(value) + "}}}"
+	reject := tmuxCommand("display-message", "-p", sessionIdentityMismatchMessage)
+	out, err := s.Run(
+		"if-shell", "-F", "-t", id, condition,
+		tmuxCommand("kill-session", "-t", id), reject,
+	)
+	if err != nil {
+		if isMissingSessionError(err) {
+			return nil
+		}
+		return err
+	}
+	if strings.TrimSpace(out) == sessionIdentityMismatchMessage {
+		return ErrSessionIdentityChanged
+	}
+	return nil
 }
 
 // KillSessionIDIfGenerationAndNameAndKind kills id only while its server
@@ -434,6 +562,72 @@ func AttachWindowIgnoringSizeIfGenerationArgs(
 ) ([]string, error) {
 	attach := tmuxCommand("attach-session", "-f", "ignore-size", "-t", id)
 	return sessionWindowCommandIfGenerationArgs(id, generation, windowID, attach)
+}
+
+// NewStandaloneSessionIfWindowGenerationArgs creates a detached helper session
+// only while the source still selects windowID on the expected server
+// generation. The temporary window is replaced before the helper is exposed.
+func NewStandaloneSessionIfWindowGenerationArgs(
+	id, generation, windowID, name string,
+) ([]string, error) {
+	if !isSessionID(id) {
+		return nil, fmt.Errorf("invalid tmux session id %q", id)
+	}
+	if !isGeneration(generation) {
+		return nil, fmt.Errorf("invalid tmux server generation %q", generation)
+	}
+	if !isWindowID(windowID) {
+		return nil, fmt.Errorf("invalid tmux window id %q", windowID)
+	}
+	if name == "" {
+		return nil, errors.New("tmux grouped session name is empty")
+	}
+	condition := "#{&&:#{==:#{" + ServerGenerationOption + "}," + generation +
+		"},#{==:#{window_id}," + windowID + "}}"
+	create := tmuxCommand(
+		"new-session", "-d", "-s", name, "-n", "__wrap_placeholder",
+		"-P", "-F", "#{session_id}\t#{window_id}",
+		"exec sleep 300",
+	)
+	create += " ; " + tmuxCommand(
+		"set-option", "-t", name, "destroy-unattached", "off",
+	)
+	reject := tmuxCommand("display-message", "-p", sessionWindowMismatchMessage)
+	return []string{"if-shell", "-F", "-t", id, condition, create, reject}, nil
+}
+
+// LinkWindowReplacingCurrentIfGenerationArgs atomically replaces the helper's
+// temporary window with one exact source window. The source identity guard
+// prevents a restarted server or changed source selection from linking a
+// different window.
+func LinkWindowReplacingCurrentIfGenerationArgs(
+	sourceID, generation, windowID, targetID, targetWindowID string,
+) ([]string, error) {
+	if !isSessionID(targetID) {
+		return nil, fmt.Errorf("invalid target tmux session id %q", targetID)
+	}
+	if !isWindowID(targetWindowID) {
+		return nil, fmt.Errorf("invalid target tmux window id %q", targetWindowID)
+	}
+	link := tmuxCommand(
+		"link-window", "-d", "-k",
+		"-s", sourceID+":"+windowID,
+		"-t", targetID+":"+targetWindowID,
+	)
+	return sessionWindowCommandIfGenerationArgs(sourceID, generation, windowID, link)
+}
+
+// SelectWindowIDIfGeneration selects one exact linked window in a helper
+// session, refusing a server restart that could reuse either stable ID.
+func (s *Server) SelectWindowIDIfGeneration(id, generation, windowID string) error {
+	if !isWindowID(windowID) {
+		return fmt.Errorf("invalid tmux window id %q", windowID)
+	}
+	return s.runSessionCommandIfGeneration(
+		id,
+		generation,
+		tmuxCommand("select-window", "-t", id+":"+windowID),
+	)
 }
 
 // CaptureWindowSizeIfGenerationArgs returns one tmux command queue operation that
@@ -642,6 +836,7 @@ func (s *Server) runSessionCommandIfGeneration(id, generation, command string) e
 
 const generationMismatchMessage = "wrap-server-generation-mismatch"
 const sessionIdentityMismatchMessage = "wrap-session-identity-mismatch"
+const sessionWindowMismatchMessage = "wrap-session-window-mismatch"
 const windowPinMismatchMessage = "wrap-window-pin-mismatch"
 
 // IsGenerationMismatchOutput reports whether tmux emitted the sentinel used by
@@ -1185,14 +1380,32 @@ func CheckVersion(r Runner) error {
 	if err != nil {
 		return errors.New("tmux not found — install it (brew install tmux, apt install tmux) and retry")
 	}
-	ver := strings.TrimPrefix(strings.TrimSpace(out), "tmux ")
-	ver = strings.TrimPrefix(ver, "next-")
-	var maj, min int
-	if _, err := fmt.Sscanf(ver, "%d.%d", &maj, &min); err != nil {
+	ver, maj, min, err := ParseVersion(out)
+	if err != nil {
 		return nil // unparseable (e.g. "master") → assume new enough
 	}
 	if maj > 3 || (maj == 3 && min >= 2) {
 		return nil
 	}
 	return fmt.Errorf("tmux %s is too old — wrap needs 3.2 or newer", ver)
+}
+
+func ParseVersion(output string) (version string, major, minor int, err error) {
+	version = strings.TrimPrefix(strings.TrimSpace(output), "tmux ")
+	version = strings.TrimPrefix(version, "next-")
+	if _, err := fmt.Sscanf(version, "%d.%d", &major, &minor); err != nil {
+		return "", 0, 0, errors.New("tmux version could not be parsed")
+	}
+	return version, major, minor, nil
+}
+
+func CheckVersionOutput(output string) (string, error) {
+	version, major, minor, err := ParseVersion(output)
+	if err != nil {
+		return strings.TrimPrefix(strings.TrimSpace(output), "tmux "), nil
+	}
+	if major > 3 || (major == 3 && minor >= 2) {
+		return version, nil
+	}
+	return "", fmt.Errorf("tmux %s is too old — wrap needs 3.2 or newer", version)
 }

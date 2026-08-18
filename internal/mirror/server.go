@@ -31,9 +31,7 @@ const (
 )
 
 type ClientHandler interface {
-	InitialSessions() []Session
-	Connected(*Client)
-	Open(context.Context, *Client, OpenRequest) error
+	Connected(context.Context, *Client) error
 	Close(*Client) error
 	Input(*Client, []byte) error
 	Disconnected(*Client)
@@ -346,28 +344,30 @@ func (s *LocalServer) handleWebSocket(response http.ResponseWriter, request *htt
 		s.mu.Unlock()
 	}()
 	client.startWriter(s.ctx)
-	if err := client.SendControl(
-		s.ctx,
-		TagMirrorList,
-		SessionList{Sessions: s.handler.InitialSessions()},
-	); err != nil {
-		s.recordHandshakeRejection("session_list_failed")
-		_ = connection.Close(websocket.StatusInternalError, "mirror unavailable")
+	if err := s.handler.Connected(s.ctx, client); err != nil {
+		errorCtx, cancel := context.WithTimeout(s.ctx, time.Second)
+		_ = client.closeWithControl(errorCtx, TagError, ProtocolError{
+			Code:    "terminal_unavailable",
+			Message: "The host terminal is unavailable.",
+			Retry:   false,
+		})
+		cancel()
+		s.handler.Disconnected(client)
+		client.closeNow(err)
+		<-client.writerDone
+		s.recordHandshakeRejection("automatic_target_unavailable")
 		return
 	}
 	emitDiagnostic(s.record, DiagnosticRecord{Level: "info", Component: "handshake", Event: "authenticated"})
-	s.handler.Connected(client)
 	client.run(s.ctx)
 }
 
 type noOpClientHandler struct{}
 
-func (noOpClientHandler) InitialSessions() []Session                       { return nil }
-func (noOpClientHandler) Connected(*Client)                                {}
-func (noOpClientHandler) Open(context.Context, *Client, OpenRequest) error { return nil }
-func (noOpClientHandler) Close(*Client) error                              { return nil }
-func (noOpClientHandler) Input(*Client, []byte) error                      { return nil }
-func (noOpClientHandler) Disconnected(*Client)                             {}
+func (noOpClientHandler) Connected(context.Context, *Client) error { return nil }
+func (noOpClientHandler) Close(*Client) error                      { return nil }
+func (noOpClientHandler) Input(*Client, []byte) error              { return nil }
+func (noOpClientHandler) Disconnected(*Client)                     {}
 
 func (s *LocalServer) serveAsset(response http.ResponseWriter, name, contentType string) {
 	assetFS := s.assetFS
@@ -391,7 +391,6 @@ func requiredMirrorAsset(name string) bool {
 		"assets/wrap-mirror.css",
 		"assets/wrap-mirror-bootstrap.js",
 		"assets/wrap-mirror.js",
-		"assets/wrap-mirror-state.js",
 		"assets/wrap-mirror-viewport.js",
 		"assets/third_party/xterm/xterm.mjs",
 		"assets/third_party/xterm/xterm.css",

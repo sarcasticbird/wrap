@@ -2,12 +2,6 @@ package mirror
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hkdf"
-	"crypto/sha256"
-	"encoding/binary"
-	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,106 +12,77 @@ import (
 	"github.com/coder/websocket"
 )
 
-type integrationViewer struct {
+type lifecycleViewer struct {
 	output func([]byte) error
 	writes chan []byte
 	done   chan error
 	once   sync.Once
 }
 
-func (v *integrationViewer) Write(data []byte) error {
-	v.writes <- append([]byte(nil), data...)
+func (viewer *lifecycleViewer) Write(data []byte) error {
+	viewer.writes <- append([]byte(nil), data...)
 	return nil
 }
 
-func (v *integrationViewer) Close() error {
-	v.once.Do(func() {
-		close(v.done)
-	})
+func (viewer *lifecycleViewer) Close() error {
+	viewer.once.Do(func() { close(viewer.done) })
 	return nil
 }
 
-func (v *integrationViewer) Done() <-chan error {
-	return v.done
+func (viewer *lifecycleViewer) Done() <-chan error { return viewer.done }
+
+type lifecyclePreparedViewer struct {
+	viewer *lifecycleViewer
 }
 
-type integrationAcknowledger struct {
-	identities chan Identity
+func (*lifecyclePreparedViewer) Geometry() ViewerGeometry {
+	return ViewerGeometry{Columns: 132, Rows: 41}
+}
+func (prepared *lifecyclePreparedViewer) Start() (Viewer, error) { return prepared.viewer, nil }
+func (*lifecyclePreparedViewer) Close() error                    { return nil }
+
+type lifecycleViewerFactory func(context.Context, Identity, func([]byte) error) (PreparedViewer, error)
+
+func (factory lifecycleViewerFactory) Prepare(
+	ctx context.Context,
+	identity Identity,
+	output func([]byte) error,
+) (PreparedViewer, error) {
+	return factory(ctx, identity, output)
 }
 
-func (a integrationAcknowledger) AcknowledgeSession(id, generation string) error {
-	a.identities <- Identity{ID: id, Generation: generation}
-	return nil
+type lifecycleTunnel struct {
+	url  string
+	done chan error
 }
 
-type integrationCipher struct {
-	aead    cipher.AEAD
-	counter uint64
-}
-
-func newIntegrationCipher(t *testing.T, key []byte) *integrationCipher {
-	t.Helper()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &integrationCipher{aead: aead}
-}
-
-func (c *integrationCipher) seal(t *testing.T, tag byte, payload []byte) []byte {
-	t.Helper()
-	plaintext := append([]byte{tag}, payload...)
-	ciphertext := c.aead.Seal(nil, integrationNonce(c.counter), plaintext, nil)
-	c.counter++
-	return ciphertext
-}
-
-func (c *integrationCipher) open(t *testing.T, ciphertext []byte) (byte, []byte) {
-	t.Helper()
-	plaintext, err := c.aead.Open(nil, integrationNonce(c.counter), ciphertext, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.counter++
-	if len(plaintext) == 0 {
-		t.Fatal("encrypted frame has no tag")
-	}
-	return plaintext[0], plaintext[1:]
-}
-
-func integrationNonce(counter uint64) []byte {
-	nonce := make([]byte, 12)
-	binary.BigEndian.PutUint64(nonce[4:], counter)
-	return nonce
-}
+func (tunnel *lifecycleTunnel) URL() string        { return tunnel.url }
+func (tunnel *lifecycleTunnel) Done() <-chan error { return tunnel.done }
+func (*lifecycleTunnel) Close() error              { return nil }
 
 func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 	const publicHost = "quiet-river.trycloudflare.com"
 	var localServer *LocalServer
-	openedViewers := make(chan *integrationViewer, 2)
-	acknowledged := make(chan Identity, 2)
+	opened := make(chan *lifecycleViewer, 4)
 	manager, err := NewManager(ManagerOptions{
-		Workspace:    "vb",
-		Acknowledger: integrationAcknowledger{identities: acknowledged},
-		Viewers: viewerFactoryFunc(func(
+		Workspace: "api",
+		Target: &HostSession{
+			ID: "$7", WindowID: "@3",
+			Generation: "0123456789abcdef0123456789abcdef",
+			Name:       "api", Kind: "terminal",
+		},
+		Viewers: lifecycleViewerFactory(func(
 			_ context.Context,
 			_ Identity,
 			output func([]byte) error,
 		) (PreparedViewer, error) {
-			viewer := &integrationViewer{
+			viewer := &lifecycleViewer{
 				output: output,
 				writes: make(chan []byte, 1),
 				done:   make(chan error),
 			}
-			openedViewers <- viewer
-			return &fakePreparedViewer{
-				geometry: ViewerGeometry{Columns: 132, Rows: 41},
-				viewer:   viewer,
-			}, nil
+			opened <- viewer
+			return &lifecyclePreparedViewer{viewer: viewer}, nil
 		}),
 		StartServer: func(ctx context.Context, options ServerOptions) (ServerResource, error) {
 			server, startErr := StartLocalServer(ctx, options)
@@ -125,252 +90,169 @@ func TestManagerLocalServerEncryptedLifecycle(t *testing.T) {
 			return server, startErr
 		},
 		StartTunnel: func(context.Context, string) (TunnelResource, error) {
-			return &fakeTunnelResource{
-				url:  "https://" + publicHost,
-				done: make(chan error),
+			return &lifecycleTunnel{
+				url: "https://" + publicHost, done: make(chan error),
 			}, nil
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := HostSession{
-		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
-	}
-	if err := manager.Mirror(t.Context(), session); err != nil {
+	if err := manager.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	secondSession := HostSession{
-		ID: "$8", Generation: session.Generation, Name: "vb/web",
-	}
-	if err := manager.Mirror(t.Context(), secondSession); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = manager.Shutdown(ctx)
+	})
 
-	secret := pairingSecret(t, manager.Snapshot().PairingURL)
-	connection, sealer, opener := dialEncryptedManager(
+	secret := lifecyclePairingSecret(t, manager.Snapshot().PairingURL)
+	connection, opener, sealer := dialLifecycleMirror(
 		t, localServer.LocalURL(), publicHost, secret, 0x30,
 	)
-	assertSessionFrame(t, connection, opener, TagMirrorList, "vb/api", "vb/web")
-	assertSessionFrame(t, connection, opener, TagStatus, "vb/api", "vb/web")
+	viewer := receiveLifecycle(t, opened, "automatically opened viewer")
+	assertLifecycleReady(t, connection, opener)
 
-	writeEncryptedControl(t, connection, sealer, TagOpen, OpenRequest{
-		ID: session.ID, Generation: session.Generation,
-	})
-	viewer := receiveWithin(t, openedViewers, "viewer open")
-	assertOpenedFrame(t, connection, opener, Opened{
-		ID: session.ID, Generation: session.Generation, Columns: 132, Rows: 41,
-	})
-	if got := receiveWithin(t, acknowledged, "viewer acknowledgement"); got != (Identity{
-		ID: session.ID, Generation: session.Generation,
-	}) {
-		t.Fatalf("acknowledged identity = %+v", got)
-	}
-	assertViewedEvent(t, manager.Events(), Identity{
-		ID: session.ID, Generation: session.Generation,
-	})
-	writeEncryptedRaw(t, connection, sealer, TagInput, []byte("hello"))
-	if got := string(receiveWithin(t, viewer.writes, "viewer input")); got != "hello" {
+	writeLifecycleFrame(t, connection, sealer, TagInput, []byte("hello"))
+	if got := string(receiveLifecycle(t, viewer.writes, "viewer input")); got != "hello" {
 		t.Fatalf("viewer input = %q", got)
 	}
 	if err := viewer.output([]byte("world")); err != nil {
 		t.Fatal(err)
 	}
-	tag, payload := readEncryptedFrame(t, connection, opener)
+	tag, payload := readLifecycleFrame(t, connection, opener)
 	if tag != TagOutput || string(payload) != "world" {
-		t.Fatalf("viewer output frame = 0x%02x %q", tag, payload)
+		t.Fatalf("viewer output = 0x%02x %q", tag, payload)
 	}
-	writeEncryptedRaw(t, connection, sealer, TagClose, nil)
-	_ = receiveWithin(t, viewer.done, "viewer close")
-	tag, payload = readEncryptedFrame(t, connection, opener)
+	writeLifecycleFrame(t, connection, sealer, TagClose, nil)
+	_ = receiveLifecycle(t, viewer.done, "viewer close")
+	tag, payload = readLifecycleFrame(t, connection, opener)
 	if tag != TagClose || len(payload) != 0 {
 		t.Fatalf("close acknowledgement = 0x%02x %x", tag, payload)
 	}
+	waitForLifecycleClients(t, manager, 0)
 
-	writeEncryptedControl(t, connection, sealer, TagOpen, OpenRequest{
-		ID: secondSession.ID, Generation: secondSession.Generation,
-	})
-	secondViewer := receiveWithin(t, openedViewers, "second viewer open")
-	assertOpenedFrame(t, connection, opener, Opened{
-		ID: secondSession.ID, Generation: secondSession.Generation, Columns: 132, Rows: 41,
-	})
-	if got := receiveWithin(t, acknowledged, "second viewer acknowledgement"); got != (Identity{
-		ID: secondSession.ID, Generation: secondSession.Generation,
-	}) {
-		t.Fatalf("second acknowledged identity = %+v", got)
-	}
-	assertViewedEvent(t, manager.Events(), Identity{
-		ID: secondSession.ID, Generation: secondSession.Generation,
-	})
-	if err := manager.Revoke(t.Context(), Identity{
-		ID: secondSession.ID, Generation: secondSession.Generation,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_ = receiveWithin(t, secondViewer.done, "revoked viewer close")
-	assertRevokedFrame(t, connection, opener, Identity{
-		ID: secondSession.ID, Generation: secondSession.Generation,
-	})
-	assertSessionFrame(t, connection, opener, TagStatus, "vb/api")
-
-	rotateResult := make(chan error, 1)
-	go func() {
-		rotateResult <- manager.Rotate(t.Context())
-	}()
-	assertShutdownFrame(t, connection, opener, "pairing rotated")
-	_ = connection.Close(websocket.StatusNormalClosure, "rotation received")
-	if err := receiveWithin(t, rotateResult, "pairing rotation"); err != nil {
-		t.Fatal(err)
-	}
-
-	rotatedSecret := pairingSecret(t, manager.Snapshot().PairingURL)
-	if rotatedSecret == secret {
-		t.Fatal("pairing rotation retained the original secret")
-	}
-	connection, _, opener = dialEncryptedManager(
-		t, localServer.LocalURL(), publicHost, rotatedSecret, 0x60,
+	rotatedConnection, rotatedOpener, _ := dialLifecycleMirror(
+		t, localServer.LocalURL(), publicHost, secret, 0x50,
 	)
-	assertSessionFrame(t, connection, opener, TagMirrorList, "vb/api")
-	assertSessionFrame(t, connection, opener, TagStatus, "vb/api")
-
-	revokeResult := make(chan error, 1)
-	go func() {
-		revokeResult <- manager.Revoke(t.Context(), Identity{
-			ID: session.ID, Generation: session.Generation,
-		})
-	}()
-	assertShutdownFrame(t, connection, opener, "no mirrored terminals remain")
-	_ = connection.Close(websocket.StatusNormalClosure, "shutdown received")
-	if err := receiveWithin(t, revokeResult, "last-session revoke"); err != nil {
+	rotatedViewer := receiveLifecycle(t, opened, "viewer before rotation")
+	assertLifecycleReady(t, rotatedConnection, rotatedOpener)
+	if err := manager.Rotate(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.Snapshot().State; got != StateStopped {
-		t.Fatalf("state after last-session revoke = %v", got)
+	_ = receiveLifecycle(t, rotatedViewer.done, "rotated viewer close")
+	readCtx, cancelRead := context.WithTimeout(t.Context(), time.Second)
+	_, _, readErr := rotatedConnection.Read(readCtx)
+	cancelRead()
+	if readErr == nil {
+		t.Fatal("credential rotation left the old WebSocket connected")
 	}
+
+	staleConnection, staleOpener, _ := dialLifecycleMirror(
+		t, localServer.LocalURL(), publicHost, secret, 0x60,
+	)
+	staleCtx, cancelStale := context.WithTimeout(t.Context(), time.Second)
+	_, staleCiphertext, staleErr := staleConnection.Read(staleCtx)
+	cancelStale()
+	if staleErr == nil {
+		if _, _, openErr := staleOpener.Open(staleCiphertext); openErr == nil {
+			t.Fatal("rotated pairing credential authenticated")
+		}
+	}
+	_ = staleConnection.CloseNow()
+
+	newSecret := lifecyclePairingSecret(t, manager.Snapshot().PairingURL)
+	if newSecret == secret {
+		t.Fatal("pairing rotation retained the old secret")
+	}
+	newConnection, newOpener, newSealer := dialLifecycleMirror(
+		t, localServer.LocalURL(), publicHost, newSecret, 0x70,
+	)
+	newViewer := receiveLifecycle(t, opened, "viewer after rotation")
+	assertLifecycleReady(t, newConnection, newOpener)
+	writeLifecycleFrame(t, newConnection, newSealer, TagClose, nil)
+	_ = receiveLifecycle(t, newViewer.done, "new viewer close")
+	tag, payload = readLifecycleFrame(t, newConnection, newOpener)
+	if tag != TagClose || len(payload) != 0 {
+		t.Fatalf("new close acknowledgement = 0x%02x %x", tag, payload)
+	}
+	waitForLifecycleClients(t, manager, 0)
 }
 
-func TestManagerUnexpectedTunnelExitRevokesBrowserCredential(t *testing.T) {
-	const publicHost = "quiet-river.trycloudflare.com"
-	var localServer *LocalServer
-	tunnel := &fakeTunnelResource{
-		url:  "https://" + publicHost,
-		done: make(chan error, 1),
-	}
-	manager, err := NewManager(ManagerOptions{
-		Workspace: "vb",
-		StartServer: func(ctx context.Context, options ServerOptions) (ServerResource, error) {
-			server, startErr := StartLocalServer(ctx, options)
-			localServer = server
-			return server, startErr
-		},
-		StartTunnel: func(context.Context, string) (TunnelResource, error) {
-			return tunnel, nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session := HostSession{
-		ID: "$7", Generation: "0123456789abcdef0123456789abcdef", Name: "vb/api",
-	}
-	if err := manager.Mirror(t.Context(), session); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = manager.Shutdown(context.Background()) })
-
-	secret := pairingSecret(t, manager.Snapshot().PairingURL)
-	connection, _, opener := dialEncryptedManager(
-		t, localServer.LocalURL(), publicHost, secret, 0x70,
-	)
-	assertSessionFrame(t, connection, opener, TagMirrorList, "vb/api")
-	assertSessionFrame(t, connection, opener, TagStatus, "vb/api")
-
-	tunnel.done <- errors.New("process exited")
-	assertShutdownFrame(t, connection, opener, "Quick Tunnel exited")
-	_ = connection.Close(websocket.StatusNormalClosure, "shutdown received")
-}
-
-func pairingSecret(t *testing.T, pairingURL string) Secret {
+func lifecyclePairingSecret(t *testing.T, pairingURL string) Secret {
 	t.Helper()
 	parsed, err := url.Parse(pairingURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret, err := ParseSecret(parsed.Fragment[len("k="):])
+	secret, err := ParseSecret(strings.TrimPrefix(parsed.Fragment, "k="))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return secret
 }
 
-func dialEncryptedManager(
+func dialLifecycleMirror(
 	t *testing.T,
 	localURL, publicHost string,
 	secret Secret,
 	seed byte,
-) (*websocket.Conn, *integrationCipher, *integrationCipher) {
+) (*websocket.Conn, *Opener, *Sealer) {
 	t.Helper()
-	socketURL := "ws://" + strings.TrimPrefix(localURL, "http://") + "/ws"
-	connection, _, err := websocket.Dial(t.Context(), socketURL, &websocket.DialOptions{
+	host := strings.TrimPrefix(localURL, "http://")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	connection, _, err := websocket.Dial(ctx, "ws://"+host+"/ws", &websocket.DialOptions{
 		HTTPHeader:      http.Header{"Origin": []string{"https://" + publicHost}},
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	kind, serverNonce, err := connection.Read(t.Context())
+	kind, serverNonce, err := connection.Read(ctx)
 	if err != nil || kind != websocket.MessageBinary || len(serverNonce) != 16 {
-		t.Fatalf("server nonce kind/len/error = %v/%d/%v", kind, len(serverNonce), err)
+		t.Fatalf("server nonce = kind:%v len:%d error:%v", kind, len(serverNonce), err)
 	}
 	clientNonce := make([]byte, 16)
-	for i := range clientNonce {
-		clientNonce[i] = seed + byte(i)
+	for index := range clientNonce {
+		clientNonce[index] = seed + byte(index)
 	}
-	if err := connection.Write(t.Context(), websocket.MessageBinary, clientNonce); err != nil {
+	if err := connection.Write(ctx, websocket.MessageBinary, clientNonce); err != nil {
 		t.Fatal(err)
 	}
-	salt := append(append([]byte(nil), serverNonce...), clientNonce...)
-	c2s, err := hkdf.Key(sha256.New, secret[:], salt, "wrap-mirror/v2/c2s", 32)
+	c2s, s2c, err := DeriveKeys(secret[:], serverNonce, clientNonce)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2c, err := hkdf.Key(sha256.New, secret[:], salt, "wrap-mirror/v2/s2c", 32)
+	sealer, err := NewSealer(c2s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealer := newIntegrationCipher(t, c2s)
-	opener := newIntegrationCipher(t, s2c)
-	writeEncryptedControl(t, connection, sealer, TagClientHello, ClientHello{
-		Version: ProtocolVersion,
-	})
-	return connection, sealer, opener
+	opener, err := NewOpener(s2c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello, err := EncodeControl(TagClientHello, ClientHello{Version: ProtocolVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLifecycleFrame(t, connection, sealer, TagClientHello, hello)
+	return connection, opener, sealer
 }
 
-func writeEncryptedControl(
+func writeLifecycleFrame(
 	t *testing.T,
 	connection *websocket.Conn,
-	sealer *integrationCipher,
-	tag byte,
-	value any,
-) {
-	t.Helper()
-	payload, err := EncodeControl(tag, value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeEncryptedRaw(t, connection, sealer, tag, payload)
-}
-
-func writeEncryptedRaw(
-	t *testing.T,
-	connection *websocket.Conn,
-	sealer *integrationCipher,
+	sealer *Sealer,
 	tag byte,
 	payload []byte,
 ) {
 	t.Helper()
-	ciphertext := sealer.seal(t, tag, payload)
+	ciphertext, err := sealer.Seal(tag, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	if err := connection.Write(ctx, websocket.MessageBinary, ciphertext); err != nil {
@@ -378,128 +260,52 @@ func writeEncryptedRaw(
 	}
 }
 
-func readEncryptedFrame(
+func readLifecycleFrame(
 	t *testing.T,
 	connection *websocket.Conn,
-	opener *integrationCipher,
+	opener *Opener,
 ) (byte, []byte) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	kind, ciphertext, err := connection.Read(ctx)
 	if err != nil || kind != websocket.MessageBinary {
-		t.Fatalf("encrypted frame read = %v/%v", kind, err)
+		t.Fatalf("encrypted frame = kind:%v error:%v", kind, err)
 	}
-	return opener.open(t, ciphertext)
-}
-
-func assertSessionFrame(
-	t *testing.T,
-	connection *websocket.Conn,
-	opener *integrationCipher,
-	wantTag byte,
-	wantNames ...string,
-) {
-	t.Helper()
-	tag, payload := readEncryptedFrame(t, connection, opener)
-	if tag != wantTag {
-		t.Fatalf("session frame tag = 0x%02x, want 0x%02x", tag, wantTag)
-	}
-	var list SessionList
-	if err := DecodeControl(tag, payload, &list); err != nil {
+	tag, payload, err := opener.Open(ciphertext)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Sessions) != len(wantNames) {
-		t.Fatalf("session frame = %+v", list.Sessions)
-	}
-	for i, wantName := range wantNames {
-		if list.Sessions[i].Name != wantName {
-			t.Fatalf("session %d name = %q, want %q", i, list.Sessions[i].Name, wantName)
-		}
-	}
+	return tag, payload
 }
 
-func assertOpenedFrame(
-	t *testing.T,
-	connection *websocket.Conn,
-	opener *integrationCipher,
-	want Opened,
-) {
+func assertLifecycleReady(t *testing.T, connection *websocket.Conn, opener *Opener) {
 	t.Helper()
-	tag, payload := readEncryptedFrame(t, connection, opener)
-	if tag != TagOpened {
-		t.Fatalf("opened frame tag = 0x%02x, want 0x%02x", tag, TagOpened)
+	tag, payload := readLifecycleFrame(t, connection, opener)
+	if tag != TagReady {
+		t.Fatalf("ready tag = 0x%02x", tag)
 	}
-	var opened Opened
-	if err := DecodeControl(tag, payload, &opened); err != nil {
+	var ready Ready
+	if err := DecodeControl(tag, payload, &ready); err != nil {
 		t.Fatal(err)
 	}
-	if opened != want {
-		t.Fatalf("opened frame = %+v, want %+v", opened, want)
+	if ready.ID != "$7" || ready.Generation == "" || ready.Columns != 132 || ready.Rows != 41 {
+		t.Fatalf("ready = %+v", ready)
 	}
 }
 
-func assertShutdownFrame(
-	t *testing.T,
-	connection *websocket.Conn,
-	opener *integrationCipher,
-	wantReason string,
-) {
+func waitForLifecycleClients(t *testing.T, manager *Manager, want int) {
 	t.Helper()
-	tag, payload := readEncryptedFrame(t, connection, opener)
-	if tag != TagShutdown {
-		t.Fatalf("shutdown frame tag = 0x%02x, want 0x%02x", tag, TagShutdown)
+	deadline := time.Now().Add(time.Second)
+	for manager.ClientCount() != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	var shutdown Shutdown
-	if err := DecodeControl(tag, payload, &shutdown); err != nil {
-		t.Fatal(err)
-	}
-	if shutdown.Reason != wantReason || shutdown.Retry {
-		t.Fatalf("shutdown frame = %+v", shutdown)
+	if got := manager.ClientCount(); got != want {
+		t.Fatalf("clients = %d, want %d", got, want)
 	}
 }
 
-func assertRevokedFrame(
-	t *testing.T,
-	connection *websocket.Conn,
-	opener *integrationCipher,
-	want Identity,
-) {
-	t.Helper()
-	tag, payload := readEncryptedFrame(t, connection, opener)
-	if tag != TagRevoked {
-		t.Fatalf("revoked frame tag = 0x%02x, want 0x%02x", tag, TagRevoked)
-	}
-	var revoked Revoked
-	if err := DecodeControl(tag, payload, &revoked); err != nil {
-		t.Fatal(err)
-	}
-	if revoked.ID != want.ID || revoked.Generation != want.Generation ||
-		revoked.Reason != "mirror revoked" {
-		t.Fatalf("revoked frame = %+v", revoked)
-	}
-}
-
-func assertViewedEvent(t *testing.T, events <-chan Event, want Identity) {
-	t.Helper()
-	timeout := time.After(time.Second)
-	for {
-		select {
-		case event := <-events:
-			if event.Viewed == nil {
-				continue
-			}
-			if event.Viewed.ID != want.ID || event.Viewed.Generation != want.Generation {
-				t.Fatalf("viewed event = %+v", event.Viewed)
-			}
-			return
-		case <-timeout:
-			t.Fatalf("timed out waiting for viewed event %+v", want)
-		}
-	}
-}
-
-func receiveWithin[T any](t *testing.T, values <-chan T, description string) T {
+func receiveLifecycle[T any](t *testing.T, values <-chan T, description string) T {
 	t.Helper()
 	select {
 	case value := <-values:

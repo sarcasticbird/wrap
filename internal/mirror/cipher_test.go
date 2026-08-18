@@ -24,19 +24,19 @@ func TestDeriveKeysMatchesBrowserVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := hex.EncodeToString(c2s[:]); got != "48dc51994ede7a7fd3b04b66ba2103331f812109cc821e56e34a0f2b3860a315" {
+	if got := hex.EncodeToString(c2s[:]); got != "2beb04e49fa488acd7f838b1656b2550c6b8be9111750d91d757e0e243fa0c76" {
 		t.Errorf("c2s key = %s", got)
 	}
-	if got := hex.EncodeToString(s2c[:]); got != "a7574bd01ad71ecf2d2339aa9a417029f860d957836d8883a2307599d9f51161" {
+	if got := hex.EncodeToString(s2c[:]); got != "bf47e53cc41e5f1c829635faf9920d9215ef6ae4372d271d71b83818627d56ab" {
 		t.Errorf("s2c key = %s", got)
 	}
 }
 
 func TestCipherMatchesBrowserVectorAndRejectsReplay(t *testing.T) {
-	keyBytes := mustHex(t, "48dc51994ede7a7fd3b04b66ba2103331f812109cc821e56e34a0f2b3860a315")
+	keyBytes := mustHex(t, "2beb04e49fa488acd7f838b1656b2550c6b8be9111750d91d757e0e243fa0c76")
 	var key [32]byte
 	copy(key[:], keyBytes)
-	plain := mustHex(t, "017b2276657273696f6e223a327d")
+	plain := mustHex(t, "017b2276657273696f6e223a337d")
 
 	sealer, err := NewSealer(key)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestCipherMatchesBrowserVectorAndRejectsReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := hex.EncodeToString(ciphertext); got != "49ac75e8504742f9e9aef44d69fefb855a3694abe34934356b6b0b8d8ffb" {
+	if got := hex.EncodeToString(ciphertext); got != "5836e8c59d70015c557cf7dc7811a1c1633af18e31732fd4cb7444af07f6" {
 		t.Fatalf("ciphertext = %s", got)
 	}
 
@@ -71,8 +71,8 @@ func TestCipherMatchesBrowserVectorAndRejectsReplay(t *testing.T) {
 
 func TestCipherRejectsTamperingAndWrongDirection(t *testing.T) {
 	var c2s, s2c [32]byte
-	copy(c2s[:], mustHex(t, "48dc51994ede7a7fd3b04b66ba2103331f812109cc821e56e34a0f2b3860a315"))
-	copy(s2c[:], mustHex(t, "a7574bd01ad71ecf2d2339aa9a417029f860d957836d8883a2307599d9f51161"))
+	copy(c2s[:], mustHex(t, "2beb04e49fa488acd7f838b1656b2550c6b8be9111750d91d757e0e243fa0c76"))
+	copy(s2c[:], mustHex(t, "bf47e53cc41e5f1c829635faf9920d9215ef6ae4372d271d71b83818627d56ab"))
 
 	sealer, _ := NewSealer(c2s)
 	ciphertext, err := sealer.Seal(TagInput, []byte("hello"))

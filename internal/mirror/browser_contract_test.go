@@ -4,6 +4,8 @@ import (
 	"io/fs"
 	"strings"
 	"testing"
+
+	"github.com/dop251/goja"
 )
 
 func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) {
@@ -11,11 +13,7 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	stateBytes, err := fs.ReadFile(assets, "assets/wrap-mirror-state.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(sourceBytes) + "\n" + string(stateBytes)
+	source := string(sourceBytes)
 	for _, want := range []string{
 		`from "/assets/third_party/xterm/xterm.mjs"`,
 		`new URLSearchParams(location.hash.slice(1))`,
@@ -25,8 +23,8 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 		`HKDF`,
 		`SHA-256`,
 		`AES-GCM`,
-		`wrap-mirror/v2/c2s`,
-		`wrap-mirror/v2/s2c`,
+		`wrap-mirror/v3/c2s`,
+		`wrap-mirror/v3/s2c`,
 		`binaryType = "arraybuffer"`,
 		`await cryptoSelfTest()`,
 		`new WebSocket`,
@@ -52,10 +50,107 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 		"new Function",
 		"http://",
 		"https://",
+		"wrap-mirror-state.js",
+		"TAG.list",
+		"TAG.status",
+		"TAG.open",
+		"TAG.revoked",
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("browser client contains forbidden capability %q", forbidden)
 		}
+	}
+}
+
+func TestBrowserContractAutoOpensSoleTargetWithoutPicker(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlBytes, err := fs.ReadFile(assets, "assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	html := string(htmlBytes)
+	for _, forbidden := range []string{
+		"Mirrored terminals",
+		"AVAILABLE NOW",
+		"sendJSON(TAG.open",
+	} {
+		if strings.Contains(source+html, forbidden) {
+			t.Errorf("single-target browser retains picker behavior %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"prepareAutomaticTerminal()",
+		"case TAG.ready:",
+		"target.authenticated = true",
+	} {
+		if !strings.Contains(source, required) {
+			t.Errorf("single-target browser missing %q", required)
+		}
+	}
+}
+
+func TestBrowserRetryableTerminalErrorClosesSocketForReconnect(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "handleTerminalError")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let viewerState = {current: {id: "terminal"}, closing: true};
+let geometryAccepted = true;
+let stopped = false;
+let resetCount = 0;
+let renderedTitle = "";
+function resetTerminalViewport() { resetCount += 1; }
+function showMessage(title) { renderedTitle = title; }
+` + handler + `
+}
+const target = {socket: {closeCount: 0, close() { this.closeCount += 1; }}};
+handleTerminalError(target, {retry: true, message: "viewer ended"});
+if (target.socket.closeCount !== 1) throw new Error("retryable error left socket open");
+if (stopped) throw new Error("retryable error stopped reconnection");
+if (viewerState.current !== null || viewerState.closing) throw new Error("viewer state was not reset");
+if (geometryAccepted || resetCount !== 1) throw new Error("terminal geometry was not reset");
+if (renderedTitle !== "Terminal unavailable") throw new Error("terminal error was not rendered");
+`)
+	if err != nil {
+		t.Fatalf("retryable terminal error behavior: %v", err)
+	}
+}
+
+func TestBrowserCloseAcknowledgementSuppressesSocketReconnect(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "handleCloseAcknowledgement")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let stopped = false;
+let viewerState = {current: {id: "terminal"}, closing: true};
+let geometryAccepted = true;
+let reconnects = 0;
+function resetTerminalViewport() {}
+function showMessage() {}
+` + handler + `
+}
+handleCloseAcknowledgement();
+if (!stopped) throw new Error("close acknowledgement did not stop connection");
+if (viewerState.current !== null || viewerState.closing || geometryAccepted) {
+  throw new Error("close acknowledgement did not reset terminal state");
+}
+// This is the reconnect decision made by the socket close listener after the
+// server follows the encrypted acknowledgement with a normal WebSocket close.
+if (!stopped) reconnects += 1;
+if (reconnects !== 0) throw new Error("intentional terminal close reconnected");
+`)
+	if err != nil {
+		t.Fatalf("close acknowledgement behavior: %v", err)
 	}
 }
 
@@ -88,15 +183,15 @@ func TestBrowserContractUsesHostOwnedGeometryWithoutRemoteResize(t *testing.T) {
 	source := string(sourceBytes)
 	for _, want := range []string{
 		`import "/assets/wrap-mirror-viewport.js"`,
-		`opened: 0x08`,
-		`case TAG.opened:`,
+		`ready: 0x08`,
+		`case TAG.ready:`,
 		`terminal.resize(opened.columns, opened.rows)`,
 		`querySelector(".xterm-viewport")`,
 		`scrollbar.offsetWidth - scrollbar.clientWidth`,
 		`terminal.options.fontSize = viewportReducer.fontSize(`,
 		`globalThis.matchMedia?.("(pointer: fine)").matches`,
 		`focusTerminalForPhysicalKeyboard()`,
-		`version":2`,
+		`version":3`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client missing host-geometry contract %q", want)
@@ -151,17 +246,17 @@ func TestBrowserContractRestoresMetricsAfterIdenticalGeometryReopen(t *testing.T
 		t.Fatal(err)
 	}
 	source := string(sourceBytes)
-	openStart := strings.Index(source, "function openSession(session)")
+	openStart := strings.Index(source, "function prepareAutomaticTerminal()")
 	if openStart < 0 {
-		t.Fatal("browser client missing openSession function")
+		t.Fatal("browser client missing automatic terminal preparation")
 	}
 	openEnd := strings.Index(source[openStart:], "\n}\n")
 	if openEnd < 0 {
-		t.Fatal("browser client missing openSession function")
+		t.Fatal("browser client missing automatic terminal preparation")
 	}
-	openSession := source[openStart : openStart+openEnd]
-	show := strings.Index(openSession, `showOnly("terminal")`)
-	restore := strings.Index(openSession, `restoreBaseTerminalMetrics()`)
+	prepare := source[openStart : openStart+openEnd]
+	show := strings.Index(prepare, `showOnly("terminal")`)
+	restore := strings.Index(prepare, `restoreBaseTerminalMetrics()`)
 	if show < 0 || restore < 0 || show > restore {
 		t.Fatal("browser does not restore base metrics after making the terminal visible")
 	}
@@ -275,22 +370,21 @@ func TestBrowserContractRecoversFromDeferredTerminalMountFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	openSession := browserFunctionSource(t, string(sourceBytes), "openSession")
+	openSession := browserFunctionSource(t, string(sourceBytes), "prepareAutomaticTerminal")
 	for _, want := range []string{
 		"try {",
 		"ensureTerminalMounted()",
 		"catch",
-		"closeState.reset(viewerState)",
+		"viewerState.current = null",
+		"viewerState.closing = false",
 		`"Terminal display unavailable"`,
 	} {
 		if !strings.Contains(openSession, want) {
 			t.Errorf("terminal mount recovery missing %q", want)
 		}
 	}
-	recoverAt := strings.Index(openSession, "closeState.reset(viewerState)")
-	openAt := strings.Index(openSession, "sendJSON(TAG.open")
-	if recoverAt < 0 || openAt < 0 || recoverAt > openAt {
-		t.Fatal("terminal mount recovery runs after the remote open request")
+	if strings.Contains(openSession, "sendJSON(TAG.open") {
+		t.Fatal("automatic terminal preparation sends a target-selection request")
 	}
 }
 
@@ -345,7 +439,7 @@ func TestBrowserContractCancelsHiddenTerminalMeasurementDuringClose(t *testing.T
 			t.Errorf("close path does not cancel terminal measurement: missing %q", want)
 		}
 	}
-	openedStart := strings.Index(source, "case TAG.opened:")
+	openedStart := strings.Index(source, "case TAG.ready:")
 	if openedStart < 0 {
 		t.Fatal("browser client is missing opened handler")
 	}
@@ -354,10 +448,10 @@ func TestBrowserContractCancelsHiddenTerminalMeasurementDuringClose(t *testing.T
 		t.Fatal("browser client is missing opened/output handlers")
 	}
 	opened := source[openedStart : openedStart+outputStart]
-	closing := strings.Index(opened, "if (viewerState.closing)")
+	authenticated := strings.Index(opened, "target.authenticated = true")
 	resize := strings.Index(opened, "resizeTerminalToHostGeometry(opened)")
-	if closing < 0 || resize < 0 || closing > resize {
-		t.Fatal("delayed opened frame is rendered before the closing-state guard")
+	if authenticated < 0 || resize < 0 || authenticated > resize {
+		t.Fatal("automatic ready frame is rendered before authentication is committed")
 	}
 }
 
@@ -680,38 +774,28 @@ func TestBrowserCoarsePointerDownSuppressesCompatibilityMouseEvents(t *testing.T
 	}
 }
 
-func TestBrowserContractHandlesCloseRevocationAndLargeInputWithoutPoisoning(t *testing.T) {
+func TestBrowserContractHandlesCloseAndLargeInputWithoutPoisoning(t *testing.T) {
 	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	stateBytes, err := fs.ReadFile(assets, "assets/wrap-mirror-state.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(sourceBytes) + "\n" + string(stateBytes)
+	source := string(sourceBytes)
 	for _, want := range []string{
 		`const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17`,
-		`case effects.tags.close:`,
+		`case TAG.close:`,
 		`function sendInput(data)`,
 		`payload.subarray(offset, offset + MAX_FRAME_PAYLOAD)`,
-		`closeState.beginClose(viewerState)`,
-		`setTimeout(() => renderSessions(viewerState.sessions), 700)`,
+		`viewerState.closing = true`,
+		`"Terminal closed"`,
 		`"Incompatible browser"`,
 	} {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client missing close/input guard %q", want)
 		}
 	}
-	for _, want := range []string{
-		`import "/assets/wrap-mirror-state.js"`,
-		`const viewerState = closeState.create()`,
-		`closeState.receiveMessage(viewerState, target, frame, viewerEffects)`,
-		`case effects.tags.status:`,
-		`case effects.tags.revoked:`,
-	} {
-		if !strings.Contains(source, want) {
-			t.Errorf("browser client does not resolve server-side close race %q", want)
+	for _, forbidden := range []string{"validateSessionList", "TAG.status", "TAG.revoked", "sendJSON(TAG.open"} {
+		if strings.Contains(source, forbidden) {
+			t.Errorf("browser client retains selection protocol %q", forbidden)
 		}
 	}
 }

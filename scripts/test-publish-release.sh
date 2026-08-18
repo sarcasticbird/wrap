@@ -83,7 +83,6 @@ ln -s "$repo/scripts/test-publish-release.sh" "$mock_bin/git"
 expected_assets=$(
   printf '%s\n' \
     checksums.txt \
-    "wrap_${tag}_darwin_amd64.tar.gz" \
     "wrap_${tag}_darwin_arm64.tar.gz" \
     "wrap_${tag}_linux_amd64.tar.gz" \
     "wrap_${tag}_linux_arm64.tar.gz" |
@@ -253,7 +252,6 @@ tag=v1.2.3+build-1
 build_assets=$(
   printf '%s\n' \
     checksums.txt \
-    "wrap_${tag}_darwin_amd64.tar.gz" \
     "wrap_${tag}_darwin_arm64.tar.gz" \
     "wrap_${tag}_linux_amd64.tar.gz" \
     "wrap_${tag}_linux_arm64.tar.gz" |

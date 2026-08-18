@@ -21,10 +21,9 @@ SECURITY.md
 docs/architecture.md
 docs/configuration.md
 docs/mobile-mirror-uat.md
-docs/troubleshooting.md
-examples/wrap.toml'
+docs/troubleshooting.md'
 
-for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+for target in darwin_arm64 linux_amd64 linux_arm64; do
   archive="$work/west/wrap_v0.0.0-test_${target}.tar.gz"
   if [ ! -f "$archive" ]; then
     echo "missing release archive: $archive" >&2
@@ -45,13 +44,18 @@ for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
   fi
 done
 
+if [ -e "$work/west/wrap_v0.0.0-test_darwin_amd64.tar.gz" ]; then
+  echo "unsupported Intel macOS archive was produced" >&2
+  exit 1
+fi
+
 "$repo/scripts/package-release.sh" v0.0.0+build "$work/plus"
 if [ ! -f "$work/plus/wrap_v0.0.0+build_darwin_arm64.tar.gz" ]; then
   echo "build-metadata version did not produce the expected archive" >&2
   exit 1
 fi
 
-if [ "$(wc -l < "$work/west/checksums.txt" | tr -d '[:space:]')" -ne 4 ]; then
-  echo "checksums.txt must contain exactly four archives" >&2
+if [ "$(wc -l < "$work/west/checksums.txt" | tr -d '[:space:]')" -ne 3 ]; then
+  echo "checksums.txt must contain exactly three archives" >&2
   exit 1
 fi

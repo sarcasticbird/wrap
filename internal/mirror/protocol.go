@@ -10,17 +10,13 @@ import (
 )
 
 const (
-	ProtocolVersion = 2
+	ProtocolVersion = 3
 
 	TagClientHello byte = 0x01
-	TagMirrorList  byte = 0x02
-	TagStatus      byte = 0x03
-	TagOpen        byte = 0x04
 	TagClose       byte = 0x05
 	TagInput       byte = 0x06
 	TagOutput      byte = 0x07
-	TagOpened      byte = 0x08
-	TagRevoked     byte = 0x09
+	TagReady       byte = 0x08
 	TagShutdown    byte = 0x0a
 	TagError       byte = 0x0b
 
@@ -36,35 +32,11 @@ type ClientHello struct {
 	Version int `json:"version"`
 }
 
-type Session struct {
-	ID         string `json:"id"`
-	Generation string `json:"generation"`
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
-	Bell       bool   `json:"bell"`
-	Activity   bool   `json:"activity"`
-}
-
-type SessionList struct {
-	Sessions []Session `json:"sessions"`
-}
-
-type OpenRequest struct {
-	ID         string `json:"id"`
-	Generation string `json:"generation"`
-}
-
-type Opened struct {
+type Ready struct {
 	ID         string `json:"id"`
 	Generation string `json:"generation"`
 	Columns    uint16 `json:"columns"`
 	Rows       uint16 `json:"rows"`
-}
-
-type Revoked struct {
-	ID         string `json:"id"`
-	Generation string `json:"generation"`
-	Reason     string `json:"reason"`
 }
 
 type Shutdown struct {
@@ -124,14 +96,6 @@ func ValidateClientFrame(tag byte, value any) error {
 		if hello.Version != ProtocolVersion {
 			return fmt.Errorf("unsupported protocol version %d", hello.Version)
 		}
-	case TagOpen:
-		open, ok := value.(OpenRequest)
-		if !ok {
-			return errors.New("invalid open payload")
-		}
-		if err := validateIdentity(open.ID, open.Generation); err != nil {
-			return err
-		}
 	case TagClose:
 		switch payload := value.(type) {
 		case nil:
@@ -168,16 +132,6 @@ func ValidateServerFrame(tag byte, value any) error {
 		default:
 			return errors.New("invalid close acknowledgement payload")
 		}
-	case TagMirrorList, TagStatus:
-		list, ok := value.(SessionList)
-		if !ok {
-			return errors.New("invalid session-list payload")
-		}
-		for _, session := range list.Sessions {
-			if err := validateIdentity(session.ID, session.Generation); err != nil {
-				return err
-			}
-		}
 	case TagOutput:
 		payload, ok := value.([]byte)
 		if !ok {
@@ -186,8 +140,8 @@ func ValidateServerFrame(tag byte, value any) error {
 		if len(payload)+1+16 > MaxWireMessage {
 			return errors.New("output payload exceeds wire limit")
 		}
-	case TagOpened:
-		opened, ok := value.(Opened)
+	case TagReady:
+		opened, ok := value.(Ready)
 		if !ok {
 			return errors.New("invalid opened payload")
 		}
@@ -195,12 +149,6 @@ func ValidateServerFrame(tag byte, value any) error {
 			return err
 		}
 		return validateDimensions(opened.Columns, opened.Rows)
-	case TagRevoked:
-		revoked, ok := value.(Revoked)
-		if !ok {
-			return errors.New("invalid revoked payload")
-		}
-		return validateIdentity(revoked.ID, revoked.Generation)
 	case TagShutdown:
 		if _, ok := value.(Shutdown); !ok {
 			return errors.New("invalid shutdown payload")
@@ -252,8 +200,7 @@ func validateDimensions(columns, rows uint16) error {
 
 func isControlTag(tag byte) bool {
 	switch tag {
-	case TagClientHello, TagMirrorList, TagStatus, TagOpen, TagOpened,
-		TagRevoked, TagShutdown, TagError:
+	case TagClientHello, TagReady, TagShutdown, TagError:
 		return true
 	default:
 		return false

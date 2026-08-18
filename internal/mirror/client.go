@@ -5,19 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
 
 var ErrClientQueueFull = errors.New("mirror client outbound queue is full")
 
+var closeFrameTimeout = time.Second
+
 type outboundFrame struct {
 	tag     byte
 	payload []byte
 	result  chan error
+	ctx     context.Context
 }
 
 type outboundQueue struct {
@@ -206,6 +209,9 @@ func (c *Client) sendCloseAcknowledgement(ctx context.Context) error {
 	if err := ValidateServerFrame(TagClose, nil); err != nil {
 		return err
 	}
+	if c.connection != nil {
+		return c.closeWithFrame(ctx, TagClose, nil)
+	}
 	return c.send(ctx, TagClose, nil)
 }
 
@@ -233,8 +239,16 @@ func (c *Client) closeWithControl(ctx context.Context, tag byte, value any) erro
 	if err != nil {
 		return err
 	}
+	return c.closeWithFrame(ctx, tag, payload)
+}
+
+func (c *Client) closeWithFrame(ctx context.Context, tag byte, payload []byte) error {
+	closeCtx, cancel := context.WithTimeout(ctx, closeFrameTimeout)
+	defer cancel()
 	result := make(chan error, 1)
-	if err := c.queue.push(outboundFrame{tag: tag, payload: payload, result: result}); err != nil {
+	if err := c.queue.push(outboundFrame{
+		tag: tag, payload: payload, result: result, ctx: closeCtx,
+	}); err != nil {
 		c.closeNow(err)
 		return err
 	}
@@ -244,28 +258,12 @@ func (c *Client) closeWithControl(ctx context.Context, tag byte, value any) erro
 			c.closeNow(err)
 			return err
 		}
-		closed := make(chan error, 1)
-		go func() {
-			closed <- c.connection.Close(websocket.StatusNormalClosure, "mirror closed")
-		}()
-		select {
-		case closeErr := <-closed:
-			return normalizeWebSocketCloseError(closeErr)
-		case <-ctx.Done():
-			c.closeNow(ctx.Err())
-			return ctx.Err()
-		}
-	case <-ctx.Done():
-		c.closeNow(ctx.Err())
-		return ctx.Err()
-	}
-}
-
-func normalizeWebSocketCloseError(err error) error {
-	if errors.Is(err, net.ErrClosed) {
+		c.closeNow(errors.New("mirror client closed"))
 		return nil
+	case <-closeCtx.Done():
+		c.closeNow(closeCtx.Err())
+		return closeCtx.Err()
 	}
-	return err
 }
 
 func (c *Client) writeLoop(ctx context.Context) {
@@ -275,9 +273,13 @@ func (c *Client) writeLoop(ctx context.Context) {
 		if !ok {
 			return
 		}
+		writeCtx := ctx
+		if frame.ctx != nil {
+			writeCtx = frame.ctx
+		}
 		ciphertext, err := c.sealer.Seal(frame.tag, frame.payload)
 		if err == nil {
-			err = c.connection.Write(ctx, websocket.MessageBinary, ciphertext)
+			err = c.connection.Write(writeCtx, websocket.MessageBinary, ciphertext)
 		}
 		if frame.result != nil {
 			frame.result <- err
@@ -293,7 +295,9 @@ func (c *Client) writeLoop(ctx context.Context) {
 func (c *Client) closeNow(err error) {
 	c.closeOnce.Do(func() {
 		c.queue.close(err)
-		_ = c.connection.CloseNow()
+		if c.connection != nil {
+			_ = c.connection.CloseNow()
+		}
 	})
 }
 
@@ -320,28 +324,6 @@ func (c *Client) run(ctx context.Context) {
 
 func (c *Client) dispatch(ctx context.Context, tag byte, payload []byte) error {
 	switch tag {
-	case TagOpen:
-		var request OpenRequest
-		if err := DecodeControl(tag, payload, &request); err != nil {
-			return err
-		}
-		if err := ValidateClientFrame(tag, request); err != nil {
-			return err
-		}
-		if !c.viewerOpen.CompareAndSwap(false, true) {
-			return errors.New("a terminal is already open")
-		}
-		if err := c.handler.Open(ctx, c, request); err != nil {
-			if !c.viewerOpen.CompareAndSwap(true, false) {
-				return nil
-			}
-			return c.SendControl(ctx, TagError, ProtocolError{
-				Code:    "terminal_unavailable",
-				Message: "The terminal is no longer available.",
-				Retry:   true,
-			})
-		}
-		return nil
 	case TagClose:
 		if err := ValidateClientFrame(tag, payload); err != nil {
 			return err
