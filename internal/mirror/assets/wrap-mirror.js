@@ -184,6 +184,7 @@ const elements = {
   terminalSurface: document.querySelector("#terminal-surface"),
   terminal: document.querySelector("#terminal"),
   pinchScale: document.querySelector("#pinch-scale"),
+  reconnect: document.querySelector("#reconnect-button"),
   close: document.querySelector("#close-button"),
   toolbar: document.querySelector("#toolbar"),
   keyboardToggle: document.querySelector("#keyboard-toggle"),
@@ -213,6 +214,7 @@ const terminalViewportState = viewportReducer.create();
 let reconnectAttempt = 0;
 let reconnectTimer = 0;
 let stopped = false;
+let pageWasHidden = document.hidden;
 let controlSticky = false;
 let geometryAccepted = false;
 let viewportMeasureFrame = 0;
@@ -279,6 +281,7 @@ function showMessage(title, detail, status = "Offline") {
   elements.messageDetail.textContent = detail;
   elements.connection.textContent = status;
   elements.connection.classList.remove("online");
+  elements.reconnect.hidden = !secret || stopped || viewerState.closing;
   showOnly("message");
 }
 
@@ -734,8 +737,18 @@ async function receiveMessage(target, data) {
       clientNonce,
       "wrap-mirror/v3/s2c",
     );
+    if (connection !== target || target.poisoned) {
+      serverNonce.fill(0);
+      clientNonce.fill(0);
+      return;
+    }
     target.socket.send(clientNonce);
     await target.sendChain;
+    if (connection !== target || target.poisoned) {
+      serverNonce.fill(0);
+      clientNonce.fill(0);
+      return;
+    }
     queueFrame(TAG.hello, encoder.encode('{"version":3}'));
     prepareAutomaticTerminal();
     serverNonce.fill(0);
@@ -743,6 +756,9 @@ async function receiveMessage(target, data) {
     return;
   }
   const frame = await decryptFrame(target.receiveKey, target.receiveCounter, bytes);
+  if (connection !== target || target.poisoned) {
+    return;
+  }
   target.receiveCounter += 1n;
   switch (frame.tag) {
     case TAG.close:
@@ -812,7 +828,7 @@ function poison(target, retry) {
     return;
   }
   target.poisoned = true;
-  if (!retry) {
+  if (!retry && !target.superseded) {
     stopped = true;
   }
   target.socket.close();
@@ -832,6 +848,34 @@ function scheduleReconnect() {
   }, jittered);
 }
 
+function reconnectNow() {
+  if (!secret || stopped || viewerState.closing) {
+    return;
+  }
+  if (reconnectTimer) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = 0;
+  }
+  const target = connection;
+  if (target) {
+    target.superseded = true;
+  }
+  connection = null;
+  target?.socket.close();
+  connect();
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    pageWasHidden = true;
+    return;
+  }
+  if (pageWasHidden) {
+    pageWasHidden = false;
+    reconnectNow();
+  }
+}
+
 function connect() {
   if (!secret || stopped) {
     return;
@@ -844,6 +888,7 @@ function connect() {
     socket,
     authenticated: false,
     poisoned: false,
+    superseded: false,
     sendKey: null,
     receiveKey: null,
     sendCounter: 0n,
@@ -1119,6 +1164,9 @@ elements.terminalViewport.addEventListener("pointercancel", (event) => {
   }
 });
 elements.close.addEventListener("click", closeSession);
+elements.reconnect.addEventListener("click", reconnectNow);
+document.addEventListener("visibilitychange", handleVisibilityChange);
+window.addEventListener("online", reconnectNow);
 window.addEventListener("resize", updateVisualViewport);
 globalThis.visualViewport?.addEventListener("resize", updateVisualViewport);
 globalThis.visualViewport?.addEventListener("scroll", updateVisualViewport);

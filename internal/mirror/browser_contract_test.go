@@ -154,6 +154,361 @@ if (reconnects !== 0) throw new Error("intentional terminal close reconnected");
 	}
 }
 
+func TestBrowserReconnectNowReplacesStaleSocket(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "reconnectNow")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let secret = new Uint8Array([1]);
+let stopped = false;
+let viewerState = {closing: false};
+let reconnectTimer = 41;
+let connection = {socket: {closeCount: 0, close() { this.closeCount += 1; }}};
+const staleConnection = connection;
+let clearTimeoutValue = 0;
+let connectCount = 0;
+const window = {clearTimeout(value) { clearTimeoutValue = value; }};
+function connect() { connectCount += 1; }
+` + handler + `
+}
+reconnectNow();
+if (clearTimeoutValue !== 41 || reconnectTimer !== 0) {
+  throw new Error("pending reconnect timer was not cleared");
+}
+if (connection !== null || staleConnection.socket.closeCount !== 1) {
+  throw new Error("stale connection was not detached and closed");
+}
+if (!staleConnection.superseded) throw new Error("stale connection was not marked superseded");
+if (connectCount !== 1) throw new Error("fresh connection was not started exactly once");
+`)
+	if err != nil {
+		t.Fatalf("immediate reconnect behavior: %v", err)
+	}
+}
+
+func TestBrowserReconnectNowRespectsStoppedState(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "reconnectNow")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let secret = new Uint8Array([1]);
+let stopped = true;
+let reconnectTimer = 41;
+let connection = {socket: {closeCount: 0, close() { this.closeCount += 1; }}};
+const originalConnection = connection;
+let connectCount = 0;
+const window = {clearTimeout() { throw new Error("stopped reconnect cleared timer"); }};
+function connect() { connectCount += 1; }
+` + handler + `
+}
+reconnectNow();
+if (reconnectTimer !== 41 || connection !== originalConnection) {
+  throw new Error("stopped reconnect changed connection state");
+}
+if (originalConnection.socket.closeCount !== 0 || connectCount !== 0) {
+  throw new Error("stopped reconnect touched the socket");
+}
+`)
+	if err != nil {
+		t.Fatalf("stopped reconnect behavior: %v", err)
+	}
+}
+
+func TestBrowserReconnectNowRespectsMissingSecretAndClosingState(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "reconnectNow")
+	for _, setup := range []string{
+		`let secret = null; let viewerState = {closing: false};`,
+		`let secret = new Uint8Array([1]); let viewerState = {closing: true};`,
+	} {
+		runtime := goja.New()
+		_, err = runtime.RunString(setup + `
+let stopped = false;
+let reconnectTimer = 41;
+let connection = {socket: {closeCount: 0, close() { this.closeCount += 1; }}};
+const originalConnection = connection;
+let connectCount = 0;
+const window = {clearTimeout() { throw new Error("unavailable reconnect cleared timer"); }};
+function connect() { connectCount += 1; }
+` + handler + `
+}
+reconnectNow();
+if (reconnectTimer !== 41 || connection !== originalConnection) {
+  throw new Error("unavailable reconnect changed connection state");
+}
+if (originalConnection.socket.closeCount !== 0 || connectCount !== 0) {
+  throw new Error("unavailable reconnect touched the socket");
+}
+`)
+		if err != nil {
+			t.Fatalf("unavailable reconnect behavior: %v", err)
+		}
+	}
+}
+
+func TestBrowserStalePoisonCannotStopReplacementConnection(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "poison")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let stopped = false;
+const stale = {poisoned: false, superseded: true, socket: {closeCount: 0, close() { this.closeCount += 1; }}};
+const replacement = {poisoned: false, superseded: false, socket: {closeCount: 0, close() { this.closeCount += 1; }}};
+let connection = replacement;
+` + handler + `
+}
+poison(stale, false);
+if (!stale.poisoned || stale.socket.closeCount !== 1) {
+  throw new Error("stale connection was not poisoned and closed");
+}
+if (stopped || replacement.poisoned || replacement.socket.closeCount !== 0) {
+  throw new Error("stale poison affected replacement connection");
+}
+poison(replacement, false);
+if (!stopped) throw new Error("current poison did not stop reconnection");
+`)
+	if err != nil {
+		t.Fatalf("stale poison behavior: %v", err)
+	}
+}
+
+func TestBrowserClosedCurrentSocketFailureStillStopsReconnect(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "poison")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let stopped = false;
+const target = {
+  poisoned: false,
+  superseded: false,
+  socket: {closeCount: 0, close() { this.closeCount += 1; }},
+};
+let connection = target;
+` + handler + `
+}
+connection = null;
+poison(target, false);
+if (!stopped) throw new Error("closed current socket failure did not stop reconnect");
+if (!target.poisoned || target.socket.closeCount !== 1) {
+  throw new Error("failed current socket was not poisoned and closed");
+}
+`)
+	if err != nil {
+		t.Fatalf("closed current socket failure behavior: %v", err)
+	}
+}
+
+func TestBrowserSupersededMessageCannotMutateReplacementState(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "receiveMessage")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const TAG = {close: 5, output: 7, ready: 8, shutdown: 10, error: 11};
+let resolveDecrypt;
+function decryptFrame() {
+  return new Promise((resolve) => { resolveDecrypt = resolve; });
+}
+const stale = {
+  poisoned: false,
+  sendKey: {},
+  authenticated: true,
+  receiveKey: {},
+  receiveCounter: 0n,
+};
+const replacement = {poisoned: false};
+let connection = stale;
+let geometryAccepted = true;
+let viewerState = {current: {id: "terminal"}, closing: false};
+let terminalWrites = 0;
+const terminal = {write() { terminalWrites += 1; }};
+function parseJSON() { throw new Error("unexpected JSON parse"); }
+function handleTerminalError() { throw new Error("unexpected terminal error"); }
+function handleCloseAcknowledgement() { throw new Error("unexpected close acknowledgement"); }
+function validateOpened() { throw new Error("unexpected ready frame"); }
+function setOnline() {}
+function resizeTerminalToHostGeometry() {}
+const viewportReducer = {open() {}};
+const terminalViewportState = {};
+function scheduleTerminalMeasurement() {}
+function focusTerminalForPhysicalKeyboard() {}
+let reconnectAttempt = 0;
+let stopped = false;
+const sessionStorage = {removeItem() {}};
+let secret = new Uint8Array([1]);
+` + handler + `
+}
+receiveMessage(stale, new ArrayBuffer(1));
+connection = replacement;
+resolveDecrypt({tag: TAG.output, payload: new Uint8Array([65])});
+`)
+	if err != nil {
+		t.Fatalf("start superseded message: %v", err)
+	}
+	if _, err := runtime.RunString(`
+if (terminalWrites !== 0) throw new Error("superseded output reached terminal");
+if (stale.receiveCounter !== 0n) throw new Error("superseded receive counter advanced");
+if (connection !== replacement) throw new Error("replacement connection changed");
+`); err != nil {
+		t.Fatalf("superseded message behavior: %v", err)
+	}
+}
+
+func TestBrowserSupersededHandshakeCannotSendOnReplacement(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "receiveMessage")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const TAG = {close: 5, hello: 1, output: 7, ready: 8, shutdown: 10, error: 11};
+let resolveFirstDerivation;
+let derivationCount = 0;
+function deriveDirectionalKey() {
+  derivationCount += 1;
+  if (derivationCount === 1) {
+    return new Promise((resolve) => { resolveFirstDerivation = resolve; });
+  }
+  return Promise.resolve({});
+}
+const stale = {
+  poisoned: false,
+  sendKey: null,
+  sendChain: Promise.resolve(),
+  socket: {sendCount: 0, send() { this.sendCount += 1; }},
+};
+const replacement = {poisoned: false};
+let connection = stale;
+let secret = new Uint8Array([1]);
+const crypto = {getRandomValues(value) { return value; }};
+let queuedFrames = 0;
+function queueFrame() { queuedFrames += 1; }
+let preparedTerminals = 0;
+function prepareAutomaticTerminal() { preparedTerminals += 1; }
+` + handler + `
+}
+receiveMessage(stale, new ArrayBuffer(16));
+connection = replacement;
+resolveFirstDerivation({});
+`)
+	if err != nil {
+		t.Fatalf("start superseded handshake: %v", err)
+	}
+	if _, err := runtime.RunString(`
+if (derivationCount !== 2) throw new Error("handshake did not reach supersession check");
+if (stale.socket.sendCount !== 0 || queuedFrames !== 0 || preparedTerminals !== 0) {
+  throw new Error("superseded handshake affected a socket or terminal");
+}
+if (connection !== replacement) throw new Error("replacement connection changed");
+`); err != nil {
+		t.Fatalf("superseded handshake behavior: %v", err)
+	}
+}
+
+func TestBrowserReconnectButtonHiddenWhileClosing(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "showMessage")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let secret = new Uint8Array([1]);
+let stopped = false;
+let viewerState = {closing: true};
+const classList = {remove() {}};
+const elements = {
+  messageTitle: {textContent: ""},
+  messageDetail: {textContent: ""},
+  connection: {textContent: "", classList},
+  reconnect: {hidden: false},
+};
+function showOnly() {}
+` + handler + `
+}
+showMessage("Closing terminal…", "Waiting", "Encrypted");
+if (!elements.reconnect.hidden) throw new Error("reconnect button shown while closing");
+viewerState.closing = false;
+showMessage("Connection lost", "Retry", "Reconnecting");
+if (elements.reconnect.hidden) throw new Error("reconnect button hidden while retryable");
+`)
+	if err != nil {
+		t.Fatalf("reconnect button visibility: %v", err)
+	}
+}
+
+func TestBrowserVisibilityRecoveryRunsOnceAfterForegrounding(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "handleVisibilityChange")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const document = {hidden: false};
+let pageWasHidden = false;
+let reconnectCount = 0;
+function reconnectNow() { reconnectCount += 1; }
+` + handler + `
+}
+handleVisibilityChange();
+if (reconnectCount !== 0) throw new Error("initial visible page reconnected");
+document.hidden = true;
+handleVisibilityChange();
+if (!pageWasHidden || reconnectCount !== 0) throw new Error("hidden page was not recorded");
+document.hidden = false;
+handleVisibilityChange();
+handleVisibilityChange();
+if (pageWasHidden || reconnectCount !== 1) {
+  throw new Error("foreground recovery did not reconnect exactly once");
+}
+`)
+	if err != nil {
+		t.Fatalf("visibility reconnect behavior: %v", err)
+	}
+}
+
+func TestBrowserContractOffersManualAndLifecycleReconnect(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlBytes, err := fs.ReadFile(assets, "assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	html := string(htmlBytes)
+	for _, want := range []string{
+		`id="reconnect-button"`,
+		`elements.reconnect.addEventListener("click", reconnectNow)`,
+		`document.addEventListener("visibilitychange", handleVisibilityChange)`,
+		`window.addEventListener("online", reconnectNow)`,
+	} {
+		if !strings.Contains(source+html, want) {
+			t.Errorf("browser client missing reconnect contract %q", want)
+		}
+	}
+}
+
 func TestBrowserContractCollapsesKeyboardWhenLeavingTerminal(t *testing.T) {
 	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
 	if err != nil {
@@ -495,6 +850,9 @@ func browserFunctionSource(t *testing.T, source, name string) string {
 	start := strings.Index(source, "function "+name+"(")
 	if start < 0 {
 		t.Fatalf("browser client missing %s", name)
+	}
+	if start >= len("async ") && source[start-len("async "):start] == "async " {
+		start -= len("async ")
 	}
 	end := strings.Index(source[start:], "\n}\n")
 	if end < 0 {
