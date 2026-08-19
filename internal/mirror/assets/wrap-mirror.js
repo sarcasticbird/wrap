@@ -185,6 +185,7 @@ const elements = {
   terminal: document.querySelector("#terminal"),
   pinchScale: document.querySelector("#pinch-scale"),
   reconnect: document.querySelector("#reconnect-button"),
+  terminalReconnect: document.querySelector("#terminal-reconnect-button"),
   close: document.querySelector("#close-button"),
   toolbar: document.querySelector("#toolbar"),
   keyboardToggle: document.querySelector("#keyboard-toggle"),
@@ -861,8 +862,27 @@ function reconnectNow() {
     target.superseded = true;
   }
   connection = null;
+  viewerState.current = null;
+  viewerState.closing = false;
+  geometryAccepted = false;
+  resetTerminalViewport();
   target?.socket.close();
   connect();
+}
+
+function reconnectIfStale() {
+  const target = connection;
+  // Preserve an authenticated socket and its scrollback when the browser only
+  // changed lifecycle state. The manual reconnect remains the escape hatch for
+  // a socket that is OPEN locally but no longer responsive end to end.
+  if (
+    target?.authenticated &&
+    !target.poisoned &&
+    target.socket.readyState === WebSocket.OPEN
+  ) {
+    return;
+  }
+  reconnectNow();
 }
 
 function handleVisibilityChange() {
@@ -872,7 +892,7 @@ function handleVisibilityChange() {
   }
   if (pageWasHidden) {
     pageWasHidden = false;
-    reconnectNow();
+    reconnectIfStale();
   }
 }
 
@@ -1165,8 +1185,9 @@ elements.terminalViewport.addEventListener("pointercancel", (event) => {
 });
 elements.close.addEventListener("click", closeSession);
 elements.reconnect.addEventListener("click", reconnectNow);
+elements.terminalReconnect.addEventListener("click", reconnectNow);
 document.addEventListener("visibilitychange", handleVisibilityChange);
-window.addEventListener("online", reconnectNow);
+window.addEventListener("online", reconnectIfStale);
 window.addEventListener("resize", updateVisualViewport);
 globalThis.visualViewport?.addEventListener("resize", updateVisualViewport);
 globalThis.visualViewport?.addEventListener("scroll", updateVisualViewport);

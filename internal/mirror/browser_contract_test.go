@@ -164,14 +164,22 @@ func TestBrowserReconnectNowReplacesStaleSocket(t *testing.T) {
 	_, err = runtime.RunString(`
 let secret = new Uint8Array([1]);
 let stopped = false;
-let viewerState = {closing: false};
+let viewerState = {current: {id: "terminal"}, closing: false};
+let geometryAccepted = true;
 let reconnectTimer = 41;
 let connection = {socket: {closeCount: 0, close() { this.closeCount += 1; }}};
 const staleConnection = connection;
 let clearTimeoutValue = 0;
 let connectCount = 0;
+let resetCount = 0;
 const window = {clearTimeout(value) { clearTimeoutValue = value; }};
-function connect() { connectCount += 1; }
+function resetTerminalViewport() { resetCount += 1; }
+function connect() {
+  if (viewerState.current !== null || viewerState.closing || geometryAccepted || resetCount !== 1) {
+    throw new Error("replacement connection started before stale viewer state was reset");
+  }
+  connectCount += 1;
+}
 ` + handler + `
 }
 reconnectNow();
@@ -186,6 +194,37 @@ if (connectCount !== 1) throw new Error("fresh connection was not started exactl
 `)
 	if err != nil {
 		t.Fatalf("immediate reconnect behavior: %v", err)
+	}
+}
+
+func TestBrowserAutomaticReconnectPreservesHealthyConnection(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := browserFunctionSource(t, string(sourceBytes), "reconnectIfStale")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const WebSocket = {OPEN: 1};
+let reconnectCount = 0;
+let connection = {authenticated: true, poisoned: false, socket: {readyState: WebSocket.OPEN}};
+function reconnectNow() { reconnectCount += 1; }
+` + handler + `
+}
+reconnectIfStale();
+if (reconnectCount !== 0) throw new Error("healthy connection was replaced");
+connection.authenticated = false;
+reconnectIfStale();
+connection = {authenticated: true, poisoned: true, socket: {readyState: WebSocket.OPEN}};
+reconnectIfStale();
+connection = {authenticated: true, poisoned: false, socket: {readyState: 3}};
+reconnectIfStale();
+connection = null;
+reconnectIfStale();
+if (reconnectCount !== 4) throw new Error("stale connection did not reconnect");
+`)
+	if err != nil {
+		t.Fatalf("automatic reconnect behavior: %v", err)
 	}
 }
 
@@ -466,7 +505,7 @@ func TestBrowserVisibilityRecoveryRunsOnceAfterForegrounding(t *testing.T) {
 const document = {hidden: false};
 let pageWasHidden = false;
 let reconnectCount = 0;
-function reconnectNow() { reconnectCount += 1; }
+function reconnectIfStale() { reconnectCount += 1; }
 ` + handler + `
 }
 handleVisibilityChange();
@@ -499,9 +538,11 @@ func TestBrowserContractOffersManualAndLifecycleReconnect(t *testing.T) {
 	html := string(htmlBytes)
 	for _, want := range []string{
 		`id="reconnect-button"`,
+		`id="terminal-reconnect-button"`,
 		`elements.reconnect.addEventListener("click", reconnectNow)`,
+		`elements.terminalReconnect.addEventListener("click", reconnectNow)`,
 		`document.addEventListener("visibilitychange", handleVisibilityChange)`,
-		`window.addEventListener("online", reconnectNow)`,
+		`window.addEventListener("online", reconnectIfStale)`,
 	} {
 		if !strings.Contains(source+html, want) {
 			t.Errorf("browser client missing reconnect contract %q", want)
