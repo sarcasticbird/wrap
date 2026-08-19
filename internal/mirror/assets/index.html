@@ -22,6 +22,9 @@
       <p class="eyebrow">CONNECTION</p>
       <h2 id="message-title">Checking encryption…</h2>
       <p id="message-detail">The terminal stays locked until pairing succeeds.</p>
+      <div class="message-actions">
+        <button id="reconnect-button" class="text-button" type="button" hidden>Reconnect</button>
+      </div>
     </section>
 
     <section id="terminal-view" class="terminal-shell hidden" aria-labelledby="terminal-title">
@@ -30,6 +33,7 @@
         <div class="terminal-actions" role="group" aria-label="Terminal view controls">
           <button id="keyboard-toggle" type="button" aria-pressed="false">Keyboard</button>
           <button id="fit-button" type="button" aria-pressed="true">Fit</button>
+          <button id="terminal-reconnect-button" type="button">Reconnect</button>
           <button id="close-button" class="danger" type="button">Close</button>
         </div>
       </div>

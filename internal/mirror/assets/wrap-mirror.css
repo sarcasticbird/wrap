@@ -133,6 +133,10 @@ h2 {
   line-height: 1.55;
 }
 
+.message-actions {
+  margin-top: 1.25rem;
+}
+
 .section-heading {
   margin-bottom: 1.5rem;
 }
