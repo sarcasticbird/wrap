@@ -394,7 +394,8 @@ func requiredMirrorAsset(name string) bool {
 		"assets/wrap-mirror-viewport.js",
 		"assets/third_party/xterm/xterm.mjs",
 		"assets/third_party/xterm/xterm.css",
-		"assets/third_party/xterm/addon-fit.mjs":
+		"assets/third_party/xterm/addon-fit.mjs",
+		"assets/third_party/xterm/addon-web-links.mjs":
 		return true
 	default:
 		return false

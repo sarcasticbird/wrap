@@ -16,6 +16,7 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 	source := string(sourceBytes)
 	for _, want := range []string{
 		`from "/assets/third_party/xterm/xterm.mjs"`,
+		`from "/assets/third_party/xterm/addon-web-links.mjs"`,
 		`new URLSearchParams(location.hash.slice(1))`,
 		`history.replaceState(null, "", location.pathname + location.search)`,
 		`sessionStorage`,
@@ -1025,6 +1026,8 @@ func TestBrowserContractIncludesTerminalAndMobileControls(t *testing.T) {
 		t.Error("transient pinch scale must not announce every gesture update")
 	}
 	for _, control := range []string{
+		`id="copy-button"`,
+		`id="paste-button"`,
 		`data-key="enter"`,
 		`data-key="escape"`,
 		`data-key="tab"`,
@@ -1104,6 +1107,8 @@ func TestBrowserContractIncludesTerminalAndMobileControls(t *testing.T) {
 		`scrollHeight: elements.terminalViewport.scrollHeight`,
 		`function showPinchScale(`,
 		`typingMode ? "Hide keyboard" : "Keyboard"`,
+		`elements.copy.addEventListener("click"`,
+		`elements.paste.addEventListener("click"`,
 		`globalThis.matchMedia?.("(any-pointer: coarse)").matches`,
 		`event.pointerType === "touch" || event.pointerType === "pen"`,
 		`elements.terminalViewport.addEventListener("pointerup"`,
@@ -1116,6 +1121,128 @@ func TestBrowserContractIncludesTerminalAndMobileControls(t *testing.T) {
 		if !strings.Contains(source, want) {
 			t.Errorf("browser client missing mobile control behavior %q", want)
 		}
+	}
+}
+
+func TestBrowserUtilityMenuKeepsSecondaryActionsOutOfPrimaryHeader(t *testing.T) {
+	htmlBytes, err := fs.ReadFile(assets, "assets/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+	menuStart := strings.Index(html, `<div id="terminal-utility-menu"`)
+	menuEnd := -1
+	if menuStart >= 0 {
+		if relativeEnd := strings.Index(html[menuStart:], "\n            </div>"); relativeEnd >= 0 {
+			menuEnd = menuStart + relativeEnd
+		}
+	}
+	if menuStart < 0 || menuEnd < 0 {
+		t.Fatal("terminal secondary actions are not grouped in a utility menu")
+	}
+	primary := html[:menuStart]
+	menu := html[menuStart:menuEnd]
+	for _, control := range []string{`id="copy-button"`, `id="paste-button"`, `id="more-button"`} {
+		if !strings.Contains(primary, control) {
+			t.Errorf("primary terminal header missing %s", control)
+		}
+	}
+	for _, control := range []string{`id="keyboard-toggle"`, `id="fit-button"`, `id="terminal-reconnect-button"`, `id="close-button"`} {
+		if strings.Contains(primary, control) || !strings.Contains(menu, control) {
+			t.Errorf("secondary terminal action is not confined to the utility menu: %s", control)
+		}
+	}
+	for _, contract := range []string{
+		`id="more-button" type="button" aria-expanded="false" aria-controls="terminal-utility-menu"`,
+		`id="terminal-utility-menu" class="terminal-utility-menu"`,
+		`aria-label="More terminal controls" hidden`,
+	} {
+		if !strings.Contains(html, contract) {
+			t.Errorf("terminal utility menu missing accessible contract %q", contract)
+		}
+	}
+
+	setOpen := browserFunctionSource(t, string(sourceBytes), "setUtilityMenuOpen")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let utilityMenuOpen = false;
+const attributes = {};
+const elements = {
+  more: {setAttribute(name, value) { attributes[name] = value; }},
+  utilityMenu: {hidden: true},
+};
+` + setOpen + `
+}
+setUtilityMenuOpen(true);
+if (!utilityMenuOpen || elements.utilityMenu.hidden || attributes["aria-expanded"] !== "true") {
+  throw new Error("opening More did not expose the utility menu");
+}
+setUtilityMenuOpen(false);
+if (utilityMenuOpen || !elements.utilityMenu.hidden || attributes["aria-expanded"] !== "false") {
+  throw new Error("closing More did not hide the utility menu");
+}
+`)
+	if err != nil {
+		t.Fatalf("terminal utility menu state: %v", err)
+	}
+}
+
+func TestBrowserUtilityMenuDismissesAfterActionsAndOutsideInput(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	setOpen := browserFunctionSource(t, source, "setUtilityMenuOpen")
+	dismissAction := browserFunctionSource(t, source, "dismissUtilityMenuAfterAction")
+	dismissPointer := browserFunctionSource(t, source, "dismissUtilityMenuFromPointer")
+	dismissKey := browserFunctionSource(t, source, "dismissUtilityMenuFromKey")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let utilityMenuOpen = true;
+let closed = 0;
+let prevented = 0;
+let stopped = 0;
+let focused = 0;
+const inside = {};
+const elements = {
+  more: {setAttribute() {}, focus() { focused += 1; }},
+  utilityMenu: {hidden: false},
+  terminalActions: {contains(target) { return target === inside; }},
+};
+` + setOpen + `
+}
+` + dismissAction + `
+}
+` + dismissPointer + `
+}
+` + dismissKey + `
+}
+dismissUtilityMenuFromPointer({target: inside});
+if (!utilityMenuOpen) throw new Error("an inside pointer closed More before its action");
+dismissUtilityMenuAfterAction({target: {closest(selector) { return selector === "button" ? {} : null; }}});
+if (utilityMenuOpen) throw new Error("a utility action left More open");
+setUtilityMenuOpen(true);
+dismissUtilityMenuFromPointer({target: {}});
+if (utilityMenuOpen) throw new Error("an outside pointer left More open");
+setUtilityMenuOpen(true);
+dismissUtilityMenuFromKey({key: "Enter", preventDefault() {}, stopPropagation() {}});
+if (!utilityMenuOpen) throw new Error("a non-Escape key closed More");
+dismissUtilityMenuFromKey({
+  key: "Escape",
+  preventDefault() { prevented += 1; },
+  stopPropagation() { stopped += 1; },
+});
+if (utilityMenuOpen || prevented !== 1 || stopped !== 1 || focused !== 1) {
+  throw new Error("Escape did not exclusively dismiss More");
+}
+`)
+	if err != nil {
+		t.Fatalf("terminal utility menu dismissal: %v", err)
 	}
 }
 
@@ -1170,6 +1297,766 @@ func TestBrowserCoarsePointerDownSuppressesCompatibilityMouseEvents(t *testing.T
 	track := strings.Index(handler, `viewportPointers.set(event.pointerId`)
 	if prevent < 0 || track < 0 || prevent > track {
 		t.Fatal("accepted coarse pointerdown can reach xterm before its browser default is canceled")
+	}
+}
+
+func TestBrowserCoarseTapForwardsPrimaryMouseAndOpensKeyboard(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	dispatch := browserFunctionSource(t, source, "dispatchTerminalMouse")
+	finish := browserFunctionSource(t, source, "finishCoarsePointer")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const dispatched = [];
+function MouseEvent(type, options) {
+  this.type = type;
+  Object.assign(this, options);
+}
+const terminalScreen = {dispatchEvent(event) { dispatched.push(event); }};
+const terminal = {element: {
+  querySelector(selector) {
+    if (selector !== ".xterm-screen") throw new Error("tap queried the wrong xterm target");
+    return terminalScreen;
+  },
+  dispatchEvent() { throw new Error("tap dispatched above xterm's link target"); },
+}};
+const navigator = {platform: "Linux armv8l", userAgent: "Mobile"};
+let selectionMode = false;
+let typingMode = false;
+const viewerState = {current: {id: "terminal"}};
+let typingChanges = 0;
+function setTypingMode(value) { typingMode = value; typingChanges += 1; }
+` + dispatch + `
+}
+` + finish + `
+}
+finishCoarsePointer({x: 41, y: 73, moved: false}, false);
+if (dispatched.length !== 3) throw new Error("tap did not resolve links before one mouse press");
+if (dispatched[0].type !== "mousemove" || dispatched[1].type !== "mousedown" ||
+    dispatched[2].type !== "mouseup") {
+  throw new Error("tap sent the wrong mouse event sequence");
+}
+if (dispatched[0].clientX !== 41 || dispatched[0].clientY !== 73 ||
+    dispatched[0].button !== 0 || dispatched[0].buttons !== 0 ||
+    dispatched[1].buttons !== 1 || dispatched[2].buttons !== 0) {
+  throw new Error("tap mouse event lost its position or primary-button state");
+}
+if (dispatched[0].shiftKey || dispatched[0].altKey) {
+  throw new Error("ordinary tap forced terminal selection");
+}
+for (const event of dispatched) {
+  if (event.wrapTerminalIntent !== "tap") throw new Error("tap lacked its synthetic intent");
+}
+if (!typingMode || typingChanges !== 1) throw new Error("tap did not preserve keyboard opening");
+`)
+	if err != nil {
+		t.Fatalf("coarse tap behavior: %v", err)
+	}
+}
+
+func TestBrowserTerminalLinksRequireDesktopModifierButOpenFromTouch(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	shouldActivate := browserFunctionSource(t, source, "shouldActivateTerminalLink")
+	activate := browserFunctionSource(t, source, "activateTerminalLink")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const opened = [];
+const navigator = {platform: "Linux x86_64"};
+const location = {href: "https://mirror.example.test/session"};
+function URL(value) {
+  this.href = value;
+  this.protocol = value.slice(0, value.indexOf(":") + 1);
+}
+const window = {
+  open(url, target, features) { opened.push({url, target, features}); },
+};
+let selectionMode = false;
+` + shouldActivate + `
+}
+` + activate + `
+}
+activateTerminalLink({isTrusted: true, ctrlKey: false, metaKey: false}, "https://example.test/plain");
+if (opened.length !== 0) throw new Error("unmodified desktop click opened a terminal link");
+activateTerminalLink({isTrusted: true, ctrlKey: true, metaKey: false}, "https://example.test/control");
+if (opened.length !== 1 || opened[0].url !== "https://example.test/control") {
+  throw new Error("control-click did not open a terminal link");
+}
+navigator.platform = "MacIntel";
+activateTerminalLink({isTrusted: true, ctrlKey: true, metaKey: false}, "https://example.test/mac-control");
+if (opened.length !== 2) throw new Error("control-click did not open a Mac terminal link");
+activateTerminalLink({isTrusted: true, ctrlKey: false, metaKey: true}, "http://example.test/command");
+if (opened.length !== 3) throw new Error("command-click did not open a terminal link");
+activateTerminalLink({isTrusted: false, wrapTerminalIntent: "tap", ctrlKey: false, metaKey: false}, "https://example.test/touch");
+if (opened.length !== 4 || opened[3].target !== "_blank" ||
+    opened[3].features !== "noopener,noreferrer") {
+  throw new Error("touch tap did not safely open a terminal link");
+}
+activateTerminalLink({isTrusted: false, wrapTerminalIntent: "selection"}, "https://example.test/selection");
+activateTerminalLink({isTrusted: false}, "https://example.test/unmarked");
+selectionMode = true;
+activateTerminalLink({isTrusted: false, wrapTerminalIntent: "tap"}, "https://example.test/copy-mode");
+activateTerminalLink({isTrusted: true, ctrlKey: true}, "https://example.test/copy-mode-control");
+if (opened.length !== 4) throw new Error("selection gesture opened a terminal link");
+selectionMode = false;
+activateTerminalLink({isTrusted: false, wrapTerminalIntent: "tap"}, "javascript:alert(1)");
+if (opened.length !== 4) throw new Error("unsafe terminal link protocol was opened");
+`)
+	if err != nil {
+		t.Fatalf("terminal link activation behavior: %v", err)
+	}
+}
+
+func TestBrowserCoarsePanAndPinchNeverForwardMouse(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := browserFunctionSource(t, string(sourceBytes), "finishCoarsePointer")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let selectionMode = false;
+let typingMode = false;
+const viewerState = {current: {id: "terminal"}};
+let mouseEvents = 0;
+let typingChanges = 0;
+function dispatchTerminalMouse() { mouseEvents += 1; }
+function setTypingMode() { typingChanges += 1; }
+` + finish + `
+}
+finishCoarsePointer({x: 41, y: 73, moved: true}, false);
+finishCoarsePointer({x: 41, y: 73, moved: false}, true);
+if (mouseEvents !== 0 || typingChanges !== 0) {
+  throw new Error("pan or pinch emitted a terminal click");
+}
+`)
+	if err != nil {
+		t.Fatalf("coarse gesture behavior: %v", err)
+	}
+}
+
+func TestBrowserSelectionGestureStagesXtermSelectionWithoutClipboardAccess(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	dispatch := browserFunctionSource(t, source, "dispatchTerminalMouse")
+	begin := browserFunctionSource(t, source, "beginTerminalSelection")
+	update := browserFunctionSource(t, source, "updateTerminalSelection")
+	finish := browserFunctionSource(t, source, "finishTerminalSelection")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const dispatched = [];
+function MouseEvent(type, options) {
+  this.type = type;
+  Object.assign(this, options);
+}
+const terminal = {
+  element: {dispatchEvent(event) { dispatched.push(event); }},
+  getSelection() { return "selected terminal text"; },
+};
+const navigator = {platform: "iPhone", userAgent: "iPhone Mobile Safari"};
+const elements = {copy: {textContent: "Cancel copy"}};
+let selectionMode = true;
+function copyTerminalSelection() { throw new Error("drag accessed the clipboard"); }
+` + dispatch + `
+}
+` + begin + `
+}
+` + update + `
+}
+` + finish + `
+}
+const pointer = {x: 20, y: 30};
+beginTerminalSelection(pointer);
+pointer.x = 80;
+pointer.y = 90;
+updateTerminalSelection(pointer);
+finishTerminalSelection(pointer);
+if (dispatched.length !== 3 || dispatched[0].type !== "mousedown" ||
+    dispatched[1].type !== "mousemove" || dispatched[2].type !== "mouseup") {
+  throw new Error("selection did not send a complete mouse drag");
+}
+for (const event of dispatched) {
+  if (!event.shiftKey || event.altKey) throw new Error("iPhone touch did not force xterm selection");
+  if (event.wrapTerminalIntent !== "selection") throw new Error("copy drag lacked its synthetic intent");
+}
+if (!selectionMode || elements.copy.textContent !== "Copy selected") {
+  throw new Error("completed selection was not staged for an explicit copy action");
+}
+`)
+	if err != nil {
+		t.Fatalf("staged mobile selection behavior: %v", err)
+	}
+}
+
+func TestBrowserSelectionModeTracksDesktopMousePointers(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shouldTrack := browserFunctionSource(t, string(sourceBytes), "shouldTrackTerminalPointer")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let selectionMode = false;
+function isCoarsePointerEvent(event) {
+  return event.pointerType === "touch" || event.pointerType === "pen";
+}
+` + shouldTrack + `
+}
+if (shouldTrackTerminalPointer({pointerType: "mouse"})) {
+  throw new Error("ordinary mouse interaction was intercepted outside copy mode");
+}
+if (!shouldTrackTerminalPointer({pointerType: "touch"})) {
+  throw new Error("touch interaction was not tracked");
+}
+selectionMode = true;
+if (!shouldTrackTerminalPointer({pointerType: "mouse"})) {
+  throw new Error("copy mode did not track desktop mouse interaction");
+}
+`)
+	if err != nil {
+		t.Fatalf("selection pointer tracking behavior: %v", err)
+	}
+}
+
+func TestBrowserWheelScrollsLocalTerminalWithTmuxMouseEnabled(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	if !strings.Contains(source, `terminal.attachCustomWheelEventHandler(handleTerminalWheel)`) {
+		t.Fatal("browser terminal does not install its local wheel handler")
+	}
+	handleWheel := browserFunctionSource(t, source, "handleTerminalWheel")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+const scrolls = [];
+const inputs = [];
+const screen = {getBoundingClientRect() { return {height: 240}; }};
+const terminal = {
+  rows: 24,
+  buffer: {active: {type: "normal"}},
+  modes: {applicationCursorKeysMode: false},
+  element: {querySelector(selector) { return selector === ".xterm-screen" ? screen : null; }},
+  options: {fontSize: 14},
+  scrollLines(amount) { scrolls.push(amount); },
+  input(value) { inputs.push(value); },
+};
+` + handleWheel + `
+}
+if (handleTerminalWheel({deltaY: 4, deltaMode: 0}) !== false) {
+  throw new Error("pixel wheel event was forwarded to tmux");
+}
+handleTerminalWheel({deltaY: 4, deltaMode: 0});
+handleTerminalWheel({deltaY: 4, deltaMode: 0});
+handleTerminalWheel({deltaY: 25, deltaMode: 0});
+handleTerminalWheel({deltaY: 3, deltaMode: 1});
+handleTerminalWheel({deltaY: 1, deltaMode: 2});
+handleTerminalWheel({deltaY: 0, deltaMode: 0});
+if (scrolls.length !== 4 || scrolls[0] !== 1 || scrolls[1] !== 2 ||
+    scrolls[2] !== 3 || scrolls[3] !== 23) {
+  throw new Error("wheel events did not accumulate rendered-line local scrolling");
+}
+terminal.buffer.active.type = "alternate";
+handleTerminalWheel({deltaY: -4, deltaMode: 0});
+handleTerminalWheel({deltaY: -4, deltaMode: 0});
+handleTerminalWheel({deltaY: -4, deltaMode: 0});
+handleTerminalWheel({deltaY: 2, deltaMode: 1});
+terminal.modes.applicationCursorKeysMode = true;
+handleTerminalWheel({deltaY: -2, deltaMode: 1});
+if (scrolls.length !== 4 || inputs.length !== 3 ||
+    inputs[0] !== "\u001b[A" || inputs[1] !== "\u001b[B\u001b[B" ||
+    inputs[2] !== "\u001bOA\u001bOA") {
+  throw new Error("alternate-buffer wheel events did not preserve xterm cursor-key fallback");
+}
+`)
+	if err != nil {
+		t.Fatalf("browser terminal wheel behavior: %v", err)
+	}
+}
+
+func TestBrowserCopyUsesClipboardAPIFromExplicitAction(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	copySynchronously := browserFunctionSource(t, source, "copyTextSynchronously")
+	copySelection := browserFunctionSource(t, source, "copyTerminalSelection")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let clipboardValue = "";
+let legacyCopies = 0;
+let cleared = 0;
+const document = {
+  body: {appendChild() {}},
+  createElement() {
+    return {focus() {}, select() {}, setSelectionRange() {}, remove() {}, style: {}};
+  },
+  execCommand() { legacyCopies += 1; return true; },
+};
+const navigator = {
+  clipboard: {
+    writeText(value) {
+      clipboardValue = value;
+      return {then(resolve) { resolve(); return {catch() {}}; }};
+    },
+  },
+};
+const terminal = {
+  getSelection() { return "selected terminal text"; },
+  clearSelection() { cleared += 1; },
+};
+const elements = {copy: {textContent: "Copy selected"}};
+let selectionMode = true;
+function setSelectionMode(value) { selectionMode = value; }
+function showCopyFeedback(value) { elements.copy.textContent = value; }
+` + copySynchronously + `
+}
+` + copySelection + `
+}
+copyTerminalSelection();
+if (clipboardValue !== "selected terminal text" || legacyCopies !== 0) {
+  throw new Error("explicit copy did not prefer the modern Clipboard API");
+}
+if (selectionMode || cleared !== 1 || elements.copy.textContent !== "Copied") {
+  throw new Error("explicit copy did not leave selection mode cleanly");
+}
+`)
+	if err != nil {
+		t.Fatalf("explicit browser copy behavior: %v", err)
+	}
+}
+
+func TestBrowserCopyButtonCopiesStagedSelection(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	handleCopy := browserFunctionSource(t, source, "handleCopyAction")
+	copySelection := browserFunctionSource(t, source, "copyTerminalSelection")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let clipboardValue = "";
+let cleared = 0;
+const viewerState = {current: {id: "terminal"}};
+const navigator = {
+  clipboard: {
+    writeText(value) {
+      clipboardValue = value;
+      return {then(resolve) { resolve(); return {catch() {}}; }};
+    },
+  },
+};
+const terminal = {
+  getSelection() { return "staged selection"; },
+  clearSelection() { cleared += 1; },
+};
+const elements = {copy: {textContent: "Copy selected"}};
+let selectionMode = true;
+function copyTextSynchronously() { throw new Error("legacy copy path was used"); }
+function setSelectionMode(value) { selectionMode = value; }
+function showCopyFeedback(value) { elements.copy.textContent = value; }
+function setTypingMode() {}
+function clearViewportGestures() {}
+` + copySelection + `
+}
+` + handleCopy + `
+}
+handleCopyAction();
+if (clipboardValue !== "staged selection") {
+  throw new Error("Copy button did not write the staged selection");
+}
+if (selectionMode || cleared !== 1 || elements.copy.textContent !== "Copied") {
+  throw new Error("Copy button did not clean up the staged selection");
+}
+`)
+	if err != nil {
+		t.Fatalf("staged selection Copy button behavior: %v", err)
+	}
+}
+
+func TestBrowserSelectionCopiesSynchronouslyWhenClipboardAPIIsUnavailable(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	copySynchronously := browserFunctionSource(t, source, "copyTextSynchronously")
+	copySelection := browserFunctionSource(t, source, "copyTerminalSelection")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let appended = 0;
+let removed = 0;
+let selected = false;
+let copiedValue = "";
+const document = {
+  body: {appendChild(element) { appended += 1; copiedValue = element.value; }},
+  createElement(type) {
+    if (type !== "textarea") throw new Error("copy fallback did not use a textarea");
+    return {
+      value: "",
+      readOnly: false,
+      style: {},
+      focus() {},
+      select() { selected = true; },
+      setSelectionRange(start, end) {
+        if (start !== 0 || end !== this.value.length) {
+          throw new Error("copy fallback selected the wrong range");
+        }
+      },
+      remove() { removed += 1; },
+    };
+  },
+  execCommand(command) {
+    if (command !== "copy" || !selected) return false;
+    return true;
+  },
+};
+const navigator = {platform: "iPhone"};
+let cleared = 0;
+const terminal = {
+  getSelection() { return "selected terminal text"; },
+  clearSelection() { cleared += 1; },
+};
+const elements = {copy: {textContent: "Cancel copy"}};
+let selectionMode = true;
+function setSelectionMode(value) { selectionMode = value; }
+function showCopyFeedback(value) { elements.copy.textContent = value; }
+` + copySynchronously + `
+}
+` + copySelection + `
+}
+copyTerminalSelection();
+if (copiedValue !== "selected terminal text" || appended !== 1 || removed !== 1) {
+  throw new Error("synchronous fallback did not copy and clean up the selected text");
+}
+if (selectionMode || cleared !== 1 || elements.copy.textContent !== "Copied") {
+  throw new Error("synchronous copy did not leave selection mode cleanly");
+}
+`)
+	if err != nil {
+		t.Fatalf("synchronous mobile copy fallback: %v", err)
+	}
+}
+
+func TestBrowserPasteSendsExactClipboardTextThroughXterm(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasteClipboard := browserFunctionSource(t, string(sourceBytes), "pasteClipboardText")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let pasted = "";
+let feedback = "";
+let menuOpen = true;
+let controlSticky = true;
+const viewerState = {current: {id: "terminal"}};
+const connection = {authenticated: true};
+const terminal = {
+  paste(value) {
+    if (controlSticky) throw new Error("paste reached xterm before Ctrl was cleared");
+    pasted = value;
+  },
+};
+const navigator = {
+  clipboard: {
+    readText() {
+      return {
+        then(resolve) {
+          resolve("first line\nsecond line");
+          return {catch() {}};
+        },
+      };
+    },
+  },
+};
+function setControlSticky(value) { controlSticky = value; }
+function setUtilityMenuOpen(value) { menuOpen = value; }
+function showPasteFeedback(value) { feedback = value; }
+` + pasteClipboard + `
+}
+pasteClipboardText();
+if (pasted !== "first line\nsecond line") {
+  throw new Error("paste did not preserve the exact clipboard text");
+}
+if (controlSticky || menuOpen || feedback !== "Pasted") {
+  throw new Error("successful paste did not clean up terminal controls");
+}
+`)
+	if err != nil {
+		t.Fatalf("browser clipboard paste behavior: %v", err)
+	}
+}
+
+func TestBrowserPasteDoesNotReadClipboardWithoutAuthenticatedTerminal(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasteClipboard := browserFunctionSource(t, string(sourceBytes), "pasteClipboardText")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let reads = 0;
+let pastes = 0;
+let controlSticky = false;
+const viewerState = {current: null};
+const connection = {authenticated: false};
+const terminal = {paste() { pastes += 1; }};
+const navigator = {
+  clipboard: {
+    readText() {
+      reads += 1;
+      return {then(resolve) { resolve("secret"); }};
+    },
+  },
+};
+function setControlSticky() {}
+function setUtilityMenuOpen() {}
+function showPasteFeedback() {}
+` + pasteClipboard + `
+}
+pasteClipboardText();
+if (reads !== 0 || pastes !== 0) {
+  throw new Error("paste read the clipboard without an authenticated terminal");
+}
+`)
+	if err != nil {
+		t.Fatalf("disconnected browser paste behavior: %v", err)
+	}
+}
+
+func TestBrowserPasteCancelsWhenViewerChangesDuringClipboardRead(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasteClipboard := browserFunctionSource(t, string(sourceBytes), "pasteClipboardText")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let feedback = "";
+let pastes = 0;
+let controlSticky = false;
+const originalViewer = {id: "first"};
+const viewerState = {current: originalViewer};
+let connection = {authenticated: true, id: "first"};
+let resolveRead;
+const terminal = {paste() { pastes += 1; }};
+const navigator = {
+  clipboard: {
+    readText() {
+      return {
+        then(resolve) {
+          resolveRead = resolve;
+          return {catch() {}};
+        },
+      };
+    },
+  },
+};
+function setControlSticky(value) { controlSticky = value; }
+function setUtilityMenuOpen() {}
+function showPasteFeedback(value) { feedback = value; }
+` + pasteClipboard + `
+}
+pasteClipboardText();
+connection = {authenticated: true, id: "replacement"};
+viewerState.current = {id: "replacement"};
+resolveRead("pending clipboard text");
+if (pastes !== 0 || feedback !== "Paste canceled") {
+  throw new Error("stale clipboard result reached the replacement viewer");
+}
+`)
+	if err != nil {
+		t.Fatalf("stale browser clipboard behavior: %v", err)
+	}
+}
+
+func TestBrowserPasteReportsUnavailableClipboardWithoutInput(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasteClipboard := browserFunctionSource(t, string(sourceBytes), "pasteClipboardText")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let feedback = "";
+let pastes = 0;
+let controlSticky = false;
+const viewerState = {current: {id: "terminal"}};
+const connection = {authenticated: true};
+const terminal = {paste() { pastes += 1; }};
+const navigator = {};
+function setControlSticky() {}
+function setUtilityMenuOpen() {}
+function showPasteFeedback(value) { feedback = value; }
+` + pasteClipboard + `
+}
+pasteClipboardText();
+if (pastes !== 0 || feedback !== "Paste unavailable") {
+  throw new Error("unavailable clipboard did not produce actionable paste feedback");
+}
+`)
+	if err != nil {
+		t.Fatalf("unavailable browser paste behavior: %v", err)
+	}
+}
+
+func TestBrowserPasteReportsEmptyClipboardWithoutInput(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasteClipboard := browserFunctionSource(t, string(sourceBytes), "pasteClipboardText")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let feedback = "";
+let pastes = 0;
+let controlSticky = false;
+const viewerState = {current: {id: "terminal"}};
+const connection = {authenticated: true};
+const terminal = {paste() { pastes += 1; }};
+const navigator = {
+  clipboard: {
+    readText() {
+      return {then(resolve) { resolve(""); return {catch() {}}; }};
+    },
+  },
+};
+function setControlSticky() {}
+function setUtilityMenuOpen() {}
+function showPasteFeedback(value) { feedback = value; }
+` + pasteClipboard + `
+}
+pasteClipboardText();
+if (pastes !== 0 || feedback !== "Clipboard empty") {
+  throw new Error("empty clipboard was pasted or reported as successful");
+}
+`)
+	if err != nil {
+		t.Fatalf("empty browser clipboard behavior: %v", err)
+	}
+}
+
+func TestBrowserPasteReportsDeniedClipboardWithoutInput(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pasteClipboard := browserFunctionSource(t, string(sourceBytes), "pasteClipboardText")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let feedback = "";
+let pastes = 0;
+let controlSticky = false;
+const viewerState = {current: {id: "terminal"}};
+const connection = {authenticated: true};
+const terminal = {paste() { pastes += 1; }};
+const navigator = {
+  clipboard: {
+    readText() {
+      return {
+        then() {
+          return {catch(reject) { reject(new Error("not allowed")); }};
+        },
+      };
+    },
+  },
+};
+function setControlSticky() {}
+function setUtilityMenuOpen() {}
+function showPasteFeedback(value) { feedback = value; }
+` + pasteClipboard + `
+}
+pasteClipboardText();
+if (pastes !== 0 || feedback !== "Paste denied") {
+  throw new Error("denied clipboard read was pasted or lacked useful feedback");
+}
+`)
+	if err != nil {
+		t.Fatalf("denied browser clipboard behavior: %v", err)
+	}
+}
+
+func TestBrowserPasteFeedbackReturnsButtonToCompactLabel(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	showFeedback := browserFunctionSource(t, string(sourceBytes), "showPasteFeedback")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let pasteFeedbackTimer = 0;
+let clearedTimer = 0;
+let pending;
+const elements = {paste: {textContent: "Paste"}};
+function clearTimeout(timer) { clearedTimer = timer; }
+function setTimeout(callback, delay) {
+  if (delay !== 1200) throw new Error("paste feedback used the wrong duration");
+  pending = callback;
+  return 9;
+}
+` + showFeedback + `
+}
+showPasteFeedback("Pasted");
+if (elements.paste.textContent !== "Pasted" || pasteFeedbackTimer !== 9) {
+  throw new Error("paste feedback was not shown");
+}
+showPasteFeedback("Paste denied");
+if (clearedTimer !== 9 || elements.paste.textContent !== "Paste denied") {
+  throw new Error("repeated paste feedback left a competing timer");
+}
+pending();
+if (pasteFeedbackTimer !== 0 || elements.paste.textContent !== "Paste") {
+  throw new Error("paste feedback did not restore the compact label");
+}
+`)
+	if err != nil {
+		t.Fatalf("paste button feedback behavior: %v", err)
+	}
+}
+
+func TestBrowserSelectionUsesXtermMacModifierOnIPadDesktopMode(t *testing.T) {
+	sourceBytes, err := fs.ReadFile(assets, "assets/wrap-mirror.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	for _, option := range []string{
+		`macOptionClickForcesSelection: true`,
+		`altClickMovesCursor: false`,
+	} {
+		if !strings.Contains(source, option) {
+			t.Errorf("browser terminal config missing %q", option)
+		}
+	}
+	dispatch := browserFunctionSource(t, source, "dispatchTerminalMouse")
+	runtime := goja.New()
+	_, err = runtime.RunString(`
+let dispatched;
+function MouseEvent(type, options) { Object.assign(this, options); }
+const terminal = {element: {dispatchEvent(event) { dispatched = event; }}};
+const navigator = {platform: "MacIntel", userAgent: "Safari"};
+` + dispatch + `
+}
+dispatchTerminalMouse("mousedown", {x: 10, y: 20}, true);
+if (!dispatched.altKey || dispatched.shiftKey) {
+  throw new Error("Mac-platform touch did not use xterm's forced-selection modifier");
+}
+`)
+	if err != nil {
+		t.Fatalf("iPad desktop selection modifier: %v", err)
 	}
 }
 

@@ -14,7 +14,7 @@ not open a public issue for an undisclosed vulnerability.
 
 - A pairing URL is an interactive-shell credential. Anyone with the complete
   fragment can control that one shared terminal. Use `wrap regen` if it may
-  have escaped and `wrap remove` when sharing is finished.
+  have escaped and `wrap kill` when sharing is finished.
 - Browser frames are protected with fragment-derived AES-256-GCM keys. The
   fragment is not sent in HTTP requests, logs, process arguments, or persisted
   host state.

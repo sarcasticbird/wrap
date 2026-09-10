@@ -1,8 +1,9 @@
 # Embedded browser asset provenance
 
-Retrieved 2026-07-30 from the npm registry. Both packages are maintained in
-the [xterm.js repository](https://github.com/xtermjs/xterm.js) and distributed
-under the MIT license.
+The xterm and addon-fit packages were retrieved 2026-07-30 from the npm
+registry. All packages are maintained in the
+[xterm.js repository](https://github.com/xtermjs/xterm.js) and distributed under
+the MIT license.
 
 ## @xterm/xterm 6.0.0
 
@@ -30,3 +31,16 @@ under the MIT license.
   `assets/third_party/xterm/addon-fit.mjs`; its source-map trailer was removed
   because the map is not shipped. Result SHA-256:
   `aa22c5f28e4d64118ac0e7d60276b3384188e59dd104c96e43760d6e2cedd771`
+
+## @xterm/addon-web-links 0.12.0
+
+Retrieved 2026-09-02.
+
+- Source archive:
+  `https://registry.npmjs.org/@xterm/addon-web-links/-/addon-web-links-0.12.0.tgz`
+- Archive SHA-256:
+  `bf463cfff1af4bb1903509830c62ed06bcd0589039f15ea5fba71d7bae5a86da`
+- `package/lib/addon-web-links.mjs` copied to
+  `assets/third_party/xterm/addon-web-links.mjs`; its source-map trailer was
+  removed because the map is not shipped. Result SHA-256:
+  `38f7f1736b3cb72a27fd8553bb5d594ca8ff6862223564acd13eec72a897514b`

@@ -1,4 +1,5 @@
 import { Terminal } from "/assets/third_party/xterm/xterm.mjs";
+import { WebLinksAddon } from "/assets/third_party/xterm/addon-web-links.mjs";
 import "/assets/wrap-mirror-viewport.js";
 
 const STORAGE_KEY = "wrap.mirror.v3.secret";
@@ -188,17 +189,99 @@ const elements = {
   terminalReconnect: document.querySelector("#terminal-reconnect-button"),
   close: document.querySelector("#close-button"),
   toolbar: document.querySelector("#toolbar"),
+  terminalActions: document.querySelector("#terminal-actions"),
   keyboardToggle: document.querySelector("#keyboard-toggle"),
+  copy: document.querySelector("#copy-button"),
+  paste: document.querySelector("#paste-button"),
+  more: document.querySelector("#more-button"),
+  utilityMenu: document.querySelector("#terminal-utility-menu"),
   fit: document.querySelector("#fit-button"),
 };
 
 const BASE_TERMINAL_FONT_SIZE = 14;
 const MAX_VIEWPORT_MEASURE_ATTEMPTS = 60;
+
+function shouldActivateTerminalLink(event) {
+  if (selectionMode) {
+    return false;
+  }
+  if (event.isTrusted === false) {
+    return event.wrapTerminalIntent === "tap";
+  }
+  const macPlatform = ["Macintosh", "MacIntel", "MacPPC", "Mac68K"]
+    .includes(navigator.platform || "");
+  return event.ctrlKey || (macPlatform && event.metaKey);
+}
+
+function activateTerminalLink(event, uri) {
+  if (!shouldActivateTerminalLink(event) || !/^(?:https?):[/][/]/i.test(uri)) {
+    return false;
+  }
+  let url;
+  try {
+    url = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return false;
+  }
+  window.open(url.href, "_blank", "noopener,noreferrer");
+  return true;
+}
+
+function handleTerminalWheel(event) {
+  const direction = Math.sign(event.deltaY);
+  if (direction === 0) {
+    return false;
+  }
+  const activeBuffer = terminal.buffer.active;
+  if (handleTerminalWheel.buffer !== activeBuffer ||
+      handleTerminalWheel.bufferType !== activeBuffer.type) {
+    handleTerminalWheel.buffer = activeBuffer;
+    handleTerminalWheel.bufferType = activeBuffer.type;
+    handleTerminalWheel.pixelRemainder = 0;
+  }
+  let lines;
+  if (event.deltaMode === 2) {
+    handleTerminalWheel.pixelRemainder = 0;
+    lines = direction * Math.max(1, terminal.rows - 1);
+  } else if (event.deltaMode === 1) {
+    handleTerminalWheel.pixelRemainder = 0;
+    lines = Math.trunc(event.deltaY) || direction;
+  } else {
+    const screenHeight = terminal.element?.querySelector(".xterm-screen")
+      ?.getBoundingClientRect().height;
+    const cellHeight = screenHeight > 0 && terminal.rows > 0
+      ? screenHeight / terminal.rows
+      : Math.max(1, terminal.options.fontSize);
+    handleTerminalWheel.pixelRemainder =
+      (handleTerminalWheel.pixelRemainder || 0) + event.deltaY;
+    lines = Math.trunc(handleTerminalWheel.pixelRemainder / cellHeight);
+    if (lines === 0) {
+      return false;
+    }
+    handleTerminalWheel.pixelRemainder -= lines * cellHeight;
+    const limit = Math.max(1, terminal.rows - 1);
+    lines = Math.max(-limit, Math.min(limit, lines));
+  }
+  if (activeBuffer.type === "alternate") {
+    const prefix = terminal.modes.applicationCursorKeysMode ? "\u001bO" : "\u001b[";
+    const key = prefix + (lines < 0 ? "A" : "B");
+    terminal.input(key.repeat(Math.abs(lines)));
+    return false;
+  }
+  terminal.scrollLines(lines);
+  return false;
+}
+
 const terminal = new Terminal({
+  altClickMovesCursor: false,
   convertEol: false,
   cursorBlink: true,
   fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
   fontSize: BASE_TERMINAL_FONT_SIZE,
+  macOptionClickForcesSelection: true,
   scrollback: 5000,
   theme: {
     background: "#080a09",
@@ -206,7 +289,10 @@ const terminal = new Terminal({
     cursor: "#b7f34a",
     selectionBackground: "#34402f",
   },
+  linkHandler: { activate: activateTerminalLink },
 });
+terminal.loadAddon(new WebLinksAddon(activateTerminalLink));
+terminal.attachCustomWheelEventHandler(handleTerminalWheel);
 
 let connection = null;
 const viewerState = { current: null, closing: false };
@@ -222,6 +308,10 @@ let viewportMeasureFrame = 0;
 let viewportMeasureAttempts = 0;
 let pendingTerminalFit = false;
 let typingMode = false;
+let selectionMode = false;
+let copyFeedbackTimer = 0;
+let pasteFeedbackTimer = 0;
+let utilityMenuOpen = false;
 const viewportPointers = new Map();
 let pinchGesture = null;
 let pinchPreview = null;
@@ -268,6 +358,9 @@ function showTerminalDisplayError() {
 function showOnly(view) {
   if (view !== "terminal") {
     setTypingMode(false);
+    setSelectionMode(false);
+    setUtilityMenuOpen(false);
+    terminal.clearSelection();
     clearViewportGestures();
     cancelTerminalMeasurement();
     revealTerminalDisplay();
@@ -482,6 +575,8 @@ function clearViewportGestures() {
 }
 
 function fitTerminalViewport() {
+  setSelectionMode(false);
+  terminal.clearSelection();
   clearViewportGestures();
   if (!viewportReducer.layout(terminalViewportState)) {
     pendingTerminalFit = true;
@@ -508,8 +603,16 @@ function isCoarsePointerEvent(event) {
   return isCoarsePointer();
 }
 
+function shouldTrackTerminalPointer(event) {
+  return selectionMode || isCoarsePointerEvent(event);
+}
+
 function setTypingMode(value) {
   typingMode = Boolean(value);
+  if (typingMode && selectionMode) {
+    setSelectionMode(false);
+    terminal.clearSelection();
+  }
   elements.terminalView.classList.toggle("typing", typingMode);
   elements.keyboardToggle.textContent = typingMode ? "Hide keyboard" : "Keyboard";
   elements.keyboardToggle.setAttribute("aria-pressed", String(typingMode));
@@ -524,6 +627,230 @@ function setTypingMode(value) {
     terminal.blur();
     terminal.textarea?.blur();
   }
+}
+
+function setSelectionMode(value) {
+  selectionMode = Boolean(value);
+  if (copyFeedbackTimer) {
+    clearTimeout(copyFeedbackTimer);
+    copyFeedbackTimer = 0;
+  }
+  elements.terminalView.classList.toggle("selecting", selectionMode);
+  elements.copy.textContent = selectionMode ? "Cancel copy" : "Copy";
+  elements.copy.setAttribute("aria-pressed", String(selectionMode));
+}
+
+function showCopyFeedback(value) {
+  if (copyFeedbackTimer) {
+    clearTimeout(copyFeedbackTimer);
+  }
+  elements.copy.textContent = value;
+  copyFeedbackTimer = setTimeout(() => {
+    copyFeedbackTimer = 0;
+    if (!selectionMode) {
+      elements.copy.textContent = "Copy";
+    }
+  }, 1200);
+}
+
+function showPasteFeedback(value) {
+  if (pasteFeedbackTimer) {
+    clearTimeout(pasteFeedbackTimer);
+  }
+  elements.paste.textContent = value;
+  pasteFeedbackTimer = setTimeout(() => {
+    pasteFeedbackTimer = 0;
+    elements.paste.textContent = "Paste";
+  }, 1200);
+}
+
+function setUtilityMenuOpen(value) {
+  utilityMenuOpen = Boolean(value);
+  elements.more.setAttribute("aria-expanded", String(utilityMenuOpen));
+  elements.utilityMenu.hidden = !utilityMenuOpen;
+}
+
+function dismissUtilityMenuAfterAction(event) {
+  if (event.target.closest("button")) {
+    setUtilityMenuOpen(false);
+  }
+}
+
+function dismissUtilityMenuFromPointer(event) {
+  if (utilityMenuOpen && !elements.terminalActions.contains(event.target)) {
+    setUtilityMenuOpen(false);
+  }
+}
+
+function dismissUtilityMenuFromKey(event) {
+  if (!utilityMenuOpen || event.key !== "Escape") {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  setUtilityMenuOpen(false);
+  elements.more.focus();
+}
+
+function dispatchTerminalMouse(type, pointer, forceSelection = false) {
+  if (!terminal.element) {
+    return false;
+  }
+  const macPlatform = ["Macintosh", "MacIntel", "MacPPC", "Mac68K"]
+    .includes(navigator.platform || "");
+  const target = terminal.element.querySelector?.(".xterm-screen") || terminal.element;
+  const event = new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX: pointer.x,
+    clientY: pointer.y,
+    button: 0,
+    buttons: type === "mousedown" || (type === "mousemove" && forceSelection) ? 1 : 0,
+    detail: 1,
+    shiftKey: forceSelection && !macPlatform,
+    altKey: forceSelection && macPlatform,
+  });
+  Object.defineProperty(event, "wrapTerminalIntent", {
+    value: forceSelection ? "selection" : "tap",
+  });
+  target.dispatchEvent(event);
+  return true;
+}
+
+function finishCoarsePointer(pointer, wasPinching) {
+  if (wasPinching || pointer.moved || !viewerState.current) {
+    return;
+  }
+  dispatchTerminalMouse("mousemove", pointer);
+  dispatchTerminalMouse("mousedown", pointer);
+  dispatchTerminalMouse("mouseup", pointer);
+  if (!typingMode) {
+    setTypingMode(true);
+  }
+}
+
+function beginTerminalSelection(pointer) {
+  dispatchTerminalMouse("mousedown", pointer, true);
+}
+
+function updateTerminalSelection(pointer) {
+  dispatchTerminalMouse("mousemove", pointer, true);
+}
+
+function finishTerminalSelection(pointer) {
+  dispatchTerminalMouse("mouseup", pointer, true);
+  if (terminal.getSelection()) {
+    elements.copy.textContent = "Copy selected";
+  }
+}
+
+function copyTextSynchronously(value) {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.readOnly = true;
+  Object.assign(textarea.style, {
+    position: "fixed",
+    top: "0",
+    left: "0",
+    opacity: "0",
+    pointerEvents: "none",
+  });
+  document.body.appendChild(textarea);
+  textarea.focus({ preventScroll: true });
+  textarea.select();
+  textarea.setSelectionRange(0, value.length);
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+  }
+}
+
+function copyTerminalSelection() {
+  const value = terminal.getSelection();
+  if (!value) {
+    elements.copy.textContent = "Select text";
+    return Promise.resolve(false);
+  }
+  if (!navigator.clipboard?.writeText) {
+    setSelectionMode(false);
+    terminal.clearSelection();
+    if (copyTextSynchronously(value)) {
+      showCopyFeedback("Copied");
+      return Promise.resolve(true);
+    }
+    showCopyFeedback("Copy failed");
+    return Promise.resolve(false);
+  }
+  return navigator.clipboard.writeText(value).then(() => {
+    setSelectionMode(false);
+    terminal.clearSelection();
+    showCopyFeedback("Copied");
+    return true;
+  }).catch(() => {
+    setSelectionMode(false);
+    terminal.clearSelection();
+    showCopyFeedback("Copy failed");
+    return false;
+  });
+}
+
+function handleCopyAction() {
+  if (!viewerState.current) {
+    return;
+  }
+  if (selectionMode) {
+    if (terminal.getSelection()) {
+      void copyTerminalSelection();
+      return;
+    }
+    setSelectionMode(false);
+    terminal.clearSelection();
+    clearViewportGestures();
+    return;
+  }
+  setTypingMode(false);
+  setSelectionMode(true);
+  terminal.clearSelection();
+  clearViewportGestures();
+}
+
+function pasteClipboardText() {
+  setUtilityMenuOpen(false);
+  if (!viewerState.current || !connection?.authenticated) {
+    return Promise.resolve(false);
+  }
+  const pasteViewer = viewerState.current;
+  const pasteConnection = connection;
+  if (!navigator.clipboard?.readText) {
+    showPasteFeedback("Paste unavailable");
+    return Promise.resolve(false);
+  }
+  return navigator.clipboard.readText().then((value) => {
+    if (viewerState.current !== pasteViewer || connection !== pasteConnection ||
+        !pasteConnection.authenticated) {
+      showPasteFeedback("Paste canceled");
+      return false;
+    }
+    if (!value) {
+      showPasteFeedback("Clipboard empty");
+      return false;
+    }
+    if (controlSticky) {
+      setControlSticky(false);
+    }
+    terminal.paste(value);
+    showPasteFeedback("Pasted");
+    return true;
+  }).catch(() => {
+    const canceled = viewerState.current !== pasteViewer || connection !== pasteConnection ||
+      !pasteConnection.authenticated;
+    showPasteFeedback(canceled ? "Paste canceled" : "Paste denied");
+    return false;
+  });
 }
 
 function updateVisualViewport() {
@@ -1020,6 +1347,15 @@ elements.keyboardToggle.addEventListener("click", () => {
     setTypingMode(!typingMode);
   }
 });
+elements.copy.addEventListener("pointerdown", (event) => event.preventDefault());
+elements.copy.addEventListener("click", handleCopyAction);
+elements.paste.addEventListener("pointerdown", (event) => event.preventDefault());
+elements.paste.addEventListener("click", pasteClipboardText);
+elements.more.addEventListener("pointerdown", (event) => event.preventDefault());
+elements.more.addEventListener("click", () => setUtilityMenuOpen(!utilityMenuOpen));
+elements.utilityMenu.addEventListener("click", dismissUtilityMenuAfterAction);
+document.addEventListener("pointerdown", dismissUtilityMenuFromPointer);
+document.addEventListener("keydown", dismissUtilityMenuFromKey, true);
 elements.fit.addEventListener("pointerdown", (event) => event.preventDefault());
 elements.fit.addEventListener("click", fitTerminalViewport);
 
@@ -1055,7 +1391,8 @@ function beginPinchGesture() {
 }
 
 elements.terminalViewport.addEventListener("pointerdown", (event) => {
-  if (!isCoarsePointerEvent(event) || viewportPointers.size >= 2) {
+  const pointerLimit = selectionMode ? 1 : 2;
+  if (!shouldTrackTerminalPointer(event) || viewportPointers.size >= pointerLimit) {
     return;
   }
   if (event.cancelable) {
@@ -1072,6 +1409,11 @@ elements.terminalViewport.addEventListener("pointerdown", (event) => {
     scrollTargetViewportY: terminal.buffer.active.viewportY,
     moved: false,
   });
+  if (selectionMode) {
+    elements.terminalViewport.setPointerCapture?.(event.pointerId);
+    beginTerminalSelection(viewportPointers.get(event.pointerId));
+    return;
+  }
   if (viewportPointers.size === 2) {
     beginPinchGesture();
   }
@@ -1085,6 +1427,13 @@ elements.terminalViewport.addEventListener("pointermove", (event) => {
   pointer.y = event.clientY;
   if (Math.hypot(pointer.x - pointer.startX, pointer.y - pointer.startY) > 10) {
     pointer.moved = true;
+  }
+  if (selectionMode) {
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    updateTerminalSelection(pointer);
+    return;
   }
   if (viewportPointers.size === 1) {
     if (event.cancelable) {
@@ -1143,6 +1492,10 @@ elements.terminalViewport.addEventListener("pointerup", (event) => {
   }
   const wasPinching = Boolean(pinchGesture) || viewportPointers.size > 1;
   viewportPointers.delete(event.pointerId);
+  if (selectionMode) {
+    finishTerminalSelection(pointer);
+    return;
+  }
   if (wasPinching) {
     commitPinchPreview();
     pinchGesture = null;
@@ -1157,17 +1510,20 @@ elements.terminalViewport.addEventListener("pointerup", (event) => {
     }
     finishPinchScale();
   }
-  const enterTyping = !wasPinching && !pointer.moved && !typingMode && viewerState.current;
-  if (enterTyping) {
-    setTypingMode(true);
-  }
+  finishCoarsePointer(pointer, wasPinching);
 });
 elements.terminalViewport.addEventListener("pointercancel", (event) => {
   if (!viewportPointers.has(event.pointerId)) {
     return;
   }
+  const pointer = viewportPointers.get(event.pointerId);
   const wasPinching = Boolean(pinchGesture) || viewportPointers.size > 1;
   viewportPointers.delete(event.pointerId);
+  if (selectionMode) {
+    dispatchTerminalMouse("mouseup", pointer, true);
+    terminal.clearSelection();
+    return;
+  }
   if (wasPinching) {
     commitPinchPreview();
     pinchGesture = null;

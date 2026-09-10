@@ -15,10 +15,23 @@ func TestValidateNameRejectsUnsafeLabels(t *testing.T) {
 			t.Errorf("ValidateName(%q) succeeded", value)
 		}
 	}
-	for _, value := range []string{"api", "list", "release review", "日本語"} {
+	for _, value := range []string{"api", "all", "list", "release review", "日本語"} {
 		if err := ValidateName(value); err != nil {
 			t.Errorf("ValidateName(%q) = %v", value, err)
 		}
+	}
+}
+
+func TestChooseNameReservesAllForBulkKill(t *testing.T) {
+	t.Parallel()
+
+	targetValue := target.Target{Directory: "/work/all", WindowName: "all"}
+	if _, err := ChooseName("all", targetValue, nil); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("ChooseName(all) = %v", err)
+	}
+	got, err := ChooseName("", targetValue, nil)
+	if err != nil || got != "all-2" {
+		t.Fatalf("ChooseName(derived all) = %q, %v; want all-2", got, err)
 	}
 }
 

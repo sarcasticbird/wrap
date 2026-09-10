@@ -14,7 +14,9 @@ The worker creates an ephemeral session containing one link to the authorized
 window and no fallback windows. The helper can remain on that window without
 moving the user's session, and destroying the window also destroys the helper.
 Wrap marks the helper with its instance ID and disables its prefix keys and
-status line.
+status line. Its private key table exposes only tmux's primary pane-click
+binding, and mouse mode is enabled so a browser tap can select a pane without
+restoring window or session switching shortcuts.
 
 Cleanup requires the original socket, generation, helper ID, helper name, and
 ownership marker to match. It kills the helper only. A linked window remains
@@ -56,7 +58,7 @@ Non-secret instance records are under `$XDG_STATE_HOME/wrap/instances`, with
 Directories are mode 0700 and records/sockets are mode 0600.
 
 Records contain the name, worker PID, control path, start time, display
-directory, and tmux identity. `list`, `show`, `regen`, and `remove` resolve a
+directory, and tmux identity. `list`, `show`, `regen`, and `kill` resolve a
 record and then require a matching response from its control socket; PID
 existence alone is never authority. Each worker also holds an instance-ID lease.
 If control is unreachable, a held lease preserves the record as unreachable;
@@ -69,6 +71,6 @@ They exclude pairing credentials, encrypted frames, and raw subprocess output.
 ## Failure boundaries
 
 A vanished target, changed tmux generation, tunnel exit, signal, or explicit
-remove closes viewers and worker-owned resources. It does not send
+kill closes viewers and worker-owned resources. It does not send
 `kill-window` or mutate the source session. Failure of one Wrap does not affect
 another.

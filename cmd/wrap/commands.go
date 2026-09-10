@@ -38,7 +38,7 @@ Usage:
   wrap list [--json]
   wrap show INSTANCE [--json]
   wrap regen INSTANCE [--json]
-  wrap remove INSTANCE
+  wrap kill INSTANCE|all
   wrap doctor [--json]
   wrap version`
 
@@ -89,7 +89,7 @@ func commandFuncsForArgs(args []string, out io.Writer, createApplication func() 
 		return commandFuncs{
 			start: func(string) error { return err }, list: func(bool) error { return err },
 			show: func(string, bool) error { return err }, regen: func(string, bool) error { return err },
-			remove: func(string) error { return err }, doctor: func(bool) error { return err },
+			kill: func(string, bool) error { return err }, doctor: func(bool) error { return err },
 			version: func() error { return err }, help: func() error { return err },
 			bootstrap: func(string) error { return err }, serve: func([]string) error { return err },
 		}
@@ -134,7 +134,7 @@ func newApplication() (*application, error) {
 func (a *application) funcs() commandFuncs {
 	return commandFuncs{
 		start: a.start, list: a.list, show: a.show, regen: a.regen,
-		remove: a.remove, doctor: a.doctor,
+		kill: a.kill, doctor: a.doctor,
 		version:   func() error { _, err := fmt.Fprintln(a.out, "wrap", version); return err },
 		help:      func() error { _, err := fmt.Fprintln(a.out, usage); return err },
 		bootstrap: a.bootstrap,
@@ -146,6 +146,9 @@ func (a *application) start(name string) error {
 	if name != "" {
 		if err := instance.ValidateName(name); err != nil {
 			return err
+		}
+		if name == "all" {
+			return errors.New(`name "all" is reserved for wrap kill all`)
 		}
 	}
 	if a.getenv("TMUX") != "" {
@@ -365,7 +368,7 @@ func (a *application) inspectRecords(ctx context.Context, removeDead bool) ([]in
 			removed, removeErr := a.store.RemoveIfPID(record.ID, record.PID)
 			if removeErr != nil {
 				_ = lease.Close()
-				return nil, problems, fmt.Errorf("remove stale Wrap %q: %w", record.Name, removeErr)
+				return nil, problems, fmt.Errorf("delete stale Wrap record %q: %w", record.Name, removeErr)
 			}
 			if removed {
 				if _, writeErr := fmt.Fprintf(a.err, "wrap: removed stale instance record %s (%s)\n", safeHumanLabel(record.Name), record.ID); writeErr != nil {
@@ -463,11 +466,39 @@ func (a *application) regen(selector string, jsonOutput bool) error {
 	return writeStatus(a.out, status, jsonOutput)
 }
 
-func (a *application) remove(selector string) error {
+func (a *application) kill(selector string, all bool) error {
+	if all {
+		return a.killAll()
+	}
 	record, err := a.store.Resolve(selector)
 	if err != nil {
 		return err
 	}
+	return a.killRecord(record)
+}
+
+func (a *application) killAll() error {
+	records, problems, err := a.store.ReadAll()
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 && len(problems) == 0 {
+		_, err := fmt.Fprintln(a.out, "No running Wraps.")
+		return err
+	}
+	var killErr error
+	for _, problem := range problems {
+		killErr = errors.Join(killErr, fmt.Errorf("read Wrap instance record: %w", problem))
+	}
+	for _, record := range records {
+		if err := a.killRecord(record); err != nil {
+			killErr = errors.Join(killErr, fmt.Errorf("kill Wrap %s: %w", safeHumanLabel(record.Name), err))
+		}
+	}
+	return killErr
+}
+
+func (a *application) killRecord(record instance.Record) error {
 	if _, err := a.callControl(context.Background(), record.ControlSocket, control.Request{
 		InstanceID: record.ID, Action: control.ActionShutdown,
 	}); err != nil {
@@ -494,13 +525,13 @@ func (a *application) remove(selector string) error {
 		if !removed {
 			return err
 		}
-		_, writeErr := fmt.Fprintf(a.out, "Removed stale Wrap %s. The tmux window is still running.\n", safeHumanLabel(record.Name))
+		_, writeErr := fmt.Fprintf(a.out, "Killed stale Wrap %s. The tmux window is still running.\n", safeHumanLabel(record.Name))
 		return writeErr
 	}
 	if err := a.waitForStopped(record); err != nil {
 		return err
 	}
-	_, writeErr := fmt.Fprintf(a.out, "Removed Wrap %s. The tmux window is still running.\n", safeHumanLabel(record.Name))
+	_, writeErr := fmt.Fprintf(a.out, "Killed Wrap %s. The tmux window is still running.\n", safeHumanLabel(record.Name))
 	return writeErr
 }
 

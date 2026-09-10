@@ -32,7 +32,7 @@ type commandFuncs struct {
 	list      func(bool) error
 	show      func(string, bool) error
 	regen     func(string, bool) error
-	remove    func(string) error
+	kill      func(string, bool) error
 	doctor    func(bool) error
 	version   func() error
 	help      func() error
@@ -77,14 +77,17 @@ func runArgs(args []string, funcs commandFuncs) error {
 			return errors.New("regen command is unavailable")
 		}
 		return funcs.regen(args[1], jsonOutput)
-	case "remove":
+	case "kill":
 		if len(args) != 2 || args[1] == "" {
-			return errors.New("usage: wrap remove INSTANCE")
+			return errors.New("usage: wrap kill INSTANCE|all")
 		}
-		if funcs.remove == nil {
-			return errors.New("remove command is unavailable")
+		if funcs.kill == nil {
+			return errors.New("kill command is unavailable")
 		}
-		return funcs.remove(args[1])
+		if args[1] == "all" {
+			return funcs.kill("", true)
+		}
+		return funcs.kill(args[1], false)
 	case "doctor":
 		jsonOutput, err := parseOptionalJSON(args[1:])
 		if err != nil {

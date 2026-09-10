@@ -61,6 +61,15 @@ Wrap captures the current window, starts one detached sharing worker, prints a
 pairing URL and QR code, and returns to your shell. Give the share a management
 name with `wrap -n api`.
 
+On a phone, tap a tmux pane to focus it. Drag to pan and pinch to zoom without
+changing panes. To copy terminal output, tap Copy and drag across the text; Wrap
+stages the selection without sending it to the terminal. Tap Copy selected to
+write it to the phone clipboard.
+Tap Paste to send clipboard text through the terminal's normal paste handling.
+Keyboard, Fit terminal, Reconnect, and Close remain available under More.
+Tap an HTTP or HTTPS link to open it. With a desktop pointer, use Ctrl-click or
+Command-click instead.
+
 Outside tmux, the same command creates and attaches an ordinary session on your
 default tmux server in the physical current directory. It uses your normal tmux
 configuration and shell—there is no private Wrap tmux server. Detach and
@@ -74,7 +83,8 @@ wrap -n api              Share it with the management name "api"
 wrap list                List running shares without credentials
 wrap show api            Show the current pairing URL and QR code
 wrap regen api           Rotate the credential and disconnect browsers
-wrap remove api          Stop sharing without killing the source window
+wrap kill api            Stop one share without killing the source window
+wrap kill all            Stop every share without killing source windows
 wrap doctor              Check dependencies and local state
 ```
 
@@ -89,7 +99,7 @@ execute or supervise the command inside it.
 
 While sharing, `tmux ls` shows an ephemeral `__wrap_<id>` helper session. It is
 grouped with the source session so it can stay pinned to the captured window.
-Removing a Wrap kills only that helper and the sharing worker; the source
+Killing a Wrap kills only that helper and the sharing worker; the source
 window and session keep running.
 
 ## Security boundary
@@ -101,7 +111,7 @@ persisted by the host. Cloudflare can still replace the JavaScript delivered
 through its edge, so this protects against passive tunnel inspection—not a
 malicious edge, browser, or host.
 
-Use `wrap regen` if a URL may have escaped and `wrap remove` when sharing is
+Use `wrap regen` if a URL may have escaped and `wrap kill` when sharing is
 finished. Read [SECURITY.md](SECURITY.md) for the complete trust boundary.
 
 ## Develop Wrap
