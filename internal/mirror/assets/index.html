@@ -30,11 +30,18 @@
     <section id="terminal-view" class="terminal-shell hidden" aria-labelledby="terminal-title">
       <div class="terminal-heading">
         <strong id="terminal-title">Terminal</strong>
-        <div class="terminal-actions" role="group" aria-label="Terminal view controls">
-          <button id="keyboard-toggle" type="button" aria-pressed="false">Keyboard</button>
-          <button id="fit-button" type="button" aria-pressed="true">Fit</button>
-          <button id="terminal-reconnect-button" type="button">Reconnect</button>
-          <button id="close-button" class="danger" type="button">Close</button>
+        <div id="terminal-actions" class="terminal-actions" role="group" aria-label="Terminal view controls">
+          <button id="copy-button" type="button" aria-pressed="false">Copy</button>
+          <button id="paste-button" type="button">Paste</button>
+          <div class="terminal-more">
+            <button id="more-button" type="button" aria-expanded="false" aria-controls="terminal-utility-menu">More</button>
+            <div id="terminal-utility-menu" class="terminal-utility-menu" role="group" aria-label="More terminal controls" hidden>
+              <button id="keyboard-toggle" type="button" aria-pressed="false">Keyboard</button>
+              <button id="fit-button" type="button" aria-pressed="true">Fit terminal</button>
+              <button id="terminal-reconnect-button" type="button">Reconnect</button>
+              <button id="close-button" class="danger" type="button">Close</button>
+            </div>
+          </div>
         </div>
       </div>
       <div id="terminal-viewport" class="terminal-viewport">

@@ -12,7 +12,7 @@ unreachable records, and old Wrap tmux servers without changing anything.
 ## Missing or old dependencies
 
 Wrap requires tmux 3.2+ and cloudflared 2020.5.1+. Management commands remain
-available without cloudflared so you can inspect or remove an existing worker.
+available without cloudflared so you can inspect or kill an existing worker.
 
 ```sh
 tmux -V
@@ -25,13 +25,13 @@ Running `wrap` twice in the same window reports the existing pairing details.
 `wrap -n NEW` renames that same live share when the name is unused. If control
 fails while the worker still holds its lease, `wrap doctor` reports the record
 as unreachable and Wrap does not replace it. When no worker holds the lease,
-`list`, a new start, or `remove` reconciles the stale record and guarded helper.
+`list`, a new start, or `kill` reconciles the stale record and guarded helper.
 PID existence alone is never treated as ownership.
 
 ## A `__wrap_...` session is visible
 
 That is the active helper session. Do not use it as your work session. `wrap
-remove NAME` removes it after guarded ownership checks and leaves your source
+kill NAME` removes it after guarded ownership checks and leaves your source
 session/window running.
 
 ## Browser pairing fails

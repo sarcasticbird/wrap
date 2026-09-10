@@ -62,8 +62,8 @@ flox activate -- wrap doctor
 Putting this checkout's absolute `bin/` path first ensures the UAT commands do
 not accidentally exercise an older installed Wrap. A live browser test also
 needs cloudflared on `PATH`. Use disposable tmux sessions and follow the
-[mobile mirror UAT](docs/mobile-mirror-uat.md). Always confirm that `wrap
-remove` stops the share without killing the source window or session.
+[mobile mirror UAT](docs/mobile-mirror-uat.md). Always confirm that `wrap kill`
+stops the share without killing the source window or session.
 
 ## Repository map
 

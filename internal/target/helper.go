@@ -148,6 +148,7 @@ func CreateHelper(target Target, instanceID string, run tmux.Runner) (*Helper, e
 		{option: "prefix", value: "None"},
 		{option: "prefix2", value: "None"},
 		{option: "status", value: "off"},
+		{option: "mouse", value: "on"},
 		{option: "key-table", value: helperKeyTable(instanceID)},
 	} {
 		if err := server.SetSessionOptionIfGeneration(
@@ -161,6 +162,16 @@ func CreateHelper(target Target, instanceID string, run tmux.Runner) (*Helper, e
 				helper.Close(),
 			)
 		}
+	}
+	if err := server.BindPaneMouseIfGeneration(
+		sessionID,
+		target.Generation,
+		helperKeyTable(instanceID),
+	); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("configure Wrap helper pane clicks: %w", err),
+			helper.Close(),
+		)
 	}
 	return helper, nil
 }
@@ -229,7 +240,17 @@ func (h *Helper) Close() error {
 	if errors.Is(err, tmux.ErrSessionIdentityChanged) || errors.Is(err, tmux.ErrServerGenerationChanged) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	unbindErr := server.UnbindPaneMouseIfGeneration(
+		h.Target.Generation,
+		helperKeyTable(h.InstanceID),
+	)
+	if errors.Is(unbindErr, tmux.ErrServerGenerationChanged) || tmux.IsMissingTargetError(unbindErr) {
+		return nil
+	}
+	return unbindErr
 }
 
 func (h *Helper) closeUnmarked() error {

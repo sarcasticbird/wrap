@@ -517,6 +517,62 @@ func (s *Server) SetSessionOptionIfGeneration(id, generation, option, value stri
 		tmuxCommand("set-option", "-t", id, option, value))
 }
 
+// BindPaneMouseIfGeneration gives a private helper key table only tmux's
+// standard primary-button pane selection behavior. The forwarded mouse event
+// still reaches an application in the selected pane when it has mouse mode
+// enabled.
+func (s *Server) BindPaneMouseIfGeneration(id, generation, keyTable string) error {
+	if !isSessionID(id) {
+		return fmt.Errorf("invalid tmux session id %q", id)
+	}
+	if !isGeneration(generation) {
+		return fmt.Errorf("invalid tmux server generation %q", generation)
+	}
+	if keyTable == "" {
+		return errors.New("tmux key table is empty")
+	}
+	// This is fixed tmux syntax rather than user input. Keeping the pane target
+	// unquoted avoids nesting quotes inside bind-key's command argument.
+	selectPane := "select-pane -t = ; send-keys -M"
+	condition := "#{==:#{" + ServerGenerationOption + "}," + generation + "}"
+	reject := tmuxCommand("display-message", "-p", generationMismatchMessage)
+	out, err := s.Run(
+		"if-shell", "-F", "-t", id, condition,
+		tmuxCommand("bind-key", "-T", keyTable, "MouseDown1Pane", selectPane), reject,
+	)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) == generationMismatchMessage {
+		return ErrServerGenerationChanged
+	}
+	return nil
+}
+
+// UnbindPaneMouseIfGeneration removes Wrap's sole private helper binding while
+// refusing to touch a restarted tmux server. -q makes cleanup idempotent when
+// the binding or its private table is already gone.
+func (s *Server) UnbindPaneMouseIfGeneration(generation, keyTable string) error {
+	if keyTable == "" {
+		return errors.New("tmux key table is empty")
+	}
+	args, err := serverCommandIfGenerationArgs(
+		generation,
+		tmuxCommand("unbind-key", "-q", "-T", keyTable, "MouseDown1Pane"),
+	)
+	if err != nil {
+		return err
+	}
+	out, err := s.Run(args...)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) == generationMismatchMessage {
+		return ErrServerGenerationChanged
+	}
+	return nil
+}
+
 // RenameSessionIDIfGeneration renames exactly id on its original server.
 func (s *Server) RenameSessionIDIfGeneration(id, generation, newName string) error {
 	if newName == "" {

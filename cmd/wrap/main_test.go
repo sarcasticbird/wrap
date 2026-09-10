@@ -60,7 +60,10 @@ func TestRunArgsManagementGrammar(t *testing.T) {
 			calls = append(calls, "regen:"+selector+":"+boolString(json))
 			return nil
 		},
-		remove:  func(selector string) error { calls = append(calls, "remove:"+selector); return nil },
+		kill: func(selector string, all bool) error {
+			calls = append(calls, "kill:"+selector+":"+boolString(all))
+			return nil
+		},
 		doctor:  func(json bool) error { calls = append(calls, "doctor:"+boolString(json)); return nil },
 		version: func() error { calls = append(calls, "version"); return nil },
 	}
@@ -68,7 +71,7 @@ func TestRunArgsManagementGrammar(t *testing.T) {
 		{"list"}, {"list", "--json"},
 		{"show", "api"}, {"show", "api", "--json"},
 		{"regen", "01KWRAP", "--json"},
-		{"remove", "api"},
+		{"kill", "api"}, {"kill", "all"}, {"kill", "--all"},
 		{"doctor"}, {"doctor", "--json"},
 		{"version"},
 	} {
@@ -78,7 +81,7 @@ func TestRunArgsManagementGrammar(t *testing.T) {
 	}
 	want := []string{
 		"list:false", "list:true", "show:api:false", "show:api:true",
-		"regen:01KWRAP:true", "remove:api", "doctor:false", "doctor:true", "version",
+		"regen:01KWRAP:true", "kill:api:false", "kill::true", "kill:--all:false", "doctor:false", "doctor:true", "version",
 	}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("calls = %v, want %v", calls, want)
@@ -90,7 +93,9 @@ func TestRunArgsRejectsCommandPayloadAndAmbiguousSyntax(t *testing.T) {
 		{"-n", "api", "--", "codex"},
 		{"api"},
 		{"show"},
-		{"remove"},
+		{"kill"},
+		{"kill", "api", "--all"},
+		{"kill", "--all", "api"},
 		{"list", "extra"},
 		{"show", "api", "extra"},
 		{"--name"},
@@ -102,6 +107,22 @@ func TestRunArgsRejectsCommandPayloadAndAmbiguousSyntax(t *testing.T) {
 		if args[0] == "-n" && !strings.Contains(err.Error(), "does not run commands") {
 			t.Fatalf("payload error = %v", err)
 		}
+	}
+}
+
+func TestRunArgsRejectsRemovedCommand(t *testing.T) {
+	called := false
+	err := runArgs([]string{"remove", "api"}, commandFuncs{
+		kill: func(string, bool) error {
+			called = true
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), `unknown command "remove"`) {
+		t.Fatalf("remove command error = %v", err)
+	}
+	if called {
+		t.Fatal("remove command dispatched to kill")
 	}
 }
 

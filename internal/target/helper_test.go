@@ -80,8 +80,11 @@ func TestCreateHelperLinksOnlyCapturedWindow(t *testing.T) {
 		"prefix None",
 		"prefix2 None",
 		"status off",
+		"mouse on",
 		"destroy-unattached off",
 		"key-table __wrap_keys_01jabcdef234567890",
+		"bind-key -T __wrap_keys_01jabcdef234567890 MouseDown1Pane",
+		"select-pane -t = ; send-keys -M",
 	} {
 		if !strings.Contains(all, required) {
 			t.Fatalf("helper calls missing %q:\n%s", required, all)
@@ -89,6 +92,10 @@ func TestCreateHelperLinksOnlyCapturedWindow(t *testing.T) {
 	}
 	if strings.Contains(all, "new-session -d -t $7") {
 		t.Fatalf("helper joined the source session group:\n%s", all)
+	}
+	if binding := joined[len(joined)-1]; !strings.Contains(binding, "if-shell -F -t $8") ||
+		!strings.Contains(binding, "bind-key -T __wrap_keys_01jabcdef234567890") {
+		t.Fatalf("pane-click binding is not helper-scoped: %s", binding)
 	}
 	if strings.Contains(all, "/bin/sleep") || !strings.Contains(all, "sleep 300") {
 		t.Fatalf("helper placeholder command does not resolve sleep through PATH:\n%s", all)
@@ -112,8 +119,8 @@ func TestHelperCloseRequiresOwnedMarker(t *testing.T) {
 	if err := helper.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("close calls = %d, want 1", len(runner.calls))
+	if len(runner.calls) != 2 {
+		t.Fatalf("close calls = %d, want 2", len(runner.calls))
 	}
 	call := strings.Join(runner.calls[0], " ")
 	for _, required := range []string{
@@ -124,6 +131,15 @@ func TestHelperCloseRequiresOwnedMarker(t *testing.T) {
 	} {
 		if !strings.Contains(call, required) {
 			t.Fatalf("guarded close missing %q: %s", required, call)
+		}
+	}
+	unbindCall := strings.Join(runner.calls[1], " ")
+	for _, required := range []string{
+		"#{==:#{@wrap_server_generation},0123456789abcdef0123456789abcdef}",
+		"unbind-key -q -T __wrap_keys_01jabcdef234567890 MouseDown1Pane",
+	} {
+		if !strings.Contains(unbindCall, required) {
+			t.Fatalf("guarded key-table cleanup missing %q: %s", required, unbindCall)
 		}
 	}
 }
@@ -139,12 +155,15 @@ func TestCleanupHelperDiscoversAndKillsOnlyExactStaleOwner(t *testing.T) {
 	if err := CleanupHelper(target, "01JABCDEF234567890", runner); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("cleanup calls = %d, want inspect and guarded kill", len(runner.calls))
+	if len(runner.calls) != 3 {
+		t.Fatalf("cleanup calls = %d, want inspect, guarded kill, and key cleanup", len(runner.calls))
 	}
 	if call := strings.Join(runner.calls[1], " "); !strings.Contains(call, "kill-session -t $8") ||
 		!strings.Contains(call, "@wrap_instance_id},01JABCDEF234567890") {
 		t.Fatalf("guarded cleanup = %s", call)
+	}
+	if call := strings.Join(runner.calls[2], " "); !strings.Contains(call, "unbind-key -q -T __wrap_keys_01jabcdef234567890 MouseDown1Pane") {
+		t.Fatalf("key-table cleanup = %s", call)
 	}
 }
 
@@ -268,6 +287,9 @@ func TestGroupedHelperDoesNotMoveOrKillSourceSession(t *testing.T) {
 	if _, err := server.Run("set-option", "-g", "destroy-unattached", "on"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := server.Run("set-option", "-g", "mouse", "off"); err != nil {
+		t.Fatal(err)
+	}
 	const generation = "0123456789abcdef0123456789abcdef"
 	if _, err := server.EnsureServerGeneration(generation); err != nil {
 		t.Fatal(err)
@@ -304,12 +326,19 @@ func TestGroupedHelperDoesNotMoveOrKillSourceSession(t *testing.T) {
 	if err != nil || keyTable != "__wrap_keys_"+strings.ToLower(instanceID) {
 		t.Fatalf("helper key-table = %q, %v", keyTable, err)
 	}
+	mouse, err := server.Run("show-options", "-v", "-t", helper.SessionID, "mouse")
+	if err != nil || mouse != "on" {
+		t.Fatalf("helper mouse = %q, %v", mouse, err)
+	}
 	rootKeys, err := server.Run("list-keys", "-T", "root")
 	if err != nil || !strings.Contains(rootKeys, "switch-client") {
 		t.Fatalf("root switch-client binding = %q, %v", rootKeys, err)
 	}
-	if helperKeys, err := server.Run("list-keys", "-T", keyTable); err == nil || strings.TrimSpace(helperKeys) != "" {
-		t.Fatalf("isolated helper key table unexpectedly exists: %q, %v", helperKeys, err)
+	helperKeys, err := server.Run("list-keys")
+	if err != nil || !strings.Contains(helperKeys, "-T "+keyTable+" ") ||
+		!strings.Contains(helperKeys, "MouseDown1Pane") ||
+		!strings.Contains(helperKeys, "select-pane -t = \\; send-keys -M") {
+		t.Fatalf("helper pane-click binding missing from key list: %v\n%s", err, helperKeys)
 	}
 	if _, err := server.Run("select-window", "-t", "source:one"); err != nil {
 		t.Fatal(err)
@@ -326,6 +355,9 @@ func TestGroupedHelperDoesNotMoveOrKillSourceSession(t *testing.T) {
 	}
 	if err := helper.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if helperKeys, err := server.Run("list-keys"); err != nil || strings.Contains(helperKeys, "-T "+keyTable+" ") {
+		t.Fatalf("helper mouse key table survived cleanup: %v\n%s", err, helperKeys)
 	}
 	remaining, err := server.Run("list-sessions", "-F", "#{session_name}\t#{window_name}")
 	if err != nil {

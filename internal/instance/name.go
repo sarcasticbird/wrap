@@ -31,13 +31,17 @@ func ValidateName(value string) error {
 }
 
 func ChooseName(requested string, targetValue target.Target, records []Record) (string, error) {
-	used := make(map[string]struct{}, len(records))
+	used := make(map[string]struct{}, len(records)+1)
+	used["all"] = struct{}{}
 	for _, record := range records {
 		used[record.Name] = struct{}{}
 	}
 	if requested != "" {
 		if err := ValidateName(requested); err != nil {
 			return "", err
+		}
+		if requested == "all" {
+			return "", errors.New(`name "all" is reserved for wrap kill all`)
 		}
 		if _, exists := used[requested]; exists {
 			return "", fmt.Errorf("wrap name %q is already in use", requested)

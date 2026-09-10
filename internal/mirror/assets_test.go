@@ -16,6 +16,7 @@ func TestEmbeddedMirrorAssets(t *testing.T) {
 		"assets/third_party/xterm/xterm.mjs",
 		"assets/third_party/xterm/xterm.css",
 		"assets/third_party/xterm/addon-fit.mjs",
+		"assets/third_party/xterm/addon-web-links.mjs",
 		"assets/wrap-mirror-bootstrap.js",
 		"assets/wrap-mirror-viewport.js",
 		"assets/licenses/xterm-LICENSE",
@@ -36,10 +37,11 @@ func TestEmbeddedMirrorAssets(t *testing.T) {
 		}
 	}
 	wantHashes := map[string]string{
-		"assets/third_party/xterm/xterm.mjs":     "3fd3d0046d2604ea5860235e2f96625a2fab158dcf3d4cfb0f7c1655559a5d9a",
-		"assets/third_party/xterm/xterm.css":     "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6",
-		"assets/third_party/xterm/addon-fit.mjs": "aa22c5f28e4d64118ac0e7d60276b3384188e59dd104c96e43760d6e2cedd771",
-		"assets/licenses/xterm-LICENSE":          "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+		"assets/third_party/xterm/xterm.mjs":           "3fd3d0046d2604ea5860235e2f96625a2fab158dcf3d4cfb0f7c1655559a5d9a",
+		"assets/third_party/xterm/xterm.css":           "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6",
+		"assets/third_party/xterm/addon-fit.mjs":       "aa22c5f28e4d64118ac0e7d60276b3384188e59dd104c96e43760d6e2cedd771",
+		"assets/third_party/xterm/addon-web-links.mjs": "38f7f1736b3cb72a27fd8553bb5d594ca8ff6862223564acd13eec72a897514b",
+		"assets/licenses/xterm-LICENSE":                "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
 	}
 	for name, want := range wantHashes {
 		data, err := fs.ReadFile(assets, name)
@@ -58,8 +60,10 @@ func TestEmbeddedMirrorAssets(t *testing.T) {
 	for _, want := range []string{
 		"@xterm/xterm 6.0.0",
 		"@xterm/addon-fit 0.11.0",
+		"@xterm/addon-web-links 0.12.0",
 		"https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz",
 		"https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz",
+		"https://registry.npmjs.org/@xterm/addon-web-links/-/addon-web-links-0.12.0.tgz",
 		"https://github.com/xtermjs/xterm.js",
 		"MIT",
 		"SHA-256",
@@ -70,7 +74,7 @@ func TestEmbeddedMirrorAssets(t *testing.T) {
 	}
 
 	externalLoad := regexp.MustCompile(`(?i)(?:from\s*|import\s*\(|url\s*\()\s*["']?https?://`)
-	for _, name := range wantFiles[:3] {
+	for _, name := range wantFiles[:4] {
 		data, err := fs.ReadFile(assets, name)
 		if err != nil {
 			t.Fatal(err)

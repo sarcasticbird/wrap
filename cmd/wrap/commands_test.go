@@ -71,16 +71,24 @@ func commandTestTarget() target.Target {
 }
 
 func commandTestRecord(t *testing.T, app *application) instance.Record {
+	return commandTestRecordNamed(t, app, "01KWRAPCOMMAND", "api")
+}
+
+func commandTestRecordNamed(t *testing.T, app *application, id, name string) instance.Record {
 	t.Helper()
+	tmuxTarget := commandTestTarget()
+	if id != "01KWRAPCOMMAND" {
+		tmuxTarget.WindowID = "@" + id
+	}
 	record := instance.Record{
 		Version:       instance.RecordVersion,
-		ID:            "01KWRAPCOMMAND",
-		Name:          "api",
+		ID:            id,
+		Name:          name,
 		PID:           os.Getpid(),
-		ControlSocket: filepath.Join(app.store.RuntimeRoot, "01KWRAPCOMMAND.sock"),
+		ControlSocket: filepath.Join(app.store.RuntimeRoot, id+".sock"),
 		StartedAt:     time.Unix(100, 0).UTC(),
 		Directory:     "/work/api",
-		Target:        commandTestTarget(),
+		Target:        tmuxTarget,
 	}
 	if err := app.store.Create(record); err != nil {
 		t.Fatal(err)
@@ -625,60 +633,60 @@ func TestHumanDoctorSurfacesStateInspectionFailureAndReturnsError(t *testing.T) 
 	}
 }
 
-func TestRemoveStopsOnlyWorkerAndWaitsForRecordCleanup(t *testing.T) {
+func TestKillStopsOnlyWorkerAndWaitsForRecordCleanup(t *testing.T) {
 	app, stdout, _ := testApplication(t)
 	record := commandTestRecord(t, app)
 	app.callControl = func(_ context.Context, _ string, request control.Request) (control.Status, error) {
 		if request.Action != control.ActionShutdown {
-			t.Fatalf("remove action = %q", request.Action)
+			t.Fatalf("kill action = %q", request.Action)
 		}
 		if err := app.store.Remove(record.ID); err != nil {
 			t.Fatal(err)
 		}
 		return commandTestStatus(record), nil
 	}
-	if err := app.remove("api"); err != nil {
+	if err := app.kill("api", false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "tmux window is still running") {
-		t.Fatalf("remove output = %q", stdout.String())
+	if !strings.Contains(stdout.String(), "Killed Wrap") || !strings.Contains(stdout.String(), "tmux window is still running") {
+		t.Fatalf("kill output = %q", stdout.String())
 	}
 }
 
-func TestRemoveReconcilesProvenStaleRecord(t *testing.T) {
+func TestKillReconcilesProvenStaleRecord(t *testing.T) {
 	app, stdout, _ := testApplication(t)
 	record := commandTestRecord(t, app)
 	app.callControl = func(context.Context, string, control.Request) (control.Status, error) {
 		return control.Status{}, errors.New("connection refused")
 	}
-	if err := app.remove(record.Name); err != nil {
+	if err := app.kill(record.Name, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.store.Resolve(record.ID); !errors.Is(err, instance.ErrNotFound) {
 		t.Fatalf("stale record remains: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "stale Wrap") || !strings.Contains(stdout.String(), "tmux window is still running") {
-		t.Fatalf("remove stale output = %q", stdout.String())
+		t.Fatalf("kill stale output = %q", stdout.String())
 	}
 }
 
-func TestRemoveRetainsProvenStaleRecordWhenCleanupFails(t *testing.T) {
+func TestKillRetainsProvenStaleRecordWhenCleanupFails(t *testing.T) {
 	app, _, _ := testApplication(t)
 	record := commandTestRecord(t, app)
 	app.callControl = func(context.Context, string, control.Request) (control.Status, error) {
 		return control.Status{}, errors.New("connection refused")
 	}
 	app.cleanupStale = func(instance.Record) error { return errors.New("tmux temporarily unavailable") }
-	err := app.remove(record.Name)
+	err := app.kill(record.Name, false)
 	if err == nil || !strings.Contains(err.Error(), "tmux temporarily unavailable") {
-		t.Fatalf("remove with failed stale cleanup = %v", err)
+		t.Fatalf("kill with failed stale cleanup = %v", err)
 	}
 	if stored, err := app.store.Resolve(record.ID); err != nil || stored.ID != record.ID {
 		t.Fatalf("stale record after failed cleanup = %+v, %v", stored, err)
 	}
 }
 
-func TestRemoveWaitsForWorkerLeaseAfterRecordDisappears(t *testing.T) {
+func TestKillWaitsForWorkerLeaseAfterRecordDisappears(t *testing.T) {
 	app, _, _ := testApplication(t)
 	record := commandTestRecord(t, app)
 	lease, err := app.store.AcquireLease(record.ID)
@@ -691,15 +699,15 @@ func TestRemoveWaitsForWorkerLeaseAfterRecordDisappears(t *testing.T) {
 		return commandTestStatus(record), nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- app.remove(record.Name) }()
+	go func() { done <- app.kill(record.Name, false) }()
 	<-shutdownCalled
 	removed, err := app.store.RemoveIfPID(record.ID, record.PID)
 	if err != nil || !removed {
-		t.Fatalf("remove record fixture = %v, %v", removed, err)
+		t.Fatalf("delete record fixture = %v, %v", removed, err)
 	}
 	select {
 	case err := <-done:
-		t.Fatalf("remove returned before lease release: %v", err)
+		t.Fatalf("kill returned before lease release: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
 	if err := lease.Close(); err != nil {
@@ -711,7 +719,81 @@ func TestRemoveWaitsForWorkerLeaseAfterRecordDisappears(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("remove did not finish after lease release")
+		t.Fatal("kill did not finish after lease release")
+	}
+}
+
+func TestKillAllContinuesAfterFailure(t *testing.T) {
+	app, stdout, _ := testApplication(t)
+	failed := commandTestRecordNamed(t, app, "01KWRAPFAILED", "api")
+	stopped := commandTestRecordNamed(t, app, "01KWRAPSTOPPED", "web")
+	lease, err := app.store.AcquireLease(failed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	app.callControl = func(_ context.Context, socket string, request control.Request) (control.Status, error) {
+		if request.Action != control.ActionShutdown {
+			t.Fatalf("kill action = %q", request.Action)
+		}
+		if socket == failed.ControlSocket {
+			return control.Status{}, errors.New("connection refused")
+		}
+		if err := app.store.Remove(stopped.ID); err != nil {
+			t.Fatal(err)
+		}
+		return commandTestStatus(stopped), nil
+	}
+	err = app.kill("", true)
+	if err == nil || !strings.Contains(err.Error(), failed.Name) || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("kill all error = %v", err)
+	}
+	if _, err := app.store.Resolve(stopped.ID); !errors.Is(err, instance.ErrNotFound) {
+		t.Fatalf("later Wrap was not stopped: %v", err)
+	}
+	if _, err := app.store.Resolve(failed.ID); err != nil {
+		t.Fatalf("failed Wrap record was not retained: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Killed Wrap \"web\"") {
+		t.Fatalf("kill all output = %q", stdout.String())
+	}
+}
+
+func TestKillAllWithNoWrapsSucceeds(t *testing.T) {
+	app, stdout, _ := testApplication(t)
+	if err := app.kill("", true); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "No running Wraps.\n" {
+		t.Fatalf("kill all output = %q", stdout.String())
+	}
+}
+
+func TestKillAllReportsMalformedRecordsAfterStoppingValidWraps(t *testing.T) {
+	app, stdout, _ := testApplication(t)
+	record := commandTestRecord(t, app)
+	malformedPath := filepath.Join(app.store.InstancesDir(), "01KWRAPBROKEN.json")
+	if err := os.WriteFile(malformedPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.callControl = func(_ context.Context, _ string, request control.Request) (control.Status, error) {
+		if request.Action != control.ActionShutdown {
+			t.Fatalf("kill action = %q", request.Action)
+		}
+		if err := app.store.Remove(record.ID); err != nil {
+			t.Fatal(err)
+		}
+		return commandTestStatus(record), nil
+	}
+	err := app.kill("", true)
+	if err == nil || !strings.Contains(err.Error(), filepath.Base(malformedPath)) {
+		t.Fatalf("kill all malformed record error = %v", err)
+	}
+	if _, err := app.store.Resolve(record.ID); !errors.Is(err, instance.ErrNotFound) {
+		t.Fatalf("valid Wrap was not stopped: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Killed Wrap \"api\"") {
+		t.Fatalf("kill all output = %q", stdout.String())
 	}
 }
 
@@ -737,6 +819,18 @@ func TestCloudflaredAbsenceBlocksOnlyStart(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "No running Wraps") {
 		t.Fatalf("list output = %q", stdout.String())
+	}
+}
+
+func TestStartRejectsReservedAllNameBeforeCreatingSession(t *testing.T) {
+	app, _, _ := testApplication(t)
+	app.createSession = func(string, string, tmux.Runner) error {
+		t.Fatal("reserved name created a tmux session")
+		return nil
+	}
+	err := app.start("all")
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("start(all) = %v", err)
 	}
 }
 

@@ -8,7 +8,7 @@ wrap [-n NAME]
 wrap list [--json]
 wrap show INSTANCE [--json]
 wrap regen INSTANCE [--json]
-wrap remove INSTANCE
+wrap kill INSTANCE|all
 wrap doctor [--json]
 wrap version
 ```
@@ -21,6 +21,15 @@ Without a name, Wrap starts with the current directory basename and adds a
 deterministic numeric suffix when another target already uses it. Management
 selectors accept an exact name, an exact instance ID, or an unambiguous ID
 prefix.
+
+`kill INSTANCE` stops one Wrap share. `kill all` attempts to stop every
+registered Wrap, continuing past individual failures and reporting them after
+the remaining shares have been attempted. Neither form kills source tmux
+windows or sessions.
+
+`all` is reserved for bulk shutdown and cannot be assigned to a new Wrap. An
+existing Wrap already named `all` remains valid and can be killed by its
+instance ID.
 
 Running `wrap -n NEW` again in the same wrapped window renames that live
 instance atomically when `NEW` is unused. It never starts a second tunnel or
