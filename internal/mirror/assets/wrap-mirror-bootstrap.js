@@ -16,6 +16,14 @@
     }
   }
 
+  // Reopening a pairing URL in this tab can be a fragment-only navigation.
+  // Reload so both bootstrap and the client consume the replacement credential.
+  globalThis.addEventListener("hashchange", () => {
+    if (new URLSearchParams(location.hash.slice(1)).get("k") !== null) {
+      location.reload();
+    }
+  });
+
   const nativeImporter = () => import("/assets/wrap-mirror.js");
   const importer = typeof globalThis.__wrapMirrorImport === "function"
     ? globalThis.__wrapMirrorImport

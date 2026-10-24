@@ -28,6 +28,7 @@ func browserBootstrapSource(t *testing.T) string {
 func installBrowserURLSearchParams(t *testing.T, runtime *goja.Runtime) {
 	t.Helper()
 	if _, err := runtime.RunString(`
+globalThis.addEventListener = () => {};
 globalThis.URLSearchParams = class {
   constructor(value) {
     this.values = Object.create(null);
@@ -142,4 +143,79 @@ if (typeof globalThis.__wrapMirrorImport !== "undefined") throw new Error("impor
 `); err != nil {
 		t.Fatalf("verify malformed credential handling: %v", err)
 	}
+}
+
+func TestBrowserBootstrapRecoversPairingURLInExistingTab(t *testing.T) {
+	source := browserBootstrapSource(t)
+	runtime := goja.New()
+	installBrowserURLSearchParams(t, runtime)
+	if _, err := runtime.RunString(`
+const credential = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+let stored = null;
+let reloads = 0;
+let hashChanged = () => {};
+globalThis.addEventListener = (name, handler) => {
+  if (name === "hashchange") hashChanged = handler;
+};
+globalThis.location = {
+  hash: "#k=" + credential, pathname: "/", search: "",
+  reload() { reloads += 1; },
+};
+globalThis.history = {replaceState(state, title, url) {
+  if (url !== "/") throw new Error("credential retained in history");
+  location.hash = "";
+}};
+globalThis.sessionStorage = {
+  setItem(key, value) { stored = value; },
+  getItem(key) { return stored; },
+  removeItem(key) { stored = null; },
+};
+`); err != nil {
+		t.Fatal(err)
+	}
+	load := func() {
+		t.Helper()
+		if _, err := runtime.RunString(source); err != nil {
+			t.Fatalf("load bootstrap: %v", err)
+		}
+	}
+	check := func(script string) {
+		t.Helper()
+		if _, err := runtime.RunString(script); err != nil {
+			t.Fatal(err)
+		}
+	}
+	load()
+	check(`
+if (stored !== credential || location.hash !== "") throw new Error("initial pairing was not transferred safely");
+`)
+	load()
+	check(`
+if (stored !== credential) throw new Error("ordinary reload lost pairing");
+// Model a document reopened without its tab-scoped credential. The cause of
+// Safari's storage loss is not assumed by this recovery regression.
+stored = null;
+`)
+	load()
+	check(`
+location.hash = "#help";
+hashChanged();
+if (reloads !== 0) throw new Error("unrelated fragment reloaded the client");
+location.hash = "#k=" + credential;
+hashChanged();
+if (reloads !== 1) throw new Error("full pairing URL did not reload the missing-key document");
+`)
+	// A real browser starts a new document on reload, rerunning bootstrap and the
+	// client module; emulate the bootstrap side of that document load here.
+	load()
+	check(`
+if (stored !== credential || location.hash !== "") throw new Error("reopened pairing URL did not restore the session credential safely");
+location.hash = "#k=too-short";
+hashChanged();
+if (reloads !== 2) throw new Error("replacement pairing URL was ignored");
+`)
+	load()
+	check(`
+if (stored !== null || location.hash !== "") throw new Error("malformed replacement credential was retained");
+`)
 }
