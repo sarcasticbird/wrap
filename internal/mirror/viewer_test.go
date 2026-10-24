@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -852,8 +853,20 @@ func TestViewerIntegrationUsesPTYWithoutResizingAndRefusesRestartedServer(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Consume host output like a real terminal so PTY backpressure cannot hold
+	// its client in terminal teardown while the server is shutting down.
+	hostOutputDone := make(chan struct{})
+	go func() {
+		defer close(hostOutputDone)
+		_, _ = io.Copy(io.Discard, hostPTY)
+	}()
+	stopHost := sync.OnceValue(func() error {
+		err := stopUnverifiedViewer(hostCommand, hostPTY)
+		<-hostOutputDone
+		return err
+	})
 	t.Cleanup(func() {
-		if err := stopUnverifiedViewer(hostCommand, hostPTY); err != nil {
+		if err := stopHost(); err != nil {
 			t.Errorf("stop host tmux client: %v", err)
 		}
 	})
@@ -1023,6 +1036,9 @@ func TestViewerIntegrationUsesPTYWithoutResizingAndRefusesRestartedServer(t *tes
 	}
 	endingViewer, err := endingPrepared.Start()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stopHost(); err != nil {
 		t.Fatal(err)
 	}
 	// Keep the server alive until the explicit restart below, rather than racing
