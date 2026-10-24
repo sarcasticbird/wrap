@@ -5,7 +5,7 @@ go 1.26
 // Pin the exact toolchain so CI, local builds, and every release retry
 // compile with the same patch. A checked-out tag carries this pin, keeping
 // its binaries and checksums reproducible even after the line moves.
-toolchain go1.26.6
+toolchain go1.26.10
 
 require (
 	github.com/coder/websocket v1.8.15

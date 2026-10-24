@@ -1025,6 +1025,11 @@ func TestViewerIntegrationUsesPTYWithoutResizingAndRefusesRestartedServer(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep the server alive until the explicit restart below, rather than racing
+	// its asynchronous exit after the last session is killed.
+	if _, err := server.Run("set-option", "-g", "exit-empty", "off"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := server.Run("kill-session", "-t", identity.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -1039,8 +1044,20 @@ func TestViewerIntegrationUsesPTYWithoutResizingAndRefusesRestartedServer(t *tes
 	if err := endingViewer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.NewSession("replacement", t.TempDir(), ""); err != nil {
+	if _, err := server.Run("kill-server"); err != nil {
 		t.Fatal(err)
+	}
+	replacementRoot := t.TempDir()
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		err := server.NewSession("replacement", replacementRoot, "")
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "server exited unexpectedly") || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	const replacementGeneration = "fedcba9876543210fedcba9876543210"
 	if _, err := server.EnsureServerGeneration(replacementGeneration); err != nil {
