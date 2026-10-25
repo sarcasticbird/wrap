@@ -57,3 +57,22 @@ socket targeting.
 - The credential disappears from the browser address bar after loading.
 - Killing or rotating one Wrap does not affect another. Start two disposable
   Wraps, run `wrap kill all`, and confirm both source tmux windows survive.
+
+## Pairing recovery
+
+Use synthetic credentials on a disposable share. Record the Wrap build, device,
+OS, browser version, and exact error text, never the key or full pairing URL.
+
+1. In the same paired tab, reload, use Reconnect, and background/resume Safari.
+   Confirm the still-running share opens without another scan or `wrap regen`.
+2. If "Pairing key missing" occurs, open the full current pairing URL in that
+   same tab, not just a fresh tab. Confirm it reloads, removes the fragment from
+   the address bar, and authenticates. For a controlled recovery check, remove
+   only `wrap.mirror.v3.secret` from that tab's session storage and reload first.
+3. Run `wrap regen mobile-uat`. Confirm the old URL cannot authenticate; open
+   the new full URL in the affected tab and confirm it recovers there too.
+4. Confirm missing and wrong keys cannot open the terminal, and `wrap kill`
+   disconnects the browser without killing the source window.
+
+The controlled storage-loss check tests recovery, not the cause of Safari losing
+tab storage. Keep naturally occurring failures separate from injected failures.
