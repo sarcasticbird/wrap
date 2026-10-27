@@ -18,6 +18,11 @@ not open a public issue for an undisclosed vulnerability.
 - Browser frames are protected with fragment-derived AES-256-GCM keys. The
   fragment is not sent in HTTP requests, logs, process arguments, or persisted
   host state.
+- The browser retains the bearer key in the URL fragment for reload recovery,
+  without localStorage or sessionStorage. It is script-readable and may persist
+  in browser history, synced tabs, and copied URLs. Wrap cannot automatically
+  remove it from those copies. Retention does not extend server-side validity:
+  expiry, rotation, invalidation, and ending the share still reject old keys.
 - Cloudflare terminates TLS and serves the browser application. A malicious or
   compromised edge could replace that JavaScript and attack key establishment.
   Application encryption protects against passive intermediaries, not an

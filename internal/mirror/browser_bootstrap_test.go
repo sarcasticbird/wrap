@@ -104,11 +104,10 @@ check(rendered.includes("Required browser asset unavailable. Reload after updati
 check(rendered.includes("Code: client_asset_unavailable"), "safe error code was not rendered");
 check(!rendered.includes("SENTINEL"), "raw import failure was rendered");
 check(!rendered.includes("credential"), "credential-bearing rejection was rendered");
-check(__historyCalls.length === 1, "bootstrap did not clear the credential fragment");
-check(__historyCalls[0].url === "/mirror?source=uat", "bootstrap retained the credential in browser history");
-check(location.hash === "", "credential remained in the address bar");
-check(__storedCredential === "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "bootstrap did not transfer the credential");
-check(!rendered.includes(__storedCredential), "transferred credential was rendered");
+check(__historyCalls.length === 0, "bootstrap changed browser history");
+check(location.hash === "#k=" + credential, "credential not retained for reload");
+check(__storedCredential === null, "bootstrap persisted a second credential copy");
+check(!rendered.includes(credential), "credential was rendered");
 check(__webSocketCalls === 0, "bootstrap constructed a WebSocket after import failure");
 check(typeof globalThis.__wrapMirrorImport === "undefined", "bootstrap left its importer seam installed");
 `); err != nil {
@@ -116,7 +115,7 @@ check(typeof globalThis.__wrapMirrorImport === "undefined", "bootstrap left its 
 	}
 }
 
-func TestBrowserBootstrapDiscardsMalformedFragmentCredential(t *testing.T) {
+func TestBrowserBootstrapLeavesCredentialValidationToClient(t *testing.T) {
 	runtime := goja.New()
 	installBrowserURLSearchParams(t, runtime)
 	if _, err := runtime.RunString(`
@@ -136,9 +135,9 @@ globalThis.__wrapMirrorImport = () => Promise.resolve();
 		t.Fatalf("run browser bootstrap: %v", err)
 	}
 	if _, err := runtime.RunString(`
-if (__historyURL !== "/mirror") throw new Error("malformed fragment was not cleared");
-if (location.hash !== "") throw new Error("malformed credential remained in address bar");
-if (__storedCredential !== null) throw new Error("malformed credential was retained");
+if (__historyURL !== null) throw new Error("bootstrap changed history");
+if (location.hash !== "#k=too-short") throw new Error("bootstrap consumed fragment");
+if (__storedCredential !== "prior-credential") throw new Error("bootstrap accessed storage");
 if (typeof globalThis.__wrapMirrorImport !== "undefined") throw new Error("importer seam was retained");
 `); err != nil {
 		t.Fatalf("verify malformed credential handling: %v", err)
@@ -187,11 +186,11 @@ globalThis.sessionStorage = {
 	}
 	load()
 	check(`
-if (stored !== credential || location.hash !== "") throw new Error("initial pairing was not transferred safely");
+if (stored !== null || location.hash !== "#k=" + credential) throw new Error("initial fragment was not retained");
 `)
 	load()
 	check(`
-if (stored !== credential) throw new Error("ordinary reload lost pairing");
+if (location.hash !== "#k=" + credential) throw new Error("ordinary reload lost fragment");
 // Model a document reopened without its tab-scoped credential. The cause of
 // Safari's storage loss is not assumed by this recovery regression.
 stored = null;
@@ -209,13 +208,13 @@ if (reloads !== 1) throw new Error("full pairing URL did not reload the missing-
 	// client module; emulate the bootstrap side of that document load here.
 	load()
 	check(`
-if (stored !== credential || location.hash !== "") throw new Error("reopened pairing URL did not restore the session credential safely");
+if (stored !== null || location.hash !== "#k=" + credential) throw new Error("reopened pairing URL was not retained");
 location.hash = "#k=too-short";
 hashChanged();
 if (reloads !== 2) throw new Error("replacement pairing URL was ignored");
 `)
 	load()
 	check(`
-if (stored !== null || location.hash !== "") throw new Error("malformed replacement credential was retained");
+if (stored !== null || location.hash !== "#k=too-short") throw new Error("bootstrap consumed malformed replacement");
 `)
 }

@@ -2,8 +2,10 @@
 
 Wrap is a small developer tool with a narrow boundary: one running Wrap shares
 one exact tmux window. Contributions should preserve the source tmux session,
-keep pairing credentials out of persistent state and ordinary management
+keep pairing credentials out of persisted host state and ordinary management
 output, and avoid growing Wrap into a command supervisor or workspace manager.
+The browser deliberately retains its bearer URL fragment for reload recovery;
+see the [security tradeoff](SECURITY.md#trust-boundaries).
 
 ## Development environment
 

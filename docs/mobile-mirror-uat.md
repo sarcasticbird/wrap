@@ -54,7 +54,8 @@ socket targeting.
 - `wrap list --json` contains no pairing URL or secret.
 - Process arguments contain no pairing credential.
 - Instance JSON contains no pairing credential or public URL.
-- The credential disappears from the browser address bar after loading.
+- The credential remains in the URL fragment after loading, never in the path,
+  query, HTTP/WebSocket request URLs, or ordinary logs. Do not record the URL.
 - Killing or rotating one Wrap does not affect another. Start two disposable
   Wraps, run `wrap kill all`, and confirm both source tmux windows survive.
 
@@ -63,16 +64,32 @@ socket targeting.
 Use synthetic credentials on a disposable share. Record the Wrap build, device,
 OS, browser version, and exact error text, never the key or full pairing URL.
 
-1. In the same paired tab, reload, use Reconnect, and background/resume Safari.
-   Confirm the still-running share opens without another scan or `wrap regen`.
-2. If "Pairing key missing" occurs, open the full current pairing URL in that
-   same tab, not just a fresh tab. Confirm it reloads, removes the fragment from
-   the address bar, and authenticates. For a controlled recovery check, remove
-   only `wrap.mirror.v3.secret` from that tab's session storage and reload first.
-3. Run `wrap regen mobile-uat`. Confirm the old URL cannot authenticate; open
+1. Record the candidate commit, `wrap version`, iPhone model, iOS and Safari
+   versions. Open the full pairing link, then independently test QR entry.
+   Confirm both open the same still-active disposable Wrap and retain `#k=`.
+2. In the same paired tab, reload and use Reconnect. Clear that origin's session
+   storage using an attached inspector, then reload without rescanning or
+   regenerating. Confirm recovery with the retained fragment. Browser fixtures
+   also deny storage access entirely; neither storage loss nor exceptions should
+   affect pairing because the client does not use browser storage.
+3. Background Safari, lock the phone, and return after recording the duration.
+   Record whether Safari actually reloaded/discarded the page, merely resumed,
+   or whether discard is unknown; do not infer discard from elapsed time alone.
+   Record fragment presence (yes/no only), recovery and safe error text. Repeat
+   an actual page-discard/reload when observable with the attached inspector.
+4. Remove the fragment in the affected tab and reload: expect "Pairing key
+   missing". Re-enter the full current URL there; confirm authentication and
+   fragment retention. A fragment-only replacement must also reload the client.
+5. Run `wrap regen mobile-uat`. Confirm the old URL cannot authenticate; open
    the new full URL in the affected tab and confirm it recovers there too.
-4. Confirm missing and wrong keys cannot open the terminal, and `wrap kill`
+6. Confirm missing, malformed and wrong keys cannot open the terminal, and `wrap kill`
    disconnects the browser without killing the source window.
 
-The controlled storage-loss check tests recovery, not the cause of Safari losing
-tab storage. Keep naturally occurring failures separate from injected failures.
+The fragment is script-readable and can remain in history, synced tabs and
+copied links; Wrap cannot remove those copies. Rotate or end the share to revoke
+them. The controlled storage-loss check tests recovery, not the cause of Safari
+losing tab storage. Keep natural failures separate from injected failures.
+Desktop Playwright WebKit is not real iOS discard evidence. Real-iPhone UAT is
+a separate before-release gate: leave it pending if a device lane is unavailable.
+This source candidate does not authorize a release, Homebrew update, installation
+or restart of an existing live share.

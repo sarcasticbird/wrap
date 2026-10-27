@@ -1,23 +1,6 @@
 (() => {
-  const storageKey = "wrap.mirror.v3.secret";
-  const fragment = new URLSearchParams(location.hash.slice(1));
-  const fragmentKey = fragment.get("k");
-  history.replaceState(null, "", location.pathname + location.search);
-  if (fragmentKey !== null) {
-    try {
-      if (!/^[A-Za-z0-9_-]{43}$/.test(fragmentKey)) {
-        sessionStorage.removeItem(storageKey);
-      } else {
-        sessionStorage.setItem(storageKey, fragmentKey);
-      }
-    } catch {
-      // Storage availability is handled by the main client. The credential has
-      // already been removed from the address bar and browser history.
-    }
-  }
-
   // Reopening a pairing URL in this tab can be a fragment-only navigation.
-  // Reload so both bootstrap and the client consume the replacement credential.
+  // Reload so the client consumes the replacement credential from the fragment.
   globalThis.addEventListener("hashchange", () => {
     if (new URLSearchParams(location.hash.slice(1)).get("k") !== null) {
       location.reload();

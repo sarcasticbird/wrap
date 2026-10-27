@@ -18,8 +18,7 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 		`from "/assets/third_party/xterm/xterm.mjs"`,
 		`from "/assets/third_party/xterm/addon-web-links.mjs"`,
 		`new URLSearchParams(location.hash.slice(1))`,
-		`history.replaceState(null, "", location.pathname + location.search)`,
-		`sessionStorage`,
+		`secret = decodeBase64URL(fragment.get("k") || "")`,
 		`crypto.subtle`,
 		`HKDF`,
 		`SHA-256`,
@@ -32,7 +31,6 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 		`setBigUint64(4, counter, false)`,
 		`Math.min(5000`,
 		`event.code === 1008`,
-		`sessionStorage.removeItem(STORAGE_KEY)`,
 		`showMessage("Pairing rejected"`,
 	} {
 		if !strings.Contains(source, want) {
@@ -43,6 +41,8 @@ func TestBrowserContractUsesFragmentScopedWebCryptoAndLocalAssets(t *testing.T) 
 		t.Fatal("browser client constructs WebSocket before its crypto self-test")
 	}
 	for _, forbidden := range []string{
+		"sessionStorage",
+		"history.replaceState",
 		"local" + "Storage",
 		"document." + "cookie",
 		"navigator.send" + "Beacon",
