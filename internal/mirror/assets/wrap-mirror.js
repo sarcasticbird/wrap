@@ -2,7 +2,6 @@ import { Terminal } from "/assets/third_party/xterm/xterm.mjs";
 import { WebLinksAddon } from "/assets/third_party/xterm/addon-web-links.mjs";
 import "/assets/wrap-mirror-viewport.js";
 
-const STORAGE_KEY = "wrap.mirror.v3.secret";
 const MAX_WIRE_MESSAGE = 128 * 1024;
 const MAX_FRAME_PAYLOAD = MAX_WIRE_MESSAGE - 17;
 const TAG = Object.freeze({
@@ -141,23 +140,14 @@ async function cryptoSelfTest() {
 }
 
 const fragment = new URLSearchParams(location.hash.slice(1));
-const fragmentKey = fragment.get("k");
-history.replaceState(null, "", location.pathname + location.search);
-if (fragmentKey !== null) {
-  try {
-    decodeBase64URL(fragmentKey).fill(0);
-    sessionStorage.setItem(STORAGE_KEY, fragmentKey);
-  } catch {
-    sessionStorage.removeItem(STORAGE_KEY);
-  }
-}
-
+// Keep the bearer fragment for reload recovery, even when tab storage is lost
+// or unavailable. Never copy it into request URLs or a second persistence store.
 let secret = null;
 let incompatibleBrowser = false;
 try {
-  secret = decodeBase64URL(sessionStorage.getItem(STORAGE_KEY) || "");
+  secret = decodeBase64URL(fragment.get("k") || "");
 } catch {
-  sessionStorage.removeItem(STORAGE_KEY);
+  // Missing and malformed fragments stay unauthenticated.
 }
 if (secret) {
   try {
@@ -1135,7 +1125,6 @@ async function receiveMessage(target, data) {
       }
       if (!shutdown.retry) {
         stopped = true;
-        sessionStorage.removeItem(STORAGE_KEY);
         secret?.fill(0);
         secret = null;
       }
@@ -1260,7 +1249,6 @@ function connect() {
     resetTerminalViewport();
     if (event.code === 1008) {
       stopped = true;
-      sessionStorage.removeItem(STORAGE_KEY);
       secret?.fill(0);
       secret = null;
       showMessage("Pairing rejected", "Scan the current QR code shown by wrap.");
